@@ -15,6 +15,7 @@ Collecting Training Data from OpenAI's APIs
 import torch
 from datasets import load_dataset
 from openai import OpenAI as oa
+import httpx
 # import time
 import json
 from collections import OrderedDict
@@ -25,9 +26,12 @@ import random
 import pickle
 from tqdm import tqdm
 
+_http_client = httpx.Client(base_url="https://sg.uiuiapi.com/v1")
 client = oa(
-    base_url = "https://sg.uiuiapi.com/v1",
-    api_key = "sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr")
+    api_key = "sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr",
+    base_url="https://sg.uiuiapi.com/v1",
+    http_client=_http_client,
+)
 
 
 def chatWithOpenAI_APIs(modelname="gpt-3.5-turbo-1106",

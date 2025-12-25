@@ -307,7 +307,7 @@ def infer_qa(modelname, task_name, res_pth, test_set_take_num=100,
             res = safe_decode(res) 
             print(f"Generated Text: {res}")
             res_ls.append((res, summary))
-    elif modelname=="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct":
+    elif modelname=="/root/workspace/models/llama3-8b-instruct":
         print("USING PRE-TRAINED BASE MODEL")
         # load model based on our idea
         model = AutoModelForCausalLM.from_pretrained(
@@ -561,7 +561,7 @@ def eval_qa_res():
 
     )
 
-    base_model_name1="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
+    base_model_name1="/root/workspace/models/llama3-8b-instruct"
 
     res_dict = {}
     dir_p = "./qa_dataset_res/"
@@ -634,7 +634,7 @@ def eval_tau1_res():
         "0.95",
         "1.0",
         ]
-    base_model_name1="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
+    base_model_name1="/root/workspace/models/llama3-8b-instruct"
 
     dir_p = "./qa_0514_tau1_res/"
     res_dict = {}
@@ -735,7 +735,7 @@ def eval_tau2_res():
         "0.95",
         "1.0",
         ]
-    base_model_name1="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
+    base_model_name1="/root/workspace/models/llama3-8b-instruct"
 
     dir_p = "./qa_0515_tau2_res/"
     res_dict = {}
@@ -817,7 +817,7 @@ def eval_pretraind_or_victim():
         "4",
         ]
     victim_model="gpt-3.5-turbo-1106"
-    pretrained_model="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
+    pretrained_model="/root/workspace/models/llama3-8b-instruct"
     mls = [
         victim_model,
         pretrained_model,
@@ -916,7 +916,7 @@ def eval_varytrainum_res():
         # "1024",
         # "2048",
         ]
-    base_model_name1="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
+    base_model_name1="/root/workspace/models/llama3-8b-instruct"
 
     dir_p = "./qa_0630_dataset_res/"
     res_dict = {}

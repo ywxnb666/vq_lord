@@ -33,7 +33,7 @@ else
 fi
 
 export TORCH_USE_CUDA_DSA="1"
-export root_dir="/mnt/petrelfs/songxinhao/sxh/workspace3/align/"
+export root_dir="/root/workspace/align/"
 export POD_save_dir="${root_dir}wmt16_ckpts/"
 export from_path="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
 export TRAIN_NUMS=(16)

@@ -9,7 +9,7 @@
 # Created:  4 May 2024
 ######################################################################
 
-export CUDA_HOME=/mnt/petrelfs/share/cuda-12.1
+export CUDA_HOME=/usr/local/cuda-12.1
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export BNB_CUDA_VERSION=121
@@ -19,7 +19,7 @@ export HF_ENDPOINT="https://hf-mirror.com"
 # echo $LD_LIBRARY_PATH
 
 echo "HOME: ${HOME}"
-export python=${HOME}/anaconda3/envs/align2/bin/python3
+export python=${HOME}/anaconda3/envs/align/bin/python3
 export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
                                         --format=csv,noheader,nounits | \
                               awk -F ', ' '$2 < 100 && $3 == 0 {print $1}' | \
@@ -35,9 +35,9 @@ fi
 
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
-export root_dir="/mnt/petrelfs/songxinhao/sxh/workspace3/align/"
+export root_dir="/root/workspace/align/"
 export POD_save_dir="${root_dir}qa_ckpts/"
-export from_path="/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/llama3-8b-instruct"
+export from_path="/root/workspace/models/llama3-8b-instruct"
 # export from_path="google/gemma-7b"
 # export TRAIN_NUMS=(64 128 256 512)
 # export TRAIN_NUMS=(128 256 512)
@@ -48,8 +48,8 @@ export msl=256
 export task_ls=("ceval/ceval-exam" )
 # export task_ls=("truthful_qa" "allenai/ai2_arc")
 # export task_ls=("piqa")
-export train_taskls=("kd")
-# export train_taskls=("LoRD-VI")
+# export train_taskls=("kd")
+export train_taskls=("LoRD-VI")
 
 export is_black_box=1
 export use_lora=1
