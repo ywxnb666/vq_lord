@@ -32,6 +32,7 @@ fi
 
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # 减少显存碎片
 export root_dir="/root/workspace/align/"
 export POD_save_dir="${root_dir}sciqa_ckpts/"
 
@@ -51,13 +52,14 @@ export train_taskls=("LoRD-VI")  # 使用 LoRD-VI 方法
 
 export is_black_box=1  # 黑盒模式
 export use_lora=1  # 使用 LoRA
+export use_4bit=1  # 是否启用4bit量化 (1=启用, 0=禁用)
 
 # 训练超参数
 export epoch=2
 export period=3  # 多个period可以让模型逐步学习
 export sub_set_num=4  # 每次训练的子集数量
 export sub_stage_num=64  # 训练阶段数
-export max_new_tokens=256  # 生成的最大token数（多模态需要更长的回复）
+export max_new_tokens=64  # 生成的最大token数（进一步降低显存）
 export infer_batch_size=1  # 推理批次大小（多模态通常为1）
 export batch_size=1  # 训练批次大小
 
@@ -74,15 +76,14 @@ export tau2=0.85
 
 # 关键修改4：序列长度适应多模态输入
 # LLaVA-Next 使用动态分辨率，每个图像可能有多个patches
-# 实测: prompt ~1982 tokens (包含 ~1700 image tokens)
-# 加上 max_new_tokens=256，总共需要 ~2240 tokens
-# 为安全起见，设置为 3072 (足够容纳最大的序列)
-export msl=3072  # 最大序列长度
-export max_length=3072
+# 显存极限：22GB GPU 只能支持较短序列，会截断大部分 image tokens
+# 这会导致性能下降，但是唯一能运行的配置
+export msl=1024  # 最大序列长度 (极限压缩)
+export max_length=1024
 
-# LoRA 参数（适配 LLaVA 架构）
-export rank=64
-export lora_alpha=128
+# LoRA 参数（适配 LLaVA 架构，降低以节省显存）
+export rank=32
+export lora_alpha=64
 
 # 学习率
 export LR="3e-5"
@@ -109,6 +110,7 @@ do
                 $python ${root_dir}lord_train_mul.py\
                     --dataset_task=$task \
                     --use_lora=$use_lora \
+                    --use_4bit=$use_4bit \
                     --rank=$rank \
                     --lora_alpha=$lora_alpha \
                     --from_path=$from_path \

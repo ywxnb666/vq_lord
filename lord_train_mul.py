@@ -19,6 +19,7 @@ from pprint import pprint as ppp
 # 关键修改1：使用 LlavaNextForConditionalGeneration
 # LlavaNext 是 LLaVA v1.6 系列的正确类
 from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
+from transformers import BitsAndBytesConfig
 from transformers import AutoTokenizer
 
 from sciqa_process import load_scienceqa_data
@@ -51,6 +52,7 @@ def setup_train_args():
     parser.add_argument("--T", default=1.0, type=float, required=False)
 
     parser.add_argument("--use_lora", default=1, type=int, required=False)
+    parser.add_argument("--use_4bit", default=1, type=int, required=False, help="Enable 4-bit quantization (1=True, 0=False)")
     parser.add_argument("--rank", default=64, type=int, required=False)
     parser.add_argument("--lora_alpha", default=128, type=int, required=False)
 
@@ -144,11 +146,30 @@ def main():
     # 关键修改3：使用 LlavaNextForConditionalGeneration
     # 参考 run_llava.py 的加载方式
     print(f"Loading LLaVA-Next model from {args.from_path}...")
-    lm = LlavaNextForConditionalGeneration.from_pretrained(
-        args.from_path,
-        device_map="auto",
-        dtype=torch.float16,  # 使用 float16 以节省显存
-    )
+    
+    # 根据 use_4bit 参数决定是否使用4bit量化
+    if args.use_4bit == 1:
+        print(">>> Enabling 4-bit quantization...")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+        )
+        lm = LlavaNextForConditionalGeneration.from_pretrained(
+            args.from_path,
+            device_map="auto",
+            quantization_config=quantization_config,
+            trust_remote_code=True,
+        )
+    else:
+        print(">>> Loading model without quantization (float16)...")
+        lm = LlavaNextForConditionalGeneration.from_pretrained(
+            args.from_path,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        )
     
     # 关键修改4：使用 LlavaNextProcessor 处理多模态输入
     print(f"Loading processor from {args.from_path}...")
@@ -206,10 +227,15 @@ def main():
     # 关键修改6：对于 LLaVA 模型，强制使用 LoRA
     # 决定是否冻结 vision tower
     if args.use_lora == 1 or float(lm.num_parameters()) > 6e9:
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
         
         print(">>>> Applying LoRA to LLaVA model")
         print(">>>> Note: Vision tower will be frozen")
+        
+        # 如果启用了4bit量化，需要准备模型
+        if args.use_4bit == 1:
+            print(">>>> Preparing model for k-bit training...")
+            lm = prepare_model_for_kbit_training(lm)
         
         # 关键修改7：配置 LoRA 目标模块
         # LLaVA 包含 language_model 和 vision_tower
