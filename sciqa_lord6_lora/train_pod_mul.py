@@ -32,6 +32,10 @@ import time
 # from training_data_collecting_openai import load_steal_datals
 # from glue_process import load_glue_datals
 
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from sequence_utils import my_padding, my_padding_logits
 from sequence_utils import my_padding_token_dist
 from sequence_utils import my_padding_logit

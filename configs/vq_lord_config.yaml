@@ -1,0 +1,94 @@
+# VQ-LoRD 配置文件
+# 用于窃取多模态模型的图像识别能力
+
+# 模型配置
+model:
+  student_path: "/root/workspace/models/llama3-llava-next-8b-hf"
+  teacher_model: "gpt-4-vision-preview"
+
+# VQ (Vector Quantization) 配置
+vq:
+  codebook_size: 8192        # Codebook 大小 (离散 token 数量)
+  embedding_dim: 1024        # 嵌入维度 (与 Vision Encoder 输出匹配)
+  commitment_cost: 0.25      # Commitment loss 权重
+  use_ema: true              # 使用指数移动平均更新 codebook
+  ema_decay: 0.99            # EMA 衰减率
+  freeze_vision_tower: false # 是否冻结原始视觉编码器
+
+# 损失函数配置
+loss:
+  alpha: 1.0                 # 视觉蒸馏损失权重 (L_vision)
+  beta: 0.25                 # VQ 损失权重 (L_vq)
+  temperature: 1.5           # 蒸馏温度
+  use_contrastive: true      # 是否使用对比学习损失
+
+# 训练配置
+training:
+  # 阶段设置
+  stage: 3                   # 1=VQ预训练, 2=视觉蒸馏, 3=LoRD联合训练
+  
+  # 基础参数
+  epochs: 3
+  batch_size: 1
+  learning_rate: 3e-5
+  max_length: 512
+  
+  # 日志和保存
+  log_step: 10
+  save_step: 100
+  
+  # LoRD 特定参数 (阶段3)
+  lord:
+    tau1: 0.80               # 置信度阈值1
+    tau2: 0.85               # 置信度阈值2
+    use_old_logits: true     # 使用历史 logits
+    use_vic_logits: true     # 使用教师 logits
+
+# LoRA 配置
+lora:
+  enabled: true
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    # 语言模型层
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# 量化配置
+quantization:
+  use_4bit: true
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_quant_type: "nf4"
+
+# 数据配置
+data:
+  data_dir: "./vq_lord_data"
+  train_num: 500
+  
+  # 视觉问题类型 (用于收集数据)
+  visual_question_types:
+    - "describe_objects"     # 描述物体
+    - "count_objects"        # 计数
+    - "spatial_relations"    # 空间关系
+    - "colors_attributes"    # 颜色和属性
+    - "scene_understanding"  # 场景理解
+  
+  # 图像描述类型
+  description_type: "detailed"  # brief, detailed, structured
+
+# 保存配置
+output:
+  save_path: "./vq_lord_ckpts"
+  log_dir: "./vq_lord_logs"
+
+# 设备配置
+device:
+  cuda_visible_devices: "auto"  # auto 表示自动选择空闲 GPU
+  mixed_precision: true

@@ -107,7 +107,7 @@ do
                 export save_path="${POD_save_dir}SCIQA${task}${train_num}${train_time}${train_task}"
 
                 # 关键修改5：调用 lord_train_mul.py（多模态训练脚本）
-                $python ${root_dir}lord_train_mul.py\
+                $python ${root_dir}/sciqa_lord6_lora/lord_train_mul.py\
                     --dataset_task=$task \
                     --use_lora=$use_lora \
                     --use_4bit=$use_4bit \
