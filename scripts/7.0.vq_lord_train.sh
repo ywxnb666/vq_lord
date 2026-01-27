@@ -42,7 +42,7 @@ export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 项目路径
-export root_dir="/home/ywx/Desktop/align/"
+export root_dir="/root/workspace/align_vq/"
 export save_dir="${root_dir}vq_lord_ckpts/"
 export data_dir="${root_dir}vq_lord_data/"
 
@@ -79,6 +79,8 @@ export use_4bit=1               # 使用 4-bit 量化
 
 # 数据
 export train_num=500            # 训练样本数
+export dataset_name="scienceqa" # 使用 ScienceQA 数据集
+export scienceqa_split="train"  # ScienceQA split
 
 # 日志和保存
 export log_step=10
@@ -121,6 +123,9 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
     --use_4bit=$use_4bit \
     --data_dir=$data_dir \
     --train_num=$train_num \
+    --dataset_name=$dataset_name \
+    --scienceqa_split=$scienceqa_split \
+    --reuse_vq_codebook=1 \
     --save_path=$save_dir \
     --log_step=$log_step \
     --save_step=$save_step \

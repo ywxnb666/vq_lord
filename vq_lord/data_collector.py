@@ -317,38 +317,37 @@ class VQLORDDataset(torch.utils.data.Dataset):
         
         # 加载图片
         image = Image.open(item["image_path"]).convert("RGB")
+        image_sizes_default = torch.tensor([image.height, image.width], dtype=torch.long)
         
         # 构建对话格式
-        conversation = [
-            {"role": "user", "content": item["instruction"]},
-            {"role": "assistant", "content": item["response"]},
-        ]
-        
-        # 使用 processor 处理
-        # 注意：具体实现需要根据 LLaVA 版本调整
+        # 使用 processor 处理 (拼接指令与回答，保证 labels 对齐)
+        instruction = item["instruction"]
+        if "<image>" not in instruction:
+            instruction = f"<image>\n{instruction}"
+        full_text = f"{instruction}\n{item['response']}"
         inputs = self.processor(
-            text=item["instruction"],
+            text=full_text,
             images=image,
             return_tensors="pt",
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
+            padding="longest",
+            truncation=False,
         )
-        
-        # 处理标签 (response)
-        labels = self.processor.tokenizer(
-            item["response"],
-            return_tensors="pt",
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-        )
+        image_sizes = inputs.get("image_sizes") if isinstance(inputs, dict) else None
+        if image_sizes is None:
+            image_sizes = image_sizes_default
+        else:
+            image_sizes = image_sizes.squeeze(0)
+
+        labels = inputs["input_ids"].clone()
+        pad_id = self.processor.tokenizer.pad_token_id
+        labels = labels.masked_fill(labels == pad_id, -100)
         
         return {
             "input_ids": inputs["input_ids"].squeeze(0),
             "attention_mask": inputs["attention_mask"].squeeze(0),
             "pixel_values": inputs["pixel_values"].squeeze(0),
-            "labels": labels["input_ids"].squeeze(0),
+            "labels": labels.squeeze(0),
+            "image_sizes": image_sizes,
             "data_type": item["type"],
         }
 
