@@ -20,6 +20,7 @@ VQ-LoRD 主训练脚本
 import os
 import torch
 import argparse
+from typing import Optional, List
 from pprint import pprint
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -38,6 +39,51 @@ from data_collector import GPT4VDataCollector, VQLORDDataset
 import torch.nn.functional as F
 
 
+def build_scienceqa_samples(
+    split: str,
+    train_num: int,
+    seed: int,
+) -> List[dict]:
+    dataset = load_dataset("derek-thomas/ScienceQA", split=split)
+    dataset_with_images = [item for item in dataset if item.get("image") is not None]
+
+    import random
+
+    all_indices = list(range(len(dataset_with_images)))
+    random.seed(seed)
+    random.shuffle(all_indices)
+    if train_num > 0 and len(all_indices) > train_num:
+        all_indices = all_indices[:train_num]
+
+    samples = []
+    for idx in all_indices:
+        item = dataset_with_images[idx]
+        question = item.get("question", "")
+        choices = item.get("choices", [])
+        choices_text = ""
+        for idx, choice in enumerate(choices):
+            choices_text += f"({chr(65 + idx)}) {choice}\n"
+
+        answer_idx = item.get("answer", 0)
+        answer = choices[answer_idx] if choices and answer_idx < len(choices) else ""
+        lecture = item.get("lecture", "")
+        solution = item.get("solution", "")
+
+        instruction = f"<image>\nQuestion: {question}\nOptions:\n{choices_text}Answer:"
+        if lecture:
+            response = f"Explanation: {lecture}\nSolution: {solution}\nAnswer: {answer}"
+        else:
+            response = f"Solution: {solution}\nAnswer: {answer}"
+
+        samples.append({
+            "image": item.get("image"),
+            "instruction": instruction,
+            "response": response,
+        })
+
+    return samples
+
+
 class ScienceQADataset(torch.utils.data.Dataset):
     """ScienceQA 多模态数据集包装"""
 
@@ -47,46 +93,20 @@ class ScienceQADataset(torch.utils.data.Dataset):
         split: str = "train",
         train_num: int = 500,
         max_length: int = 512,
+        samples: Optional[List[dict]] = None,
+        seed: int = 20240306,
     ):
         self.processor = processor
         self.max_length = max_length
 
-        dataset = load_dataset("derek-thomas/ScienceQA", split=split)
-        dataset_with_images = [item for item in dataset if item.get("image") is not None]
+        if samples is None:
+            samples = build_scienceqa_samples(
+                split=split,
+                train_num=train_num,
+                seed=seed,
+            )
 
-        if len(dataset_with_images) < train_num:
-            selected_data = dataset_with_images
-        else:
-            import random
-
-            random.seed(20240306)
-            random.shuffle(dataset_with_images)
-            selected_data = dataset_with_images[:train_num]
-
-        self.samples = []
-        for item in selected_data:
-            question = item.get("question", "")
-            choices = item.get("choices", [])
-            choices_text = ""
-            for idx, choice in enumerate(choices):
-                choices_text += f"({chr(65 + idx)}) {choice}\n"
-
-            answer_idx = item.get("answer", 0)
-            answer = choices[answer_idx] if choices and answer_idx < len(choices) else ""
-            lecture = item.get("lecture", "")
-            solution = item.get("solution", "")
-
-            instruction = f"<image>\nQuestion: {question}\nOptions:\n{choices_text}Answer:"
-            if lecture:
-                response = f"Explanation: {lecture}\nSolution: {solution}\nAnswer: {answer}"
-            else:
-                response = f"Solution: {solution}\nAnswer: {answer}"
-
-            self.samples.append({
-                "image": item.get("image"),
-                "instruction": instruction,
-                "response": response,
-            })
+        self.samples = samples
 
     def __len__(self):
         return len(self.samples)
@@ -194,6 +214,10 @@ def setup_args():
                        help="训练数据来源 (vq_lord 或 scienceqa)")
     parser.add_argument("--scienceqa_split", type=str, default="train",
                        help="ScienceQA 数据集 split")
+    parser.add_argument("--scienceqa_seed", type=int, default=20240306,
+                       help="ScienceQA 划分随机种子")
+    parser.add_argument("--scienceqa_eval_split", type=str, default="validation",
+                       help="ScienceQA 验证/测试 split")
     parser.add_argument("--reuse_vq_codebook", type=int, default=1,
                        help="若存在已保存的VQ codebook则复用并跳过Stage1")
     parser.add_argument("--vq_codebook_path", type=str, default="",
@@ -250,6 +274,20 @@ def load_model_and_processor(args):
     
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+    # 训练场景下关闭 KV cache，避免与梯度检查点冲突
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
+    # 显式设置 gradient checkpointing 的 use_reentrant，消除警告
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            # 兼容不支持该参数的版本
+            model.gradient_checkpointing_enable()
     
     return model, processor
 
@@ -642,13 +680,30 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
             
             # ========== Step 1: 双样本生成 ==========
             # 找到 prompt 部分 (labels == -100 的部分是 prompt)
-            # 简化处理：使用完整 input_ids 作为 prompt 进行生成
+            # 注意：部分数据集未标注 prompt，会导致 prompt_len=0
             prompt_len = (labels == -100).sum(dim=-1).min().item()
             prompt_ids = input_ids[:, :max(prompt_len, 1)]
             prompt_mask = attention_mask[:, :max(prompt_len, 1)]
+
+            # 保障 prompt 中包含 image token，否则生成会报错
+            image_token_id = getattr(model.config, "image_token_index", None)
+            if image_token_id is None:
+                image_token_id = getattr(model.config, "image_token_id", None)
+
+            has_image_token = True
+            if image_token_id is not None:
+                has_image_token = (prompt_ids == image_token_id).any().item()
+
+            if prompt_len <= 0 or not has_image_token:
+                prompt_ids = input_ids
+                prompt_mask = attention_mask
             
             model.eval()
             with torch.no_grad():
+                # 生成阶段无需梯度，临时关闭 checkpoint 以消除警告
+                gc_enabled = getattr(model, "is_gradient_checkpointing", False)
+                if gc_enabled and hasattr(model, "gradient_checkpointing_disable"):
+                    model.gradient_checkpointing_disable()
                 # 生成样本 S1
                 gen_output_1 = model.generate(
                     input_ids=prompt_ids,
@@ -672,6 +727,14 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
                     temperature=0.7,
                     pad_token_id=model.config.pad_token_id or 0,
                 )
+
+                if gc_enabled and hasattr(model, "gradient_checkpointing_enable"):
+                    try:
+                        model.gradient_checkpointing_enable(
+                            gradient_checkpointing_kwargs={"use_reentrant": False}
+                        )
+                    except TypeError:
+                        model.gradient_checkpointing_enable()
             
             model.train()
             
@@ -913,7 +976,6 @@ def load_stage2_checkpoint(model, ckpt_path: str):
             model.set_adapter("stage2")
         else:
             # 直接加载状态字典
-            import torch
             adapter_weights = os.path.join(ckpt_path, "adapter_model.safetensors")
             if os.path.exists(adapter_weights):
                 from safetensors.torch import load_file
@@ -958,11 +1020,24 @@ def main():
     # 加载数据
     print("\n加载训练数据...")
     if args.dataset_name == "scienceqa":
-        dataset = ScienceQADataset(
-            processor=processor,
+        train_samples = build_scienceqa_samples(
             split=args.scienceqa_split,
             train_num=args.train_num,
+            seed=args.scienceqa_seed,
+        )
+
+        train_dataset = ScienceQADataset(
+            processor=processor,
             max_length=args.max_length,
+            samples=train_samples,
+            seed=args.scienceqa_seed,
+        )
+        test_dataset = ScienceQADataset(
+            processor=processor,
+            split=args.scienceqa_eval_split,
+            train_num=0,
+            max_length=args.max_length,
+            seed=args.scienceqa_seed,
         )
     else:
         collector = GPT4VDataCollector(save_dir=args.data_dir)
@@ -981,12 +1056,13 @@ def main():
         visual_qa_items = [VisualQAItem(**item) for item in visual_qa_data]
         desc_items = [ImageDescriptionItem(**item) for item in image_descriptions]
 
-        dataset = VQLORDDataset(
+        train_dataset = VQLORDDataset(
             visual_qa_data=visual_qa_items,
             image_descriptions=desc_items,
             processor=processor,
             max_length=args.max_length,
         )
+        test_dataset = None
     
     def vq_lord_collate(batch):
         batch = [b for b in batch if b is not None]
@@ -1018,14 +1094,16 @@ def main():
         return collated
 
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,
         collate_fn=vq_lord_collate,
     )
     
-    print(f"训练数据量: {len(dataset)}")
+    print(f"训练数据量: {len(train_dataset)}")
+    if test_dataset is not None:
+        print(f"测试数据量: {len(test_dataset)}")
     
     # 根据阶段训练
     if args.stage >= 1:

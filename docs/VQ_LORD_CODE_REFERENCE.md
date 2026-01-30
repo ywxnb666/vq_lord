@@ -15,6 +15,7 @@
 5. [train_vq_lord.py — 主训练脚本](#train_vq_lordpy--主训练脚本)
 6. [启动脚本和配置文件](#启动脚本和配置文件)
 7. [已知问题与注意事项](#已知问题与注意事项)
+8. [sciqa_process.py — ScienceQA 验证脚本](#sciqa_processpy--scienceqa-验证脚本)
 
 ---
 
@@ -280,3 +281,41 @@ VQ-LoRD 的完整训练流程实现，包含模型加载、VQ 层添加、三阶
 ---
 
 **文档结束**
+
+---
+
+## sciqa_process.py — ScienceQA 验证脚本
+
+### 功能概述
+
+该脚本用于对训练后的多模态学生模型进行 ScienceQA 验证，支持图像 + 文本输入，输出选择题准确率并保存详细结果。
+
+### 核心功能
+
+1. **多模态推理**：使用 `LlavaNextProcessor` 构建 `<image> + Question + Options` 的提示词，并传入图像进行生成。
+2. **答案解析**：优先解析 `Answer: X` 形式的字母答案，若无则尝试匹配选项文本。
+3. **评测输出**：输出准确率，保存 `metrics` 和逐样本结果到 JSON 文件。
+
+### 主要参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--model_path` | 基础模型路径 | 必填 |
+| `--adapter_path` | LoRA 适配器路径 | 空 |
+| `--split` | ScienceQA split | `validation` |
+| `--max_samples` | 最大评测样本数 | `200` |
+| `--max_new_tokens` | 生成长度 | `64` |
+| `--use_4bit` | 是否 4-bit 加载 | `1` |
+| `--save_path` | 结果保存路径 | `./sciqa_eval.json` |
+
+### 结果文件示例
+
+结果文件为 JSON，包含：
+
+- `metrics`: 准确率、总样本数、正确数
+- `results`: 每条样本的 `question / choices / pred_idx / answer_idx / output`
+
+### 划分一致性说明
+
+训练使用官方 `train` split，验证使用官方 `validation`/`test` split，保持数据划分一致性。
+

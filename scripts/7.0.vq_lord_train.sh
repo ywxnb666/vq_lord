@@ -81,6 +81,8 @@ export use_4bit=1               # 使用 4-bit 量化
 export train_num=500            # 训练样本数
 export dataset_name="scienceqa" # 使用 ScienceQA 数据集
 export scienceqa_split="train"  # ScienceQA split
+export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
+export scienceqa_seed=20240306  # ScienceQA 划分随机种子
 
 # 日志和保存
 export log_step=10
@@ -125,7 +127,11 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
     --train_num=$train_num \
     --dataset_name=$dataset_name \
     --scienceqa_split=$scienceqa_split \
+    --scienceqa_eval_split=$scienceqa_eval_split \
+    --scienceqa_seed=$scienceqa_seed \
     --reuse_vq_codebook=1 \
+    --reuse_stage2=1 \
+    --stage2_ckpt_path=$save_dir/stage2_vision \
     --save_path=$save_dir \
     --log_step=$log_step \
     --save_step=$save_step \
@@ -134,5 +140,26 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
 echo "======================================================"
 echo "VQ-LoRD 训练完成"
 echo "======================================================"
+
+# ================== 训练结果验证 ==================
+# if [ "$stage" -ge 3 ]; then
+#     echo "======================================================"
+#     echo "开始 ScienceQA 验证"
+#     echo "======================================================"
+
+#     $python ${root_dir}sciqa_process.py \
+#         --model_path=$model_path \
+#         --adapter_path=$save_dir/stage3_lord_final \
+#         --split=$scienceqa_eval_split \
+#         --max_samples=200 \
+#         --max_new_tokens=64 \
+#         --use_4bit=$use_4bit \
+#         --save_path=$save_dir/sciqa_eval.json
+
+#     echo "======================================================"
+#     echo "ScienceQA 验证完成"
+#     echo "结果保存在: $save_dir/sciqa_eval.json"
+#     echo "======================================================"
+# fi
 
 # 7.0.vq_lord_train.sh ends here
