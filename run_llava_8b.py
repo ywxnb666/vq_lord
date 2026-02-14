@@ -1,21 +1,10 @@
-from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration, BitsAndBytesConfig
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 import torch
 from PIL import Image
 import requests
 
-processor = LlavaNextProcessor.from_pretrained("/root/workspace/models/llama3-llava-next-8b-hf")
-bnb_config = BitsAndBytesConfig(
-  load_in_4bit=True,
-  bnb_4bit_use_double_quant=True,
-  bnb_4bit_compute_dtype=torch.bfloat16,
-  bnb_4bit_quant_type="nf4",
-)
-model = LlavaNextForConditionalGeneration.from_pretrained(
-  "/root/workspace/models/llama3-llava-next-8b-hf",
-  device_map="auto",
-  quantization_config=bnb_config,
-  trust_remote_code=True,
-) 
+processor = LlavaNextProcessor.from_pretrained("/root/autodl-tmp/models/llama3-llava-next-8b-hf")
+model = LlavaNextForConditionalGeneration.from_pretrained("/root/autodl-tmp/models/llama3-llava-next-8b-hf", torch_dtype=torch.float16, device_map="auto") 
 
 # prepare image and text prompt, using the appropriate prompt template
 url = "https://github.com/haotian-liu/LLaVA/blob/1a91fc274d7c35a9b50b3cb29c4247ae5837ce39/images/llava_v1_5_radar.jpg?raw=true"
