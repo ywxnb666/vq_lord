@@ -58,7 +58,7 @@ def build_scienceqa_samples(
     train_num: int,
     seed: int,
 ) -> List[dict]:
-    dataset = load_dataset("/root/autodl-tmp/datasets/ScienceQA", split=split)
+    dataset = load_dataset("/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/dataset/ScienceQA", split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
     import random
@@ -177,7 +177,7 @@ def setup_args():
     
     # 模型参数
     parser.add_argument("--model_path", type=str, 
-                       default="/root/workspace/models/llama3-llava-next-8b-hf",
+                       default="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf",
                        help="LLaVA 模型路径")
     parser.add_argument("--victim_model", type=str,
                        default="gpt-4-vision-preview",
@@ -774,6 +774,11 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
             if prompt_len <= 0 or not has_image_token:
                 prompt_ids = input_ids
                 prompt_mask = attention_mask
+
+            # 防止生成阶段再次生成 <image> token，导致 image tokens 与 image features 数量不一致
+            bad_words_ids = None
+            if image_token_id is not None:
+                bad_words_ids = [[int(image_token_id)]]
             
             model.eval()
             with torch.no_grad():
@@ -790,6 +795,7 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
                     do_sample=True,
                     max_new_tokens=max_new_tokens,
                     temperature=0.7,
+                    bad_words_ids=bad_words_ids,
                     pad_token_id=model.config.pad_token_id or 0,
                 )
                 
@@ -802,8 +808,30 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
                     do_sample=True,
                     max_new_tokens=max_new_tokens,
                     temperature=0.7,
+                    bad_words_ids=bad_words_ids,
                     pad_token_id=model.config.pad_token_id or 0,
                 )
+
+                # 双保险：若采样结果中仍出现新增 <image> token，则替换为 eos/pad
+                if image_token_id is not None:
+                    eos_or_pad_id = model.config.eos_token_id
+                    if eos_or_pad_id is None:
+                        eos_or_pad_id = model.config.pad_token_id or 0
+
+                    allowed_img_counts = (prompt_ids == image_token_id).sum(dim=1)
+
+                    def _strip_extra_image_tokens(seq_ids, allowed_counts):
+                        seq_ids = seq_ids.clone()
+                        for bi in range(seq_ids.shape[0]):
+                            img_pos = (seq_ids[bi] == image_token_id).nonzero(as_tuple=False).squeeze(-1)
+                            allowed = int(allowed_counts[bi].item())
+                            if img_pos.numel() > allowed:
+                                extra = int(img_pos.numel() - allowed)
+                                seq_ids[bi, img_pos[-extra:]] = eos_or_pad_id
+                        return seq_ids
+
+                    gen_output_1 = _strip_extra_image_tokens(gen_output_1, allowed_img_counts)
+                    gen_output_2 = _strip_extra_image_tokens(gen_output_2, allowed_img_counts)
 
                 if gc_enabled and hasattr(model, "gradient_checkpointing_enable"):
                     try:

@@ -18,7 +18,7 @@ import argparse
 import json
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 from datasets import load_dataset
@@ -31,7 +31,13 @@ def build_prompt(question: str, choices: List[str]) -> str:
     choices_text = ""
     for idx, choice in enumerate(choices):
         choices_text += f"({chr(65 + idx)}) {choice}\n"
-    return f"<image>\nQuestion: {question}\nOptions:\n{choices_text}Answer:"
+    return (
+        f"<image>\n"
+        f"Question: {question}\n"
+        f"Options:\n{choices_text}"
+        "Answer with only one option letter (A, B, C, ...).\n"
+        "Answer:"
+    )
 
 
 def normalize_text(text: str) -> str:
@@ -45,22 +51,35 @@ def extract_choice_from_output(output_text: str, choices: List[str]) -> Optional
     if not output_text:
         return None
 
-    normalized = normalize_text(output_text)
+    raw = output_text.strip()
+    normalized = normalize_text(raw)
 
-    match = re.search(r"answer\s*[:：]\s*([a-z])", normalized)
+    # 1) 最优先：开头直接给选项字母，如 "A" / "(B)" / "答案：C"
+    max_letter = chr(65 + len(choices) - 1) if choices else "A"
+    letter_class = f"A-{max_letter}" if max_letter >= "A" else "A"
+
+    match = re.search(rf"^\s*\(?\s*([{letter_class}])\s*\)?\b", raw, flags=re.IGNORECASE)
+    if match:
+        idx = ord(match.group(1).upper()) - 65
+        if 0 <= idx < len(choices):
+            return idx
+
+    # 2) 其次：显式 answer/答案 字段
+    match = re.search(rf"(?:answer|答案)\s*[:：]\s*\(?\s*([{letter_class}])\s*\)?", raw, flags=re.IGNORECASE)
     if match:
         letter = match.group(1).upper()
         idx = ord(letter) - 65
         if 0 <= idx < len(choices):
             return idx
 
-    match = re.search(r"\b([a-z])\b", normalized)
-    if match:
-        letter = match.group(1).upper()
-        idx = ord(letter) - 65
-        if 0 <= idx < len(choices):
-            return idx
+    # 3) 再次：文本中出现了唯一可用字母选项
+    letter_hits = re.findall(rf"\b([{letter_class}])\b", raw, flags=re.IGNORECASE)
+    if letter_hits:
+        unique_hits = {ord(x.upper()) - 65 for x in letter_hits if 0 <= ord(x.upper()) - 65 < len(choices)}
+        if len(unique_hits) == 1:
+            return list(unique_hits)[0]
 
+    # 4) 最后：按选项文本匹配（仅当唯一命中）
     choice_hits = []
     for idx, choice in enumerate(choices):
         if not choice:
@@ -72,6 +91,72 @@ def extract_choice_from_output(output_text: str, choices: List[str]) -> Optional
         return choice_hits[0]
 
     return None
+
+
+def _get_letter_token_candidates(tokenizer, letter: str) -> List[int]:
+    """收集表示某个选项字母的候选 token id（单 token 形式）。"""
+    variants = [
+        letter,
+        f" {letter}",
+        f"({letter})",
+        f" ({letter})",
+        f"{letter}.",
+        f" {letter}.",
+        f"答案:{letter}",
+        f"Answer: {letter}",
+    ]
+
+    candidate_ids = set()
+    for text in variants:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) == 1:
+            candidate_ids.add(ids[0])
+
+    if not candidate_ids:
+        ids = tokenizer.encode(letter, add_special_tokens=False)
+        if ids:
+            candidate_ids.add(ids[0])
+
+    return list(candidate_ids)
+
+
+def predict_choice_with_next_token_logits(
+    model,
+    tokenizer,
+    input_ids,
+    attention_mask,
+    pixel_values,
+    image_sizes,
+    num_choices: int,
+) -> Optional[int]:
+    """基于 Answer: 之后的下一 token 概率直接选择 A/B/C/..."""
+    if num_choices <= 0:
+        return None
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            use_cache=False,
+        )
+
+    next_token_logits = outputs.logits[0, -1, :]
+
+    best_idx = None
+    best_score = None
+    for idx in range(num_choices):
+        letter = chr(65 + idx)
+        cand_ids = _get_letter_token_candidates(tokenizer, letter)
+        if not cand_ids:
+            continue
+        score = max(next_token_logits[token_id].item() for token_id in cand_ids)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = idx
+
+    return best_idx
 
 
 def load_model_and_processor(model_path: str, adapter_path: str, use_4bit: int):
@@ -96,9 +181,13 @@ def load_model_and_processor(model_path: str, adapter_path: str, use_4bit: int):
             trust_remote_code=True,
         )
 
-    if adapter_path and os.path.exists(adapter_path):
-        model = PeftModel.from_pretrained(model, adapter_path)
-        model.eval()
+    if adapter_path:
+        if os.path.exists(adapter_path):
+            model = PeftModel.from_pretrained(model, adapter_path)
+        else:
+            print(f"[Warning] adapter_path does not exist, skip LoRA loading: {adapter_path}")
+
+    model.eval()
 
     processor = LlavaNextProcessor.from_pretrained(model_path, trust_remote_code=True)
     if processor.tokenizer.pad_token is None:
@@ -114,8 +203,9 @@ def run_eval(
     max_samples: int,
     max_new_tokens: int,
     save_path: str,
+    answer_mode: str,
 ):
-    dataset = load_dataset("derek-thomas/ScienceQA", split=split)
+    dataset = load_dataset("/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/dataset/ScienceQA", split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
     if max_samples > 0 and len(dataset_with_images) > max_samples:
@@ -147,19 +237,51 @@ def run_eval(
         if image_sizes is not None:
             image_sizes = image_sizes.to(model.device)
 
-        with torch.no_grad():
-            generated = model.generate(
+        output_text = ""
+        pred_idx = None
+
+        if answer_mode in ("generate", "hybrid"):
+            with torch.no_grad():
+                generated = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=1,
+                    do_sample=False,
+                    pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                    eos_token_id=processor.tokenizer.eos_token_id,
+                )
+
+            # 仅解码新生成部分，避免把整段 prompt 回显当成答案解析。
+            prompt_len = input_ids.shape[-1]
+            gen_tokens = generated[0][prompt_len:]
+            output_text = processor.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+
+            if not output_text:
+                # 兜底：部分模型可能返回异常切分，保留完整输出便于排查。
+                output_text = processor.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+
+            pred_idx = extract_choice_from_output(output_text, choices)
+
+        if pred_idx is None and answer_mode in ("logits", "hybrid"):
+            pred_idx = predict_choice_with_next_token_logits(
+                model=model,
+                tokenizer=processor.tokenizer,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                num_choices=len(choices),
             )
+            if answer_mode == "logits":
+                output_text = "[logits_mode]"
+            elif not output_text:
+                output_text = "[hybrid_fallback_to_logits]"
+            else:
+                output_text = f"{output_text}\n[hybrid_fallback_to_logits]"
 
-        output_text = processor.tokenizer.decode(generated[0], skip_special_tokens=True)
-        pred_idx = extract_choice_from_output(output_text, choices)
         is_correct = pred_idx == answer_idx
 
         total += 1
@@ -178,7 +300,9 @@ def run_eval(
     accuracy = correct / total if total else 0.0
     metrics = {"accuracy": accuracy, "total": total, "correct": correct}
 
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump({"metrics": metrics, "results": results}, f, ensure_ascii=False, indent=2)
 
@@ -194,6 +318,13 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")
     parser.add_argument("--max_new_tokens", type=int, default=64, help="生成长度")
     parser.add_argument("--use_4bit", type=int, default=1, help="是否使用4bit加载")
+    parser.add_argument(
+        "--answer_mode",
+        type=str,
+        default="hybrid",
+        choices=["generate", "logits", "hybrid"],
+        help="答案获取方式：generate=仅生成解析, logits=仅下一token打分, hybrid=生成失败时回退logits",
+    )
     parser.add_argument("--save_path", type=str, default="./sciqa_eval.json", help="保存结果路径")
     return parser.parse_args()
 
@@ -210,6 +341,7 @@ def main():
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
         save_path=args.save_path,
+        answer_mode=args.answer_mode,
     )
 
 

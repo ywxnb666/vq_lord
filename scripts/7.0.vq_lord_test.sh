@@ -5,10 +5,7 @@
 # VQ-LoRD 训练脚本
 # 用于窃取多模态模型的图像识别能力
 #
-# 训练流程:
-# 1. 阶段1: VQ Codebook 预训练
-# 2. 阶段2: 视觉能力蒸馏 
-# 3. 阶段3: LoRD 联合训练
+# 测试
 #
 # Author: VQ-LoRD Project
 # Created: January 2026
@@ -117,57 +114,16 @@ export save_step=100
 # ================== 训练执行 ==================
 
 echo "======================================================"
-echo "VQ-LoRD 训练开始"
+echo "VQ-LoRD 测试开始"
 echo "======================================================"
 echo "模型路径: $model_path"
 echo "教师模型: $victim_model"
 echo "VQ Codebook 大小: $vq_codebook_size"
-echo "训练阶段: $stage"
-echo "保存路径: $save_dir"
 echo "======================================================"
 
 # 创建必要目录
 mkdir -p $save_dir
 mkdir -p $data_dir
-
-# 运行训练
-$python ${root_dir}vq_lord/train_vq_lord.py \
-    --model_path=$model_path \
-    --victim_model=$victim_model \
-    --vq_codebook_size=$vq_codebook_size \
-    --vq_commitment_cost=$vq_commitment_cost \
-    --freeze_vision_tower=$freeze_vision_tower \
-    --alpha=$alpha \
-    --beta=$beta \
-    --temperature=$temperature \
-    --stage=$stage \
-    --epochs=$epochs \
-    --batch_size=$batch_size \
-    --lr=$lr \
-    --max_length=$max_length \
-    --use_lora=$use_lora \
-    --lora_rank=$lora_rank \
-    --lora_alpha=$lora_alpha_val \
-    --use_4bit=$use_4bit \
-    --grad_accum=$grad_accum \
-    --max_new_tokens=$max_new_tokens \
-    --data_dir=$data_dir \
-    --train_num=$train_num \
-    --dataset_name=$dataset_name \
-    --scienceqa_split=$scienceqa_split \
-    --scienceqa_eval_split=$scienceqa_eval_split \
-    --scienceqa_seed=$scienceqa_seed \
-    --reuse_vq_codebook=1 \
-    --reuse_stage2=1 \
-    --stage2_ckpt_path=$save_dir/stage2_vision \
-    --save_path=$save_dir \
-    --log_step=$log_step \
-    --save_step=$save_step \
-    --device="cuda"
-
-echo "======================================================"
-echo "VQ-LoRD 训练完成"
-echo "======================================================"
 
 # ================== 训练结果验证 ==================
 if [ "$stage" -ge 3 ]; then
@@ -189,5 +145,3 @@ if [ "$stage" -ge 3 ]; then
     echo "结果保存在: $save_dir/sciqa_eval.json"
     echo "======================================================"
 fi
-
-7.0.vq_lord_train.sh ends here
