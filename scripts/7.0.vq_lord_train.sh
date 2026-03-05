@@ -72,36 +72,36 @@ export temperature=1.5          # 蒸馏温度
 # ================== 训练参数选择区 (请二选一取消注释) ==================
 
 # --- 选项 A: 针对 A800 80GB PCIe 优化 (默认) ---
-# export stage=3                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
-# export epochs=3                 # 训练轮数
-# export batch_size=1             # 批次大小 (LLaVA-Next 不支持 bs>1, 不同图片 patch 数不同)
-# export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
-# export lr=2e-5                  # 学习率 (等效bs更大,lr适当降低)
-# export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
-# export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
-# # LoRA 参数
-# export use_lora=1               # 使用 LoRA
-# export lora_rank=64             # LoRA rank (80GB可支持更大rank,提升拟合能力)
-# export lora_alpha_val=128       # LoRA alpha (通常为rank的2倍)
-# # 量化
-# export use_4bit=1               # 使用 4-bit 量化
-
-# --- 选项 B: 针对 H200 141GB SXM 优化 (高性能) ---
-export stage=3                  # 训练阶段
-export epochs=5                 # 训练轮数 (算力充裕，可多训练几轮)
-export batch_size=1             # 批次大小 (保持1以应对动态分辨率)
-export grad_accum=32            # 梯度累积步数 (H200显存巨大，大幅增加等效BS至32，稳定训练)
-export lr=4e-5                  # 学习率 (BS增大，LR适当增加)
-export max_length=4096          # 最大序列长度 (141GB显存可支持极长上下文，提升指令跟随)
-export max_new_tokens=512       # LoRD生成最长token数 (生成更详细的推理过程)
+export stage=3                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
+export epochs=3                 # 训练轮数
+export batch_size=1             # 批次大小 (LLaVA-Next 不支持 bs>1, 不同图片 patch 数不同)
+export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
+export lr=2e-5                  # 学习率 (等效bs更大,lr适当降低)
+export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
+export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
 # LoRA 参数
 export use_lora=1               # 使用 LoRA
-export lora_rank=256            # LoRA rank (H200可支持极大秩，接近全量微调效果)
-export lora_alpha_val=512       # LoRA alpha 
+export lora_rank=64             # LoRA rank (80GB可支持更大rank,提升拟合能力)
+export lora_alpha_val=128       # LoRA alpha (通常为rank的2倍)
 # 量化
-export use_4bit=1               # H200 显存足够，关闭 4-bit 量化，使用 bf16 精度训练提升效果
+export use_4bit=1               # 使用 4-bit 量化
 
-# ---------------------
+# # --- 选项 B: 针对 H200 141GB SXM 优化 (高性能) ---
+# export stage=3                  # 训练阶段
+# export epochs=5                 # 训练轮数 (算力充裕，可多训练几轮)
+# export batch_size=1             # 批次大小 (保持1以应对动态分辨率)
+# export grad_accum=32            # 梯度累积步数 (H200显存巨大，大幅增加等效BS至32，稳定训练)
+# export lr=4e-5                  # 学习率 (BS增大，LR适当增加)
+# export max_length=4096          # 最大序列长度 (141GB显存可支持极长上下文，提升指令跟随)
+# export max_new_tokens=512       # LoRD生成最长token数 (生成更详细的推理过程)
+# # LoRA 参数
+# export use_lora=1               # 使用 LoRA
+# export lora_rank=256            # LoRA rank (H200可支持极大秩，接近全量微调效果)
+# export lora_alpha_val=512       # LoRA alpha 
+# # 量化
+# export use_4bit=1               # 使用 4-bit 量化（若需全精度训练请设为0）
+
+# # ---------------------
 
 # 数据
 export train_num=500           # 训练样本数 (更多数据充分利用算力)
@@ -109,6 +109,8 @@ export dataset_name="scienceqa" # 使用 ScienceQA 数据集
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
 export scienceqa_seed=20240306  # ScienceQA 划分随机种子
+export collect_teacher_data=1    # 自动补齐 GPT-4V 教师回答
+export strict_teacher_distill=1  # 严格模式：缺少教师回答则报错
 
 # 日志和保存
 export log_step=10
@@ -157,6 +159,8 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
     --scienceqa_split=$scienceqa_split \
     --scienceqa_eval_split=$scienceqa_eval_split \
     --scienceqa_seed=$scienceqa_seed \
+    --collect_teacher_data=$collect_teacher_data \
+    --strict_teacher_distill=$strict_teacher_distill \
     --reuse_vq_codebook=1 \
     --reuse_stage2=1 \
     --stage2_ckpt_path=$save_dir/stage2_vision \
@@ -168,26 +172,3 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
 echo "======================================================"
 echo "VQ-LoRD 训练完成"
 echo "======================================================"
-
-# ================== 训练结果验证 ==================
-if [ "$stage" -ge 3 ]; then
-    echo "======================================================"
-    echo "开始 ScienceQA 验证"
-    echo "======================================================"
-
-    $python ${root_dir}vq_lord/sciqa_process.py \
-        --model_path=$model_path \
-        --adapter_path=$save_dir/stage3_lord_final \
-        --split=$scienceqa_eval_split \
-        --max_samples=200 \
-        --max_new_tokens=64 \
-        --use_4bit=$use_4bit \
-        --save_path=$save_dir/sciqa_eval.json
-
-    echo "======================================================"
-    echo "ScienceQA 验证完成"
-    echo "结果保存在: $save_dir/sciqa_eval.json"
-    echo "======================================================"
-fi
-
-7.0.vq_lord_train.sh ends here

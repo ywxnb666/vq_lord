@@ -15,6 +15,7 @@ Created: January 2026
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,43 @@ from datasets import load_dataset
 from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor, BitsAndBytesConfig
 from peft import PeftModel
 from tqdm import tqdm
+from vq_module import VQVisionEncoder
+
+
+def file_md5(path: str) -> str:
+    md5 = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def probe_adapter_fingerprint(adapter_path: str) -> dict:
+    info = {
+        "adapter_path": adapter_path,
+        "exists": os.path.exists(adapter_path),
+        "adapter_model_file": "",
+        "adapter_model_md5": "",
+        "adapter_config_md5": "",
+    }
+    if not info["exists"]:
+        return info
+
+    safetensors_path = os.path.join(adapter_path, "adapter_model.safetensors")
+    bin_path = os.path.join(adapter_path, "adapter_model.bin")
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+
+    if os.path.exists(safetensors_path):
+        info["adapter_model_file"] = safetensors_path
+        info["adapter_model_md5"] = file_md5(safetensors_path)
+    elif os.path.exists(bin_path):
+        info["adapter_model_file"] = bin_path
+        info["adapter_model_md5"] = file_md5(bin_path)
+
+    if os.path.exists(config_path):
+        info["adapter_config_md5"] = file_md5(config_path)
+
+    return info
 
 
 def build_prompt(question: str, choices: List[str]) -> str:
@@ -159,7 +197,101 @@ def predict_choice_with_next_token_logits(
     return best_idx
 
 
-def load_model_and_processor(model_path: str, adapter_path: str, use_4bit: int):
+def add_vq_inference_hook(model, vq_codebook_size: int, freeze_vision_tower: int):
+    """给模型注入与训练一致的 VQ 视觉量化 hook（推理版）。"""
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    vision_tower = base_model.vision_tower
+
+    vq_vision_encoder = VQVisionEncoder(
+        vision_tower=vision_tower,
+        num_embeddings=vq_codebook_size,
+        freeze_vision_tower=bool(freeze_vision_tower),
+    )
+
+    try:
+        vision_device = next(vision_tower.parameters()).device
+        vq_vision_encoder.to(vision_device)
+    except StopIteration:
+        pass
+
+    base_model.vq_vision_encoder = vq_vision_encoder
+    base_model._vq_loss_container = {"loss": None, "logits": None}
+
+    def vq_hook(module, input, output):
+        if hasattr(output, "last_hidden_state"):
+            vision_features = output.last_hidden_state
+        elif isinstance(output, tuple):
+            vision_features = output[0]
+        else:
+            vision_features = output
+
+        need_move = (
+            base_model.vq_vision_encoder.vq.embedding.weight.device != vision_features.device
+            or base_model.vq_vision_encoder.vq.embedding.weight.dtype != vision_features.dtype
+        )
+        if need_move:
+            base_model.vq_vision_encoder.vq.to(device=vision_features.device, dtype=vision_features.dtype)
+
+        quantized, indices, vq_loss, _ = base_model.vq_vision_encoder.vq(
+            vision_features, return_logits=True
+        )
+
+        base_model._vq_loss_container["loss"] = vq_loss
+        base_model._vq_loss_container["indices"] = indices
+
+        if hasattr(output, "last_hidden_state"):
+            output.last_hidden_state = quantized
+            return output
+        elif isinstance(output, tuple):
+            return (quantized,) + output[1:]
+        else:
+            return quantized
+
+    base_model._vq_hook_handle = vision_tower.register_forward_hook(vq_hook)
+    return model
+
+
+def load_vq_codebook_for_inference(model, vq_codebook_path: str):
+    """加载训练得到的 VQ codebook。"""
+    if not vq_codebook_path:
+        return False
+    if not os.path.exists(vq_codebook_path):
+        print(f"[Warning] vq_codebook_path does not exist, skip VQ loading: {vq_codebook_path}")
+        return False
+
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    try:
+        codebook = torch.load(vq_codebook_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # 兼容旧版 PyTorch
+        codebook = torch.load(vq_codebook_path, map_location="cpu")
+
+    emb = base_model.vq_vision_encoder.vq.embedding.weight
+    codebook = codebook.to(device=emb.device, dtype=emb.dtype)
+    emb.data.copy_(codebook)
+    return True
+
+
+def load_model_and_processor(
+    model_path: str,
+    adapter_path: str,
+    use_4bit: int,
+    use_vq: int,
+    vq_codebook_size: int,
+    freeze_vision_tower: int,
+    vq_codebook_path: str,
+):
+    load_info = {
+        "model_path": model_path,
+        "adapter_path": adapter_path,
+        "adapter_loaded": False,
+        "adapter_fingerprint": probe_adapter_fingerprint(adapter_path) if adapter_path else None,
+        "use_vq": bool(use_vq),
+        "vq_codebook_size": int(vq_codebook_size),
+        "vq_codebook_path": vq_codebook_path,
+        "vq_codebook_loaded": False,
+    }
+
     if use_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -184,8 +316,24 @@ def load_model_and_processor(model_path: str, adapter_path: str, use_4bit: int):
     if adapter_path:
         if os.path.exists(adapter_path):
             model = PeftModel.from_pretrained(model, adapter_path)
+            load_info["adapter_loaded"] = True
         else:
-            print(f"[Warning] adapter_path does not exist, skip LoRA loading: {adapter_path}")
+            raise FileNotFoundError(
+                f"adapter_path does not exist, refusing to fallback to base model: {adapter_path}"
+            )
+
+    if use_vq:
+        model = add_vq_inference_hook(
+            model,
+            vq_codebook_size=vq_codebook_size,
+            freeze_vision_tower=freeze_vision_tower,
+        )
+        loaded = load_vq_codebook_for_inference(model, vq_codebook_path)
+        load_info["vq_codebook_loaded"] = bool(loaded)
+        if loaded:
+            print(f"[Info] VQ enabled with codebook: {vq_codebook_path}")
+        else:
+            print("[Warning] VQ enabled but codebook not loaded, behavior may mismatch training")
 
     model.eval()
 
@@ -193,7 +341,7 @@ def load_model_and_processor(model_path: str, adapter_path: str, use_4bit: int):
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    return model, processor
+    return model, processor, load_info
 
 
 def run_eval(
@@ -204,6 +352,7 @@ def run_eval(
     max_new_tokens: int,
     save_path: str,
     answer_mode: str,
+    run_config: Optional[dict] = None,
 ):
     dataset = load_dataset("/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/dataset/ScienceQA", split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
@@ -303,8 +452,13 @@ def run_eval(
     save_dir = os.path.dirname(save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
+    payload = {
+        "metrics": metrics,
+        "run_config": run_config or {},
+        "results": results,
+    }
     with open(save_path, "w", encoding="utf-8") as f:
-        json.dump({"metrics": metrics, "results": results}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
     print(f"Results saved to: {save_path}")
@@ -318,6 +472,10 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")
     parser.add_argument("--max_new_tokens", type=int, default=64, help="生成长度")
     parser.add_argument("--use_4bit", type=int, default=1, help="是否使用4bit加载")
+    parser.add_argument("--use_vq", type=int, default=1, help="是否启用训练同款VQ视觉量化路径")
+    parser.add_argument("--vq_codebook_size", type=int, default=8192, help="VQ codebook 大小")
+    parser.add_argument("--freeze_vision_tower", type=int, default=0, help="是否冻结视觉塔参数（仅构图一致性参数）")
+    parser.add_argument("--vq_codebook_path", type=str, default="", help="训练得到的 vq_codebook.pt 路径")
     parser.add_argument(
         "--answer_mode",
         type=str,
@@ -331,9 +489,30 @@ def parse_args():
 
 def main():
     args = parse_args()
-    model, processor = load_model_and_processor(
-        args.model_path, args.adapter_path, args.use_4bit
+    model, processor, load_info = load_model_and_processor(
+        args.model_path,
+        args.adapter_path,
+        args.use_4bit,
+        args.use_vq,
+        args.vq_codebook_size,
+        args.freeze_vision_tower,
+        args.vq_codebook_path,
     )
+    run_config = {
+        "model_path": args.model_path,
+        "adapter_path": args.adapter_path,
+        "adapter_loaded": load_info.get("adapter_loaded", False),
+        "adapter_fingerprint": load_info.get("adapter_fingerprint"),
+        "split": args.split,
+        "max_samples": args.max_samples,
+        "max_new_tokens": args.max_new_tokens,
+        "use_4bit": int(args.use_4bit),
+        "use_vq": int(args.use_vq),
+        "vq_codebook_size": int(args.vq_codebook_size),
+        "vq_codebook_path": args.vq_codebook_path,
+        "vq_codebook_loaded": load_info.get("vq_codebook_loaded", False),
+        "answer_mode": args.answer_mode,
+    }
     run_eval(
         model=model,
         processor=processor,
@@ -342,6 +521,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         save_path=args.save_path,
         answer_mode=args.answer_mode,
+        run_config=run_config,
     )
 
 

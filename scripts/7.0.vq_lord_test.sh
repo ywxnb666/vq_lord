@@ -96,7 +96,7 @@ export use_lora=1               # 使用 LoRA
 export lora_rank=256            # LoRA rank (H200可支持极大秩，接近全量微调效果)
 export lora_alpha_val=512       # LoRA alpha 
 # 量化
-export use_4bit=1               # H200 显存足够，关闭 4-bit 量化，使用 bf16 精度训练提升效果
+export use_4bit=1               # 使用 4-bit 量化（若需全精度训练请设为0）
 
 # ---------------------
 

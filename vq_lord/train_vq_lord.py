@@ -19,6 +19,8 @@ VQ-LoRD 主训练脚本
 
 import gc
 import os
+import json
+import hashlib
 import torch
 import argparse
 from typing import Optional, List
@@ -98,6 +100,154 @@ def build_scienceqa_samples(
     return samples
 
 
+def _safe_name(text: str) -> str:
+    keep = []
+    for ch in text:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            keep.append(ch)
+        else:
+            keep.append("_")
+    return "".join(keep)
+
+
+def _sample_key(sample: dict) -> str:
+    instruction = sample.get("instruction", "")
+    response = sample.get("response", "")
+    image = sample.get("image")
+    size = ""
+    if image is not None and hasattr(image, "size"):
+        size = f"{image.size[0]}x{image.size[1]}"
+    raw = f"{instruction}\n{response}\n{size}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
+    """
+    为 ScienceQA 样本补充 GPT-4V 教师回答（带缓存）
+
+    说明：
+    - 若缓存存在，优先读取缓存；
+    - 若启用采集且存在 API key，则补齐缺失项；
+    - 若 strict_teacher_distill=1 且仍有缺失，将直接报错。
+    """
+    os.makedirs(args.data_dir, exist_ok=True)
+
+    cache_path = args.teacher_cache_path
+    if not cache_path:
+        victim_tag = _safe_name(args.victim_model)
+        cache_name = (
+            f"scienceqa_teacher_{victim_tag}_{args.scienceqa_split}_"
+            f"n{args.train_num}_seed{args.scienceqa_seed}.json"
+        )
+        cache_path = os.path.join(args.data_dir, cache_name)
+
+    cache_data = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            cache_data = payload.get("samples", {}) if isinstance(payload, dict) else {}
+            print(f"已加载教师缓存: {cache_path}, 条目数={len(cache_data)}")
+        except Exception as e:
+            print(f"警告: 教师缓存读取失败，将忽略缓存 ({e})")
+            cache_data = {}
+
+    need_collect = []
+    for i, sample in enumerate(samples):
+        key = _sample_key(sample)
+        teacher_response = cache_data.get(key)
+        if teacher_response:
+            sample["teacher_response"] = teacher_response
+            sample["teacher_source"] = args.victim_model
+        else:
+            need_collect.append((i, key))
+
+    if need_collect and args.collect_teacher_data:
+        collector = GPT4VDataCollector(
+            model=args.victim_model,
+            save_dir=args.data_dir,
+        )
+
+        if not collector.api_key:
+            msg = (
+                "需要采集 GPT-4V 教师回答，但未检测到 OPENAI_API_KEY。"
+                "可设置环境变量，或提供已有 teacher cache。"
+            )
+            if args.strict_teacher_distill:
+                raise RuntimeError(msg)
+            print(f"警告: {msg}")
+        else:
+            print(f"开始采集教师回答，待补齐样本数: {len(need_collect)}")
+            for rank, (idx, key) in enumerate(tqdm(need_collect, desc="采集 GPT-4V 教师回答"), start=1):
+                sample = samples[idx]
+                image = sample.get("image")
+                instruction = sample.get("instruction", "")
+
+                teacher_prompt = (
+                    "你是严谨的视觉科学题解答助手。"
+                    "请基于图片回答下面的选择题。"
+                    "要求：先给出简短解释，再给出最终答案文本。"
+                    "输出格式必须为：\n"
+                    "Explanation: ...\n"
+                    "Answer: ...\n\n"
+                    f"{instruction}"
+                )
+
+                teacher_response = None
+                if image is not None:
+                    teacher_response = collector.query_gpt4v_image(
+                        image=image,
+                        prompt=teacher_prompt,
+                        max_tokens=args.max_new_tokens,
+                        image_format="PNG",
+                    )
+
+                if teacher_response:
+                    sample["teacher_response"] = teacher_response
+                    sample["teacher_source"] = args.victim_model
+                    cache_data[key] = teacher_response
+                else:
+                    # 非 strict 模式下回退到原始 response
+                    sample["teacher_response"] = sample.get("response", "")
+                    sample["teacher_source"] = "fallback_dataset"
+
+                if rank % 10 == 0 or rank == len(need_collect):
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "victim_model": args.victim_model,
+                                "scienceqa_split": args.scienceqa_split,
+                                "train_num": args.train_num,
+                                "scienceqa_seed": args.scienceqa_seed,
+                                "samples": cache_data,
+                            },
+                            f,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+
+    # 兜底：保证每个样本存在 teacher_response 字段
+    missing = 0
+    for sample in samples:
+        if "teacher_response" not in sample:
+            sample["teacher_response"] = sample.get("response", "")
+            sample["teacher_source"] = "fallback_dataset"
+        if sample.get("teacher_source") != args.victim_model:
+            missing += 1
+
+    print(
+        f"教师样本统计: total={len(samples)}, "
+        f"from_{args.victim_model}={len(samples)-missing}, fallback={missing}"
+    )
+
+    if args.strict_teacher_distill and missing > 0:
+        raise RuntimeError(
+            f"严格蒸馏模式开启，但仍有 {missing} 条样本未使用 {args.victim_model} 教师回答。"
+        )
+
+    return samples
+
+
 class ScienceQADataset(torch.utils.data.Dataset):
     """ScienceQA 多模态数据集包装"""
 
@@ -131,7 +281,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
         image_sizes_default = torch.tensor([image.height, image.width], dtype=torch.long)
 
         instruction = item['instruction']
-        response = item['response']
+        response = item.get('teacher_response', item.get('response', ''))
 
         # 预截断文本部分（不能截断 processor 输出，否则会破坏 <image> token 对齐）
         # 先估算 response 的 token 数，超出预算则截断 response
@@ -151,6 +301,15 @@ class ScienceQADataset(torch.utils.data.Dataset):
             padding="longest",
             truncation=False,
         )
+
+        prompt_inputs = self.processor(
+            text=instruction,
+            images=image,
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+        )
+
         image_sizes = inputs.get("image_sizes") if isinstance(inputs, dict) else None
         if image_sizes is None:
             image_sizes = image_sizes_default
@@ -159,6 +318,9 @@ class ScienceQADataset(torch.utils.data.Dataset):
 
         pad_id = self.processor.tokenizer.pad_token_id
         labels = inputs["input_ids"].squeeze(0)
+        prompt_len = prompt_inputs["input_ids"].shape[1]
+        prompt_len = min(prompt_len, labels.shape[0])
+        labels[:prompt_len] = -100
         labels = labels.masked_fill(labels == pad_id, -100)
 
         return {
@@ -247,6 +409,12 @@ def setup_args():
                        help="ScienceQA 划分随机种子")
     parser.add_argument("--scienceqa_eval_split", type=str, default="validation",
                        help="ScienceQA 验证/测试 split")
+    parser.add_argument("--teacher_cache_path", type=str, default="",
+                       help="ScienceQA 教师回答缓存路径 (json)")
+    parser.add_argument("--collect_teacher_data", type=int, default=1,
+                       help="是否自动采集缺失的 GPT-4V 教师回答")
+    parser.add_argument("--strict_teacher_distill", type=int, default=1,
+                       help="严格蒸馏模式：若缺失 GPT-4V 教师回答则报错")
     parser.add_argument("--reuse_vq_codebook", type=int, default=1,
                        help="若存在已保存的VQ codebook则复用并跳过Stage1")
     parser.add_argument("--vq_codebook_path", type=str, default="",
@@ -336,6 +504,7 @@ def add_vq_to_model(model, args):
     vq_vision_encoder = VQVisionEncoder(
         vision_tower=vision_tower,
         num_embeddings=args.vq_codebook_size,
+        commitment_cost=args.vq_commitment_cost,
         freeze_vision_tower=bool(args.freeze_vision_tower),
     )
 
@@ -679,6 +848,24 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
     grad_accum = getattr(args, 'grad_accum', 1)
     
     print(f"LoRD 参数: tau1={tau1}, tau_delta={tau_delta}, max_new_tokens={max_new_tokens}, grad_accum={grad_accum}")
+
+    # 关键修复：Stage3 重新显式设置可训练参数，避免沿用 Stage2 冻结状态
+    model.train()
+    for name, param in model.named_parameters():
+        if not torch.is_floating_point(param):
+            param.requires_grad = False
+            continue
+
+        name_l = name.lower()
+        is_lora = "lora_" in name_l or "modules_to_save" in name_l
+        is_vq = "vq" in name_l
+        is_projector = "projector" in name_l or "multi_modal_projector" in name_l
+        is_vision = ("vision" in name_l) and (not args.freeze_vision_tower)
+
+        param.requires_grad = bool(is_lora or is_vq or is_projector or is_vision)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Stage3 可训练参数量: {trainable_params:,}")
     
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -1149,6 +1336,11 @@ def main():
     print("=" * 60)
     pprint(vars(args))
     print("=" * 60)
+
+    if args.reuse_vq_codebook:
+        print("[Info] reuse_vq_codebook=1，若存在 stage1 codebook 将跳过 Stage1。")
+    if args.reuse_stage2:
+        print("[Info] reuse_stage2=1，若存在 stage2 ckpt 将跳过 Stage2。")
     
     # 创建保存目录
     os.makedirs(args.save_path, exist_ok=True)
@@ -1174,6 +1366,9 @@ def main():
             train_num=args.train_num,
             seed=args.scienceqa_seed,
         )
+
+        # 关键：为每条样本补齐 GPT-4V 教师回答，供 Stage2/Stage3 蒸馏使用
+        train_samples = attach_gpt4v_teacher_responses(train_samples, args)
 
         train_dataset = ScienceQADataset(
             processor=processor,

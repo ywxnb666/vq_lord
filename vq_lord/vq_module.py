@@ -189,6 +189,7 @@ class VQVisionEncoder(nn.Module):
         self,
         vision_tower: nn.Module,
         num_embeddings: int = 8192,
+        commitment_cost: float = 0.25,
         freeze_vision_tower: bool = False,
     ):
         super().__init__()
@@ -208,6 +209,7 @@ class VQVisionEncoder(nn.Module):
         self.vq = VectorQuantizer(
             num_embeddings=num_embeddings,
             embedding_dim=self.hidden_size,
+            commitment_cost=commitment_cost,
         )
         
         if freeze_vision_tower:

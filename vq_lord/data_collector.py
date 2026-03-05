@@ -61,14 +61,20 @@ class GPT4VDataCollector:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
         model: str = "gpt-4-vision-preview",
         save_dir: str = "./vq_lord_data",
         max_retries: int = 3,
+        http_timeout: float = 120.0,
     ):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
         self.model = model
         self.save_dir = save_dir
         self.max_retries = max_retries
+        self.http_timeout = http_timeout
+        self._client = None
+        self._http_client = None
         
         os.makedirs(save_dir, exist_ok=True)
         
@@ -83,11 +89,63 @@ class GPT4VDataCollector:
             "action_detection": "图片中的人物或物体正在进行什么动作或活动？",
             "emotion_expression": "如果图片中有人物，请描述他们的表情和可能的情绪状态。",
         }
+
+    def _get_openai_client(self):
+        """
+        构建 OpenAI 客户端。
+        支持与如下形式等价的调用：
+            _http_client = httpx.Client(base_url="...")
+            client = OpenAI(api_key="...", base_url="...", http_client=_http_client)
+        """
+        if self._client is not None:
+            return self._client
+
+        if not self.api_key:
+            print("未检测到 API Key，请设置 OPENAI_API_KEY")
+            return None
+
+        try:
+            from openai import OpenAI as oa
+        except ImportError:
+            print("请安装 openai 库: pip install openai")
+            return None
+
+        kwargs = {"api_key": self.api_key}
+
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+            try:
+                import httpx
+                self._http_client = httpx.Client(
+                    base_url=self.base_url,
+                    timeout=self.http_timeout,
+                )
+                kwargs["http_client"] = self._http_client
+            except ImportError:
+                print("警告: 未安装 httpx，将不传入自定义 http_client。可执行: pip install httpx")
+
+        self._client = oa(**kwargs)
+        return self._client
+
+    def __del__(self):
+        if self._http_client is not None:
+            try:
+                self._http_client.close()
+            except Exception:
+                pass
     
     def encode_image_base64(self, image_path: str) -> str:
         """将图片编码为 base64"""
         with open(image_path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
+
+    def encode_pil_image_base64(self, image: Image.Image, image_format: str = "PNG") -> str:
+        """将 PIL.Image 编码为 base64"""
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        buffer = BytesIO()
+        image.save(buffer, format=image_format)
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
     
     def query_gpt4v(
         self,
@@ -107,9 +165,9 @@ class GPT4VDataCollector:
             GPT-4V 的回答，失败返回 None
         """
         try:
-            import openai
-            
-            client = openai.OpenAI(api_key=self.api_key)
+            client = self._get_openai_client()
+            if client is None:
+                return None
             
             # 编码图片
             image_data = self.encode_image_base64(image_path)
@@ -156,9 +214,70 @@ class GPT4VDataCollector:
                         time.sleep(2 ** attempt)  # 指数退避
             
             return None
-            
-        except ImportError:
-            print("请安装 openai 库: pip install openai")
+
+        except Exception as e:
+            print(f"GPT-4V 查询失败: {e}")
+            return None
+
+    def query_gpt4v_image(
+        self,
+        image: Image.Image,
+        prompt: str,
+        max_tokens: int = 500,
+        image_format: str = "PNG",
+    ) -> Optional[str]:
+        """
+        使用 PIL.Image 直接查询 GPT-4V
+
+        Args:
+            image: PIL 图像
+            prompt: 提示词
+            max_tokens: 最大生成 token 数
+            image_format: 编码格式（默认 PNG）
+
+        Returns:
+            GPT-4V 回答文本，失败返回 None
+        """
+        try:
+            client = self._get_openai_client()
+            if client is None:
+                return None
+            image_data = self.encode_pil_image_base64(image, image_format=image_format)
+            mime_type = "image/png" if image_format.upper() == "PNG" else "image/jpeg"
+
+            for attempt in range(self.max_retries):
+                try:
+                    response = client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{mime_type};base64,{image_data}",
+                                            "detail": "high",
+                                        },
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": prompt,
+                                    },
+                                ],
+                            }
+                        ],
+                        max_tokens=max_tokens,
+                    )
+                    return response.choices[0].message.content
+                except Exception as e:
+                    print(f"API 调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
+                    if attempt < self.max_retries - 1:
+                        time.sleep(2 ** attempt)
+
+            return None
+        except Exception as e:
+            print(f"GPT-4V 查询失败: {e}")
             return None
     
     def collect_visual_qa_data(
@@ -332,6 +451,13 @@ class VQLORDDataset(torch.utils.data.Dataset):
             padding="longest",
             truncation=False,
         )
+        prompt_inputs = self.processor(
+            text=instruction,
+            images=image,
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+        )
         image_sizes = inputs.get("image_sizes") if isinstance(inputs, dict) else None
         if image_sizes is None:
             image_sizes = image_sizes_default
@@ -340,6 +466,9 @@ class VQLORDDataset(torch.utils.data.Dataset):
 
         labels = inputs["input_ids"].clone()
         pad_id = self.processor.tokenizer.pad_token_id
+        prompt_len = prompt_inputs["input_ids"].shape[1]
+        prompt_len = min(prompt_len, labels.shape[1])
+        labels[:, :prompt_len] = -100
         labels = labels.masked_fill(labels == pad_id, -100)
         
         return {
