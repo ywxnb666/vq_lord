@@ -56,11 +56,12 @@ import torch.nn.functional as F
 
 
 def build_scienceqa_samples(
+    scienceqa_path: str,
     split: str,
     train_num: int,
     seed: int,
 ) -> List[dict]:
-    dataset = load_dataset("/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/dataset/ScienceQA", split=split)
+    dataset = load_dataset(scienceqa_path, split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
     import random
@@ -121,6 +122,26 @@ def _sample_key(sample: dict) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
+def normalize_teacher_response(text: str, lang: str = "zh") -> str:
+    """规范教师回答字段标签，尽量减少中英文模板混杂。"""
+    if not isinstance(text, str):
+        return ""
+
+    text = text.strip()
+    # 防止教师回答里回显 <image>，破坏 LLaVA-Next 的图文 token 对齐
+    text = text.replace("<image>", "")
+    text = text.replace("< image >", "")
+    text = text.replace("<Image>", "")
+
+    if lang == "zh":
+        text = text.replace("Explanation:", "解释：")
+        text = text.replace("Answer:", "答案：")
+    else:
+        text = text.replace("解释：", "Explanation:")
+        text = text.replace("答案：", "Answer:")
+    return text
+
+
 def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
     """
     为 ScienceQA 样本补充 GPT-4V 教师回答（带缓存）
@@ -142,6 +163,7 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
         cache_path = os.path.join(args.data_dir, cache_name)
 
     cache_data = {}
+    teacher_lang = getattr(args, "teacher_lang", "zh")
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
@@ -157,7 +179,7 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
         key = _sample_key(sample)
         teacher_response = cache_data.get(key)
         if teacher_response:
-            sample["teacher_response"] = teacher_response
+            sample["teacher_response"] = normalize_teacher_response(teacher_response, teacher_lang)
             sample["teacher_source"] = args.victim_model
         else:
             need_collect.append((i, key))
@@ -183,15 +205,26 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
                 image = sample.get("image")
                 instruction = sample.get("instruction", "")
 
-                teacher_prompt = (
-                    "你是严谨的视觉科学题解答助手。"
-                    "请基于图片回答下面的选择题。"
-                    "要求：先给出简短解释，再给出最终答案文本。"
-                    "输出格式必须为：\n"
-                    "Explanation: ...\n"
-                    "Answer: ...\n\n"
-                    f"{instruction}"
-                )
+                if teacher_lang == "en":
+                    teacher_prompt = (
+                        "You are a rigorous visual science QA assistant. "
+                        "Please answer the following multiple-choice question based on the image. "
+                        "Use only English. "
+                        "Output format must be:\n"
+                        "Explanation: ...\n"
+                        "Answer: ...\n\n"
+                        f"{instruction}"
+                    )
+                else:
+                    teacher_prompt = (
+                        "你是严谨的视觉科学题解答助手。"
+                        "请基于图片回答下面的选择题。"
+                        "请仅使用中文回答。"
+                        "输出格式必须为：\n"
+                        "解释：...\n"
+                        "答案：...\n\n"
+                        f"{instruction}"
+                    )
 
                 teacher_response = None
                 if image is not None:
@@ -203,12 +236,13 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
                     )
 
                 if teacher_response:
+                    teacher_response = normalize_teacher_response(teacher_response, teacher_lang)
                     sample["teacher_response"] = teacher_response
                     sample["teacher_source"] = args.victim_model
                     cache_data[key] = teacher_response
                 else:
                     # 非 strict 模式下回退到原始 response
-                    sample["teacher_response"] = sample.get("response", "")
+                    sample["teacher_response"] = normalize_teacher_response(sample.get("response", ""), teacher_lang)
                     sample["teacher_source"] = "fallback_dataset"
 
                 if rank % 10 == 0 or rank == len(need_collect):
@@ -230,7 +264,7 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
     missing = 0
     for sample in samples:
         if "teacher_response" not in sample:
-            sample["teacher_response"] = sample.get("response", "")
+            sample["teacher_response"] = normalize_teacher_response(sample.get("response", ""), teacher_lang)
             sample["teacher_source"] = "fallback_dataset"
         if sample.get("teacher_source") != args.victim_model:
             missing += 1
@@ -282,6 +316,8 @@ class ScienceQADataset(torch.utils.data.Dataset):
 
         instruction = item['instruction']
         response = item.get('teacher_response', item.get('response', ''))
+        response = response.replace("<image>", "").replace("< image >", "").replace("<Image>", "")
+        instruction_text = instruction.replace("<image>", "").replace("< image >", "").replace("<Image>", "").strip()
 
         # 预截断文本部分（不能截断 processor 输出，否则会破坏 <image> token 对齐）
         # 先估算 response 的 token 数，超出预算则截断 response
@@ -293,7 +329,39 @@ class ScienceQADataset(torch.utils.data.Dataset):
             resp_tokens = resp_tokens[:budget]
             response = self.processor.tokenizer.decode(resp_tokens, skip_special_tokens=True)
 
-        full_text = f"{instruction}\n{response}"
+        if hasattr(self.processor, "apply_chat_template"):
+            full_conv = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction_text},
+                        {"type": "image"},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": response},
+                    ],
+                },
+            ]
+            prompt_conv = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction_text},
+                        {"type": "image"},
+                    ],
+                }
+            ]
+
+            full_text = self.processor.apply_chat_template(full_conv, add_generation_prompt=False)
+            prompt_text = self.processor.apply_chat_template(prompt_conv, add_generation_prompt=True)
+        else:
+            # 兼容无 chat template 的老版本
+            full_text = f"<image>\n{instruction_text}\n{response}"
+            prompt_text = f"<image>\n{instruction_text}"
+
         inputs = self.processor(
             text=full_text,
             images=image,
@@ -303,21 +371,18 @@ class ScienceQADataset(torch.utils.data.Dataset):
         )
 
         prompt_inputs = self.processor(
-            text=instruction,
+            text=prompt_text,
             images=image,
             return_tensors="pt",
             padding="longest",
             truncation=False,
         )
 
-        image_sizes = inputs.get("image_sizes") if isinstance(inputs, dict) else None
-        if image_sizes is None:
-            image_sizes = image_sizes_default
-        else:
-            image_sizes = image_sizes.squeeze(0)
+        # 对 LLaVA-Next，直接使用原图尺寸最稳妥，避免 processor 返回形状差异导致 patch 计算异常
+        image_sizes = image_sizes_default
 
         pad_id = self.processor.tokenizer.pad_token_id
-        labels = inputs["input_ids"].squeeze(0)
+        labels = inputs["input_ids"].squeeze(0).clone()
         prompt_len = prompt_inputs["input_ids"].shape[1]
         prompt_len = min(prompt_len, labels.shape[0])
         labels[:prompt_len] = -100
@@ -331,6 +396,33 @@ class ScienceQADataset(torch.utils.data.Dataset):
             "labels": labels,
             "data_type": "scienceqa",
         }
+
+
+def sanitize_image_sizes(image_sizes: Optional[torch.Tensor], batch_size: int) -> Optional[torch.Tensor]:
+    """规范化 image_sizes 为 CPU int64 [bs, 2]。"""
+    if image_sizes is None:
+        return None
+    if not isinstance(image_sizes, torch.Tensor):
+        image_sizes = torch.tensor(image_sizes, dtype=torch.long)
+    if image_sizes.dim() == 1:
+        image_sizes = image_sizes.unsqueeze(0)
+    image_sizes = image_sizes[:, :2].to(dtype=torch.long).clamp(min=1)
+    if image_sizes.is_cuda:
+        image_sizes = image_sizes.cpu()
+    return image_sizes
+
+
+def _get_image_token_id(model) -> int:
+    """从 model.config 获取 image_token_index（已在 load_model_and_processor 中统一设置）。"""
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        # PeftModel: 穿透到 base model
+        base = getattr(model, "get_base_model", lambda: None)()
+        cfg = getattr(base, "config", None) if base is not None else None
+    val = getattr(cfg, "image_token_index", None)
+    if val is None:
+        raise RuntimeError("model.config 中未找到 image_token_index，请检查模型加载")
+    return int(val)
 
 
 def setup_args():
@@ -374,10 +466,10 @@ def setup_args():
                        help="最大序列长度")
     
     # LoRD 超参数
-    parser.add_argument("--tau1", type=float, default=0.1,
-                       help="LoRD 置信度阈值")
-    parser.add_argument("--tau_delta", type=float, default=0.01,
-                       help="LoRD delta 阈值")
+    parser.add_argument("--tau1", type=float, default=0.01,
+                       help="LoRD 冷启动阈值: exp(avg_lp) < tau1 时用教师兜底")
+    parser.add_argument("--tau_delta", type=float, default=0.005,
+                       help="LoRD delta 阈值 (保留备用，当前仅用 tau1 判断)")
     parser.add_argument("--max_new_tokens", type=int, default=128,
                        help="LoRD 生成最大新 token 数")
     parser.add_argument("--grad_accum", type=int, default=4,
@@ -405,6 +497,8 @@ def setup_args():
                        help="训练数据来源 (vq_lord 或 scienceqa)")
     parser.add_argument("--scienceqa_split", type=str, default="train",
                        help="ScienceQA 数据集 split")
+    parser.add_argument("--scienceqa_path", type=str, default="ScienceQA",
+                       help="ScienceQA 数据集路径（本地路径或 HuggingFace 数据集名）")
     parser.add_argument("--scienceqa_seed", type=int, default=20240306,
                        help="ScienceQA 划分随机种子")
     parser.add_argument("--scienceqa_eval_split", type=str, default="validation",
@@ -415,6 +509,8 @@ def setup_args():
                        help="是否自动采集缺失的 GPT-4V 教师回答")
     parser.add_argument("--strict_teacher_distill", type=int, default=1,
                        help="严格蒸馏模式：若缺失 GPT-4V 教师回答则报错")
+    parser.add_argument("--teacher_lang", type=str, default="zh", choices=["zh", "en"],
+                       help="教师回答统一语言：zh 或 en")
     parser.add_argument("--reuse_vq_codebook", type=int, default=1,
                        help="若存在已保存的VQ codebook则复用并跳过Stage1")
     parser.add_argument("--vq_codebook_path", type=str, default="",
@@ -471,6 +567,13 @@ def load_model_and_processor(args):
     
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+    # 确认 model.config.image_token_index 与 tokenizer 一致
+    tok_img_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    cfg_img_id = getattr(model.config, "image_token_index", None)
+    if cfg_img_id != tok_img_id:
+        print(f"[Info] 对齐 image_token_index: config={cfg_img_id} -> tokenizer={tok_img_id}")
+        model.config.image_token_index = int(tok_img_id)
 
     # 训练场景下关闭 KV cache，避免与梯度检查点冲突
     if hasattr(model, "config"):
@@ -599,8 +702,8 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
     print("阶段 1: VQ Codebook 预训练")
     print("=" * 50)
 
-    original_use_ema = model.vq_vision_encoder.vq.use_ema
-    model.vq_vision_encoder.vq.use_ema = False
+    # 注意：不再关闭 EMA。保留 EMA 更新让 codebook 跟随数据分布移动，
+    # 配合 dead code restart 机制可避免 codebook collapse。
     
     # 设置模型为训练模式
     model.train()
@@ -642,27 +745,22 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
                 batch_size, num_patches, channels, height, width = pixel_values.shape
                 pixel_values = pixel_values.view(batch_size * num_patches, channels, height, width)
             
-            # 前向传播（会触发 VQ hook）
+            # 前向传播（VQ hook 自动执行 EMA 更新 + dead code restart）
             _ = model.vision_tower(pixel_values)
             
-            # 获取 VQ 损失与索引
+            # 获取 hook 中缓存的 VQ 损失与索引
             vq_loss = model._vq_loss_container["loss"]
             vq_indices = model._vq_loss_container.get("indices")
             
-            if vq_loss is None or not vq_loss.requires_grad:
-                # 如果 hook 中计算的 loss 不需要梯度，需要重新计算
-                vision_features = model.vision_tower(pixel_values)
-                if hasattr(vision_features, "last_hidden_state"):
-                    vision_features = vision_features.last_hidden_state
-                _, indices, vq_loss, _ = model.vq_vision_encoder.vq(vision_features)
-                vq_indices = indices
-            
-            if vq_loss.requires_grad:
+            # EMA 模式: codebook 已在 hook 中通过 EMA 原地更新，
+            # vision_tower 冻结 → loss 无梯度 → 跳过 backward。
+            # 非 EMA 模式: 需要 backward + optimizer.step()。
+            if vq_loss is not None and vq_loss.requires_grad:
                 optimizer.zero_grad()
                 vq_loss.backward()
                 optimizer.step()
             
-            vq_loss_val = vq_loss.item()
+            vq_loss_val = vq_loss.item() if vq_loss is not None else 0.0
             epoch_loss += vq_loss_val
             loss_ema = vq_loss_val if loss_ema is None else (0.95 * loss_ema + 0.05 * vq_loss_val)
 
@@ -696,6 +794,8 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
     print("阶段 2: 视觉能力蒸馏")
     print("=" * 50)
     
+    image_token_id = _get_image_token_id(model)
+    
     model.train()
     
     # 训练 VQ + Vision (如果未冻结) + Projector
@@ -728,9 +828,16 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
             attention_mask = batch["attention_mask"].to(args.device)
             pixel_values = batch["pixel_values"].to(args.device)
             image_sizes = batch.get("image_sizes")
-            if image_sizes is not None:
-                image_sizes = image_sizes.to(args.device)
+            image_sizes = sanitize_image_sizes(image_sizes, batch_size=input_ids.size(0))
             labels = batch["labels"].to(args.device)
+
+            # 首个 batch 做一次 sanity check
+            if global_step == 1:
+                n_img = (input_ids == image_token_id).sum(dim=1)
+                if (n_img == 0).any():
+                    raise RuntimeError(
+                        f"首个 batch 缺少 image token: counts={n_img.tolist()}, id={image_token_id}"
+                    )
             
             # 前向传播（VQ hook 会自动应用）
             outputs = model(
@@ -770,28 +877,33 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
     return model
 
 
-def log_clip(tnsr, epsilon=0.2):
-    """对数裁剪函数，防止数值不稳定"""
-    one_tensor = torch.ones_like(tnsr)
-    one_tensor = one_tensor.to(tnsr.device)
-    tnsr = torch.min(tnsr, torch.log(one_tensor * (1 + epsilon)))
-    tnsr = torch.max(tnsr, torch.log(one_tensor * (1 - epsilon)))
-    return tnsr
-
-
-def compute_sequence_log_prob(model, input_ids, attention_mask, pixel_values, image_sizes):
+def log_clip(tnsr, epsilon=1.0):
+    """对数裁剪函数，防止数值不稳定。
+    将输入裁剪到 [log(1-epsilon), log(1+epsilon)] 范围内。
+    epsilon=1.0 对应 [-inf, log(2)] ≈ [-inf, 0.693]，
+    实际 max 侧裁剪为 log(1+epsilon)=0.693，min 侧裁剪为 -10（防 -inf）。
     """
-    计算序列的 log probability
-    
+    upper = torch.log(torch.tensor(1.0 + epsilon, device=tnsr.device, dtype=tnsr.dtype))
+    lower = torch.tensor(-10.0, device=tnsr.device, dtype=tnsr.dtype)  # 下界不用 log(1-1)=-inf
+    return torch.clamp(tnsr, min=lower.item(), max=upper.item())
+
+
+def compute_sequence_log_prob(model, input_ids, attention_mask, pixel_values, image_sizes,
+                              prompt_len: int = 0):
+    """
+    计算序列 **生成部分** 的平均 log probability。
+
     Args:
         model: 学生模型
         input_ids: token 序列 [bs, seq_len]
         attention_mask: attention mask
         pixel_values: 图像特征
         image_sizes: 图像尺寸
-        
+        prompt_len: prompt token 数量。log prob 只统计 position >= prompt_len 的 token。
+                    默认 0 = 统计全部（向后兼容）。
+
     Returns:
-        log_probs: 每个样本的平均 log probability [bs]
+        seq_log_prob: 每个样本的平均 log probability [bs]
     """
     with torch.no_grad():
         outputs = model(
@@ -800,25 +912,30 @@ def compute_sequence_log_prob(model, input_ids, attention_mask, pixel_values, im
             pixel_values=pixel_values,
             image_sizes=image_sizes,
         )
-    
+
     logits = outputs.logits[:, :-1, :]  # [bs, seq-1, vocab]
     log_probs = F.log_softmax(logits, dim=-1)
-    
-    # 获取目标 token 的 log prob
+
     bs, seq_len = input_ids.shape
     target_ids = input_ids[:, 1:seq_len]  # [bs, seq-1]
-    
-    # gather: [bs, seq-1]
+
     token_log_probs = log_probs.gather(
-        dim=-1, 
+        dim=-1,
         index=target_ids.unsqueeze(-1)
     ).squeeze(-1)
-    
-    # 使用 attention_mask 计算平均 (忽略 padding)
+
+    # 构建 mask：同时排除 padding 和 prompt 部分
     mask = attention_mask[:, 1:seq_len].float()
+    if prompt_len > 0:
+        # prompt 覆盖 position 0..prompt_len-1，shift 后对应 0..prompt_len-2
+        # 但 position prompt_len-1 预测的是 position prompt_len（第一个生成 token）
+        # 所以需要 mask 掉 0..prompt_len-2
+        gen_start = max(prompt_len - 1, 0)
+        if gen_start > 0:
+            mask[:, :gen_start] = 0.0
+
     seq_log_prob = (token_log_probs * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
-    
-    return seq_log_prob, token_log_probs, mask
+    return seq_log_prob
 
 
 def train_stage3_lord(model, dataloader, args, tb_writer):
@@ -841,15 +958,17 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
     print("=" * 50)
     
     # LoRD 超参数
-    tau1 = getattr(args, 'tau1', 0.1)  # 置信度阈值
-    tau_delta = getattr(args, 'tau_delta', 0.01)  # delta 阈值
+    tau1 = getattr(args, 'tau1', 0.01)  # 冷启动置信度阈值
+    tau_delta = getattr(args, 'tau_delta', 0.005)  # delta 阈值（保留备用）
     max_new_tokens = getattr(args, 'max_new_tokens', 64)  # 生成长度
     
     grad_accum = getattr(args, 'grad_accum', 1)
     
     print(f"LoRD 参数: tau1={tau1}, tau_delta={tau_delta}, max_new_tokens={max_new_tokens}, grad_accum={grad_accum}")
 
-    # 关键修复：Stage3 重新显式设置可训练参数，避免沿用 Stage2 冻结状态
+    image_token_id = _get_image_token_id(model)
+
+    # Stage3 重新显式设置可训练参数，避免沿用 Stage2 冻结状态
     model.train()
     for name, param in model.named_parameters():
         if not torch.is_floating_point(param):
@@ -858,11 +977,20 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
 
         name_l = name.lower()
         is_lora = "lora_" in name_l or "modules_to_save" in name_l
-        is_vq = "vq" in name_l
+        # VQ codebook 在 Stage3 冻结 — Stage1+2 已训练好，Stage3 专注 LoRD 对比学习
+        is_vq = False
         is_projector = "projector" in name_l or "multi_modal_projector" in name_l
         is_vision = ("vision" in name_l) and (not args.freeze_vision_tower)
 
         param.requires_grad = bool(is_lora or is_vq or is_projector or is_vision)
+
+    # 冻结 VQ codebook：关闭 EMA 和 dead code restart，
+    # 避免 Stage3 多次 forward 导致 codebook 过激进更新。
+    # STE 仍正常传递梯度到 vision_tower，commitment loss 仍约束 z→codebook。
+    _vq = model.vq_vision_encoder.vq
+    _vq.use_ema = False
+    _vq.dead_code_threshold = 10**9  # 实质禁用 dead code restart
+    print(f"[Stage3] VQ codebook 已冻结 (use_ema=False, dead_code restart 禁用)")
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Stage3 可训练参数量: {trainable_params:,}")
@@ -918,107 +1046,89 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
         
         print(f"已恢复: epoch={start_epoch}, global_step={global_step}")
     
+    # pad_token_id 统一获取，用于 mask 构建
+    _pad_id = model.config.pad_token_id
+    if _pad_id is None:
+        _pad_id = model.config.eos_token_id or 0
+
     for epoch in range(start_epoch, args.epochs):
         epoch_loss = 0.0
         epoch_obj_loss = 0.0
         epoch_reg_loss = 0.0
         epoch_vq_loss = 0.0
-        
+        cold_start_count = 0
+
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"LoRD Epoch {epoch+1}")):
             if batch is None:
                 continue
             global_step += 1
-            
+
             # 获取输入数据
             input_ids = batch["input_ids"].to(args.device)  # prompt + y_vic
             attention_mask = batch["attention_mask"].to(args.device)
             pixel_values = batch["pixel_values"].to(args.device)
             image_sizes = batch.get("image_sizes")
-            if image_sizes is not None:
-                image_sizes = image_sizes.to(args.device)
+            image_sizes = sanitize_image_sizes(image_sizes, batch_size=input_ids.size(0))
             labels = batch["labels"].to(args.device)  # y_vic
-            
-            torch.cuda.empty_cache()  # 清理缓存，防止 OOM
-            
+
             bs = input_ids.shape[0]
-            
-            # ========== Step 1: 双样本生成 ==========
-            # 找到 prompt 部分 (labels == -100 的部分是 prompt)
-            # 注意：部分数据集未标注 prompt，会导致 prompt_len=0
-            prompt_len = (labels == -100).sum(dim=-1).min().item()
+
+            # ========== Step 1: 提取 prompt，双样本生成 ==========
+            prompt_len = int((labels == -100).sum(dim=-1).min().item())
             prompt_ids = input_ids[:, :max(prompt_len, 1)]
             prompt_mask = attention_mask[:, :max(prompt_len, 1)]
 
             # 保障 prompt 中包含 image token，否则生成会报错
-            image_token_id = getattr(model.config, "image_token_index", None)
-            if image_token_id is None:
-                image_token_id = getattr(model.config, "image_token_id", None)
-
-            has_image_token = True
             if image_token_id is not None:
-                has_image_token = (prompt_ids == image_token_id).any().item()
+                if not (prompt_ids == image_token_id).any().item():
+                    prompt_ids = input_ids
+                    prompt_mask = attention_mask
+                    prompt_len = input_ids.shape[1]
 
-            if prompt_len <= 0 or not has_image_token:
+            if prompt_len <= 0:
                 prompt_ids = input_ids
                 prompt_mask = attention_mask
+                prompt_len = input_ids.shape[1]
 
-            # 防止生成阶段再次生成 <image> token，导致 image tokens 与 image features 数量不一致
-            bad_words_ids = None
-            if image_token_id is not None:
-                bad_words_ids = [[int(image_token_id)]]
-            
+            # 防止生成 <image> token
+            bad_words_ids = [[int(image_token_id)]] if image_token_id is not None else None
+
             model.eval()
             with torch.no_grad():
-                # 生成阶段无需梯度，临时关闭 checkpoint 以消除警告
                 gc_enabled = getattr(model, "is_gradient_checkpointing", False)
                 if gc_enabled and hasattr(model, "gradient_checkpointing_disable"):
                     model.gradient_checkpointing_disable()
-                # 生成样本 S1
-                gen_output_1 = model.generate(
-                    input_ids=prompt_ids,
-                    attention_mask=prompt_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    do_sample=True,
-                    max_new_tokens=max_new_tokens,
-                    temperature=0.7,
-                    bad_words_ids=bad_words_ids,
-                    pad_token_id=model.config.pad_token_id or 0,
-                )
-                
-                # 生成样本 S2
-                gen_output_2 = model.generate(
-                    input_ids=prompt_ids,
-                    attention_mask=prompt_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    do_sample=True,
-                    max_new_tokens=max_new_tokens,
-                    temperature=0.7,
-                    bad_words_ids=bad_words_ids,
-                    pad_token_id=model.config.pad_token_id or 0,
-                )
 
-                # 双保险：若采样结果中仍出现新增 <image> token，则替换为 eos/pad
+                _gen_kwargs = dict(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    do_sample=True,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.7,
+                    bad_words_ids=bad_words_ids,
+                    pad_token_id=_pad_id,
+                )
+                gen_output_1 = model.generate(**_gen_kwargs)
+                gen_output_2 = model.generate(**_gen_kwargs)
+
+                # 清除生成序列中多余的 <image> token
                 if image_token_id is not None:
-                    eos_or_pad_id = model.config.eos_token_id
-                    if eos_or_pad_id is None:
-                        eos_or_pad_id = model.config.pad_token_id or 0
+                    eos_or_pad = model.config.eos_token_id or _pad_id
+                    allowed_img = (prompt_ids == image_token_id).sum(dim=1)
 
-                    allowed_img_counts = (prompt_ids == image_token_id).sum(dim=1)
-
-                    def _strip_extra_image_tokens(seq_ids, allowed_counts):
+                    def _strip_extra_img(seq_ids, allowed_counts):
                         seq_ids = seq_ids.clone()
                         for bi in range(seq_ids.shape[0]):
-                            img_pos = (seq_ids[bi] == image_token_id).nonzero(as_tuple=False).squeeze(-1)
-                            allowed = int(allowed_counts[bi].item())
-                            if img_pos.numel() > allowed:
-                                extra = int(img_pos.numel() - allowed)
-                                seq_ids[bi, img_pos[-extra:]] = eos_or_pad_id
+                            pos = (seq_ids[bi] == image_token_id).nonzero(as_tuple=False).view(-1)
+                            a = int(allowed_counts[bi].item())
+                            if pos.numel() > a:
+                                seq_ids[bi, pos[a:]] = eos_or_pad
                         return seq_ids
 
-                    gen_output_1 = _strip_extra_image_tokens(gen_output_1, allowed_img_counts)
-                    gen_output_2 = _strip_extra_image_tokens(gen_output_2, allowed_img_counts)
+                    gen_output_1 = _strip_extra_img(gen_output_1, allowed_img)
+                    gen_output_2 = _strip_extra_img(gen_output_2, allowed_img)
 
                 if gc_enabled and hasattr(model, "gradient_checkpointing_enable"):
                     try:
@@ -1027,191 +1137,162 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
                         )
                     except TypeError:
                         model.gradient_checkpointing_enable()
-            
+
             model.train()
-            
-            # 对齐序列长度
+
+            # ========== 对齐序列长度 ==========
             max_len = max(gen_output_1.shape[1], gen_output_2.shape[1], input_ids.shape[1])
-            
-            def pad_to_length(tensor, length, pad_value=0):
+
+            def pad_to_len(tensor, length, pad_val=_pad_id):
                 if tensor.shape[1] < length:
-                    padding = torch.full(
-                        (tensor.shape[0], length - tensor.shape[1]),
-                        pad_value,
-                        dtype=tensor.dtype,
-                        device=tensor.device
-                    )
-                    return torch.cat([tensor, padding], dim=1)
+                    p = torch.full((tensor.shape[0], length - tensor.shape[1]),
+                                   pad_val, dtype=tensor.dtype, device=tensor.device)
+                    return torch.cat([tensor, p], dim=1)
                 return tensor[:, :length]
-            
-            s1_ids = pad_to_length(gen_output_1, max_len)
-            s2_ids = pad_to_length(gen_output_2, max_len)
-            y_vic_ids = pad_to_length(input_ids, max_len)
-            
-            s1_mask = (s1_ids != 0).long()
-            s2_mask = (s2_ids != 0).long()
-            y_vic_mask = pad_to_length(attention_mask, max_len)
-            
-            # ========== Step 2: 计算 log probability ==========
-            # 计算 S1 的 log prob
-            log_prob_s1, token_lp_s1, mask_s1 = compute_sequence_log_prob(
-                model, s1_ids, s1_mask, pixel_values, image_sizes
-            )
-            
-            # 计算 S2 的 log prob
-            log_prob_s2, token_lp_s2, mask_s2 = compute_sequence_log_prob(
-                model, s2_ids, s2_mask, pixel_values, image_sizes
-            )
-            
-            # 计算 y_vic 的 log prob
-            log_prob_vic, token_lp_vic, mask_vic = compute_sequence_log_prob(
-                model, y_vic_ids, y_vic_mask, pixel_values, image_sizes
-            )
-            
-            # ========== Step 3: 局部性排序 + 冷启动 ==========
-            # 确定 y+ 和 y-
+
+            s1_ids = pad_to_len(gen_output_1, max_len)
+            s2_ids = pad_to_len(gen_output_2, max_len)
+            y_vic_ids = pad_to_len(input_ids, max_len)
+
+            # 修复4: mask 使用 pad_token_id 而非硬编码 0
+            s1_mask = (s1_ids != _pad_id).long()
+            s2_mask = (s2_ids != _pad_id).long()
+            y_vic_mask = pad_to_len(attention_mask, max_len, pad_val=0)
+
+            # ========== Step 2+3: 无梯度排序 + 冷启动（复用同一批 forward） ==========
+            # 修复2: 合并排序和损失计算，去掉冗余的 3 次 compute_sequence_log_prob
+            # 只用 no_grad forward 做排序/冷启动判断，然后在 Step 4 中带梯度计算损失。
+            with torch.no_grad():
+                # 辅助函数：无梯度只算生成部分 log prob（仅用于排序）
+                def _nograd_gen_lp(ids, mask):
+                    out = model(input_ids=ids, attention_mask=mask,
+                                pixel_values=pixel_values, image_sizes=image_sizes)
+                    logits = out.logits[:, :-1, :]
+                    lp = F.log_softmax(logits, dim=-1)
+                    token_lp = lp.gather(dim=-1, index=ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+                    m = mask[:, 1:].float()
+                    # 修复1: 只统计 prompt_len 之后生成部分的 log prob
+                    gen_start = max(prompt_len - 1, 0)
+                    if gen_start > 0:
+                        m[:, :gen_start] = 0.0
+                    return (token_lp * m).sum(dim=-1) / m.sum(dim=-1).clamp(min=1)
+
+                lp_s1 = _nograd_gen_lp(s1_ids, s1_mask)
+                lp_s2 = _nograd_gen_lp(s2_ids, s2_mask)
+
+            # 局部性排序 + 冷启动
             y_plus_ids = s1_ids.clone()
             y_minus_ids = s2_ids.clone()
             y_plus_mask = s1_mask.clone()
             y_minus_mask = s2_mask.clone()
-            log_prob_plus = log_prob_s1.clone()
-            log_prob_minus = log_prob_s2.clone()
-            
+            # 记录 y_minus 对应的 no_grad lp，供 step 4 L_reg 直接复用（省 1 次 forward）
+            lp_minus_detached = lp_s2.clone()  # 默认 s1=y+, s2=y-
+
             for i in range(bs):
-                p1 = torch.exp(log_prob_s1[i]).item()
-                p2 = torch.exp(log_prob_s2[i]).item()
-                
-                # 获取上一轮的 log prob (用于计算 delta)
-                key = f"{batch_idx}_{i}"
-                prev_p1 = prev_log_probs.get(f"{key}_1", p1)
-                prev_p2 = prev_log_probs.get(f"{key}_2", p2)
-                
-                delta1 = p1 - prev_p1
-                delta2 = p2 - prev_p2
-                
-                # 更新记录
-                prev_log_probs[f"{key}_1"] = p1
-                prev_log_probs[f"{key}_2"] = p2
-                
-                # 排序：确保 y+ 有更高的 log prob
-                if p2 > p1:
+                lp1 = lp_s1[i].item()
+                lp2 = lp_s2[i].item()
+
+                # 修复3: 用样本内容哈希做 key（而非 shuffle 后不稳定的 batch_idx）
+                sample_key = f"{int(input_ids[i, min(prompt_len, input_ids.shape[1]-1)].item())}_{input_ids.shape[1]}_{i}"
+                prev_lp = prev_log_probs.get(sample_key, None)
+
+                # 排序：log prob 更高的为 y+
+                if lp2 > lp1:
                     y_plus_ids[i] = s2_ids[i]
                     y_minus_ids[i] = s1_ids[i]
                     y_plus_mask[i] = s2_mask[i]
                     y_minus_mask[i] = s1_mask[i]
-                    log_prob_plus[i] = log_prob_s2[i]
-                    log_prob_minus[i] = log_prob_s1[i]
-                    delta1, delta2 = delta2, delta1
-                
-                # 冷启动策略：置信度低时使用 y_vic
-                if max(p1, p2) < tau1 and delta1 < tau_delta:
+                    lp_minus_detached[i] = lp_s1[i]  # y- 换成 s1
+                # else: 默认 s1=y+, s2=y-, lp_minus_detached[i] 已是 lp_s2[i]
+
+                # 冷启动策略：仅当 y⁺ 置信度极低（生成质量太差、无法作为有效正样本）时
+                # 用教师回答 y_vic 替代。tau1=0.01 → 仅 avg per-token prob < 1% 时触发。
+                # 去掉 delta 条件，避免 epochs>1 时因 delta 过小导致全部退化为 SFT。
+                p_best = torch.exp(torch.tensor(max(lp1, lp2))).item()
+                if p_best < tau1:
                     y_plus_ids[i] = y_vic_ids[i]
                     y_plus_mask[i] = y_vic_mask[i]
-                    log_prob_plus[i] = log_prob_vic[i]
-            
-            # 清理 Step 2/3 产生的不再需要的中间张量
-            del log_prob_s1, log_prob_s2, log_prob_vic
-            del token_lp_s1, token_lp_s2, token_lp_vic
-            del mask_s1, mask_s2, mask_vic
-            del s1_ids, s2_ids, s1_mask, s2_mask
-            del log_prob_plus, log_prob_minus
-            torch.cuda.empty_cache()
+                    cold_start_count += 1
 
-            # ========== Step 4: 计算 LoRD 损失 (梯度累积，避免 OOM) ==========
-            # 核心思路：不再同时持有 3 个计算图，而是逐个前向+backward，
-            # 利用梯度累积达到等价效果，峰值显存降为原来的 ~1/3。
-            
-            # 梯度累积：仅在累积周期开始时清零 (用 batch_idx 判断，避免跨 epoch 边界漏清零)
+                # 保留 prev_log_probs 记录（可用于日志分析或未来 delta 策略扩展）
+                prev_log_probs[sample_key] = max(lp1, lp2)
+
+            del lp_s1, lp_s2, s1_ids, s2_ids, s1_mask, s2_mask
+            del gen_output_1, gen_output_2
+
+            # ========== Step 4: LoRD 损失（带梯度，分拆 backward 省显存） ==========
             if batch_idx % grad_accum == 0:
                 optimizer.zero_grad(set_to_none=True)
-            
-            # --- 辅助函数：单次前向计算序列 log prob (带梯度) ---
-            def _forward_seq_lp(ids, mask, pv=pixel_values, isz=image_sizes):
-                out = model(
-                    input_ids=ids,
-                    attention_mask=mask,
-                    pixel_values=pv,
-                    image_sizes=isz,
-                )
+
+            # 辅助函数：带梯度前向，只统计生成部分 log prob
+            def _forward_gen_lp(ids, mask):
+                out = model(input_ids=ids, attention_mask=mask,
+                            pixel_values=pixel_values, image_sizes=image_sizes)
                 logits = out.logits[:, :-1, :]
                 lp = F.log_softmax(logits, dim=-1)
                 token_lp = lp.gather(dim=-1, index=ids[:, 1:].unsqueeze(-1)).squeeze(-1)
                 m = mask[:, 1:].float()
-                seq_lp = (token_lp * m).sum(dim=-1) / m.sum(dim=-1).clamp(min=1)
-                return seq_lp
-            
-            # --- (a) 先用 no_grad 计算 y- 的 detached log prob，供后续两步使用 ---
-            with torch.no_grad():
-                seq_lp_minus_detached = _forward_seq_lp(y_minus_ids, y_minus_mask).detach()
-            torch.cuda.empty_cache()
-            
-            # --- (b) Forward y+，计算 L_obj 的 y+ 部分并 backward ---
-            seq_lp_plus = _forward_seq_lp(y_plus_ids, y_plus_mask)
-            # L_obj 中 y+ 的贡献: -mean(log P(y+))  (y- 部分被 detach)
+                gen_start = max(prompt_len - 1, 0)
+                if gen_start > 0:
+                    m[:, :gen_start] = 0.0
+                return (token_lp * m).sum(dim=-1) / m.sum(dim=-1).clamp(min=1)
+
+            # (a) y- 的 detached log prob：直接复用排序阶段已算过的 lp_minus_detached
+            seq_lp_minus_d = lp_minus_detached.detach()
+
+            # (b) y+ forward + backward
+            seq_lp_plus = _forward_gen_lp(y_plus_ids, y_plus_mask)
             L_obj_plus = -torch.mean(seq_lp_plus)
             L_obj_plus.backward()
             L_obj_plus_val = L_obj_plus.item()
             del seq_lp_plus, L_obj_plus
-            torch.cuda.empty_cache()
-            
-            # --- (c) Forward y_vic，计算 L_reg 的 y_vic 部分并 backward ---
-            seq_lp_vic = _forward_seq_lp(y_vic_ids, y_vic_mask)
-            L_reg = -torch.mean(log_clip(seq_lp_vic - seq_lp_minus_detached))
+
+            # (c) y_vic forward + backward (L_reg)
+            seq_lp_vic = _forward_gen_lp(y_vic_ids, y_vic_mask)
+            L_reg = -torch.mean(log_clip(seq_lp_vic - seq_lp_minus_d))
             L_reg.backward()
             L_reg_val = L_reg.item()
             del seq_lp_vic, L_reg
-            torch.cuda.empty_cache()
-            
-            # --- (d) Forward y-，计算 L_obj 的 y- 部分 + VQ loss 并 backward ---
-            seq_lp_minus = _forward_seq_lp(y_minus_ids, y_minus_mask)
-            # L_obj 中 y- 的贡献: +mean(log P(y-))  (与 y+ 的 -mean 合起来就是原式)
+
+            # (d) y- forward + backward (L_obj_minus + VQ loss)
+            seq_lp_minus = _forward_gen_lp(y_minus_ids, y_minus_mask)
             L_obj_minus = torch.mean(seq_lp_minus)
-            
+
             vq_loss = model._vq_loss_container.get("loss", None)
             if vq_loss is None or not isinstance(vq_loss, torch.Tensor):
                 vq_loss = torch.tensor(0.0, device=args.device)
-            
-            partial_loss = L_obj_minus + args.beta * vq_loss
-            partial_loss.backward()
+
+            (L_obj_minus + args.beta * vq_loss).backward()
             L_obj_minus_val = L_obj_minus.item()
             vq_loss_val = vq_loss.item() if isinstance(vq_loss, torch.Tensor) else 0.0
-            del seq_lp_minus, L_obj_minus, partial_loss, vq_loss, seq_lp_minus_detached
-            torch.cuda.empty_cache()
-            
-            # --- (e) 梯度累积满后执行 optimizer step ---
+            del seq_lp_minus, L_obj_minus, vq_loss, seq_lp_minus_d
+
+            # (e) optimizer step
             if (batch_idx + 1) % grad_accum == 0 or batch_idx == len(dataloader) - 1:
                 optimizer.step()
-            
-            # 还原 L_obj 和 total 的值用于日志
+
+            # 日志
             L_obj_val = L_obj_plus_val + L_obj_minus_val
             total_loss_val = L_obj_val + L_reg_val + args.beta * vq_loss_val
-            
-            # 记录损失
+
             epoch_loss += total_loss_val
             epoch_obj_loss += L_obj_val
             epoch_reg_loss += L_reg_val
             epoch_vq_loss += vq_loss_val
-            
+
             if global_step % args.log_step == 0:
                 print(f"Step {global_step}, Total: {total_loss_val:.4f}, "
                       f"L_obj: {L_obj_val:.4f}, L_reg: {L_reg_val:.4f}, "
-                      f"VQ: {vq_loss_val:.4f}")
+                      f"VQ: {vq_loss_val:.4f}, cold_start: {cold_start_count}")
                 tb_writer.add_scalar("stage3/total_loss", total_loss_val, global_step)
                 tb_writer.add_scalar("stage3/L_obj", L_obj_val, global_step)
                 tb_writer.add_scalar("stage3/L_reg", L_reg_val, global_step)
                 tb_writer.add_scalar("stage3/vq_loss", vq_loss_val, global_step)
-            
-            if global_step % args.save_step == 0:
-                save_checkpoint(model, args, f"step_{global_step}")
-            
-            # 主动清理显存，防止堆积
-            del gen_output_1, gen_output_2
+
+            # 修复5: 只在 step 末尾清理一次显存
             del input_ids, attention_mask, pixel_values, image_sizes, labels
             del y_plus_ids, y_minus_ids, y_plus_mask, y_minus_mask
-            del y_vic_ids, y_vic_mask
-            del prompt_ids, prompt_mask
-            del batch
-            gc.collect()
+            del y_vic_ids, y_vic_mask, prompt_ids, prompt_mask, batch
             torch.cuda.empty_cache()
         
         # Epoch 统计
@@ -1362,6 +1443,7 @@ def main():
     print("\n加载训练数据...")
     if args.dataset_name == "scienceqa":
         train_samples = build_scienceqa_samples(
+            scienceqa_path=args.scienceqa_path,
             split=args.scienceqa_split,
             train_num=args.train_num,
             seed=args.scienceqa_seed,
@@ -1381,6 +1463,12 @@ def main():
             split=args.scienceqa_eval_split,
             train_num=0,
             max_length=args.max_length,
+            samples=build_scienceqa_samples(
+                scienceqa_path=args.scienceqa_path,
+                split=args.scienceqa_eval_split,
+                train_num=0,
+                seed=args.scienceqa_seed,
+            ),
             seed=args.scienceqa_seed,
         )
     else:

@@ -458,11 +458,8 @@ class VQLORDDataset(torch.utils.data.Dataset):
             padding="longest",
             truncation=False,
         )
-        image_sizes = inputs.get("image_sizes") if isinstance(inputs, dict) else None
-        if image_sizes is None:
-            image_sizes = image_sizes_default
-        else:
-            image_sizes = image_sizes.squeeze(0)
+        # 直接使用原图尺寸，避免 processor 返回形状差异触发下游 patch 计算异常
+        image_sizes = image_sizes_default
 
         labels = inputs["input_ids"].clone()
         pad_id = self.processor.tokenizer.pad_token_id

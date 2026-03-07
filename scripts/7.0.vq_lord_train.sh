@@ -23,9 +23,14 @@ export BNB_CUDA_VERSION=121
 export HF_ENDPOINT="https://hf-mirror.com"
 export HF_DATASETS_OFFLINE=1
 
+# 避免 libgomp 报 OMP_NUM_THREADS 非法值
+if ! [[ "${OMP_NUM_THREADS}" =~ ^[0-9]+$ ]]; then
+    export OMP_NUM_THREADS=8
+fi
+
 echo "HOME: ${HOME}"
-# export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
-export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
+export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
+# export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
 
 # 自动选择空闲 GPU
 # export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
@@ -45,17 +50,25 @@ export CUDA_VISIBLE_DEVICES=0
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# 需要定位 CUDA 异步报错时可开启：export DEBUG_CUDA=1
+if [ "${DEBUG_CUDA:-1}" = "1" ]; then
+    export CUDA_LAUNCH_BLOCKING=1
+fi
 
 # 项目路径
-# export root_dir="/root/workspace/align/"
-export root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
-export save_dir="${root_dir}vq_lord_ckpts/"
+# 自动定位到当前脚本所在仓库根目录，避免误指向旧工程
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export root_dir="$(cd "${script_dir}/.." && pwd)/"
+export save_dir="/root/autodl-tmp/vq_lord_ckpts/"
 export data_dir="${root_dir}vq_lord_data/"
 
 # 模型路径
-# export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
-export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+# export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
 export victim_model="gpt-4-vision-preview"
+
+export OPENAI_BASE_URL="https://sg.uiuiapi.com/v1"
+export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
 
 # ================== VQ-LoRD 参数配置 ==================
 
@@ -72,7 +85,7 @@ export temperature=1.5          # 蒸馏温度
 # ================== 训练参数选择区 (请二选一取消注释) ==================
 
 # --- 选项 A: 针对 A800 80GB PCIe 优化 (默认) ---
-export stage=3                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
+export stage=2                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
 export epochs=3                 # 训练轮数
 export batch_size=1             # 批次大小 (LLaVA-Next 不支持 bs>1, 不同图片 patch 数不同)
 export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
@@ -104,16 +117,25 @@ export use_4bit=1               # 使用 4-bit 量化
 # # ---------------------
 
 # 数据
-export train_num=500           # 训练样本数 (更多数据充分利用算力)
+export train_num=500           # 训练样本数（0表示使用全部数据）
 export dataset_name="scienceqa" # 使用 ScienceQA 数据集
+# ScienceQA 数据路径（优先本地目录，其次回退到 HF 数据集名）
+if [ -d "${root_dir}downloads/dataset/ScienceQA" ]; then
+    export scienceqa_path="${root_dir}downloads/dataset/ScienceQA"
+elif [ -d "/root/autodl-tmp/datasets/ScienceQA" ]; then
+    export scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
+else
+    export scienceqa_path="ScienceQA"
+fi
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
 export scienceqa_seed=20240306  # ScienceQA 划分随机种子
 export collect_teacher_data=1    # 自动补齐 GPT-4V 教师回答
 export strict_teacher_distill=1  # 严格模式：缺少教师回答则报错
+export teacher_lang="en"        # 教师回答统一语言: zh / en
 
 # 日志和保存
-export log_step=10
+export log_step=100
 export save_step=100
 
 # ================== 训练执行 ==================
@@ -132,6 +154,13 @@ echo "======================================================"
 mkdir -p $save_dir
 mkdir -p $data_dir
 
+# 校验训练入口是否存在
+if [ ! -f "${root_dir}vq_lord/train_vq_lord.py" ]; then
+    echo "错误: 未找到训练入口 ${root_dir}vq_lord/train_vq_lord.py"
+    echo "当前 root_dir=${root_dir}"
+    exit 1
+fi
+
 # 运行训练
 $python ${root_dir}vq_lord/train_vq_lord.py \
     --model_path=$model_path \
@@ -142,8 +171,8 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
     --alpha=$alpha \
     --beta=$beta \
     --temperature=$temperature \
-    --stage=$stage \
-    --epochs=$epochs \
+    --stage=2 \
+    --epochs=2 \
     --batch_size=$batch_size \
     --lr=$lr \
     --max_length=$max_length \
@@ -156,11 +185,52 @@ $python ${root_dir}vq_lord/train_vq_lord.py \
     --data_dir=$data_dir \
     --train_num=$train_num \
     --dataset_name=$dataset_name \
+    --scienceqa_path=$scienceqa_path \
     --scienceqa_split=$scienceqa_split \
     --scienceqa_eval_split=$scienceqa_eval_split \
     --scienceqa_seed=$scienceqa_seed \
     --collect_teacher_data=$collect_teacher_data \
     --strict_teacher_distill=$strict_teacher_distill \
+    --teacher_lang=$teacher_lang \
+    --reuse_vq_codebook=1 \
+    --reuse_stage2=1 \
+    --stage2_ckpt_path=$save_dir/stage2_vision \
+    --save_path=$save_dir \
+    --log_step=$log_step \
+    --save_step=$save_step \
+    --device="cuda"
+
+# 运行训练
+$python ${root_dir}vq_lord/train_vq_lord.py \
+    --model_path=$model_path \
+    --victim_model=$victim_model \
+    --vq_codebook_size=$vq_codebook_size \
+    --vq_commitment_cost=$vq_commitment_cost \
+    --freeze_vision_tower=$freeze_vision_tower \
+    --alpha=$alpha \
+    --beta=$beta \
+    --temperature=$temperature \
+    --stage=3 \
+    --epochs=1 \
+    --batch_size=$batch_size \
+    --lr=$lr \
+    --max_length=$max_length \
+    --use_lora=$use_lora \
+    --lora_rank=$lora_rank \
+    --lora_alpha=$lora_alpha_val \
+    --use_4bit=$use_4bit \
+    --grad_accum=$grad_accum \
+    --max_new_tokens=$max_new_tokens \
+    --data_dir=$data_dir \
+    --train_num=$train_num \
+    --dataset_name=$dataset_name \
+    --scienceqa_path=$scienceqa_path \
+    --scienceqa_split=$scienceqa_split \
+    --scienceqa_eval_split=$scienceqa_eval_split \
+    --scienceqa_seed=$scienceqa_seed \
+    --collect_teacher_data=$collect_teacher_data \
+    --strict_teacher_distill=$strict_teacher_distill \
+    --teacher_lang=$teacher_lang \
     --reuse_vq_codebook=1 \
     --reuse_stage2=1 \
     --stage2_ckpt_path=$save_dir/stage2_vision \

@@ -21,8 +21,8 @@ export HF_ENDPOINT="https://hf-mirror.com"
 export HF_DATASETS_OFFLINE=1
 
 echo "HOME: ${HOME}"
-# export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
-export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
+export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
+# export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
 
 # 自动选择空闲 GPU
 # export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
@@ -44,14 +44,17 @@ export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 项目路径
-# export root_dir="/root/workspace/align/"
-export root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
-export save_dir="${root_dir}vq_lord_ckpts/"
+# 自动定位到当前脚本所在仓库根目录，避免误指向旧工程（旧工程的 sciqa_process.py 不支持 --scienceqa_path）
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export root_dir="$(cd "${script_dir}/.." && pwd)/"
+# export root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
+export save_dir="/root/autodl-tmp/vq_lord_ckpts/"
 export data_dir="${root_dir}vq_lord_data/"
+export vq_codebook_path="${save_dir}stage2_vision/vq_codebook.pt"  # VQ Codebook 保存路径
 
 # 模型路径
-# export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
-export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+# export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
 export victim_model="gpt-4-vision-preview"
 
 # ================== VQ-LoRD 参数配置 ==================
@@ -103,6 +106,14 @@ export use_4bit=1               # 使用 4-bit 量化（若需全精度训练请
 # 数据
 export train_num=500           # 训练样本数 (更多数据充分利用算力)
 export dataset_name="scienceqa" # 使用 ScienceQA 数据集
+# ScienceQA 数据路径（优先本地目录，其次回退到 HF 数据集名）
+if [ -d "${root_dir}downloads/dataset/ScienceQA" ]; then
+    export scienceqa_path="${root_dir}downloads/dataset/ScienceQA"
+elif [ -d "/root/autodl-tmp/datasets/ScienceQA" ]; then
+    export scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
+else
+    export scienceqa_path="ScienceQA"
+fi
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
 export scienceqa_seed=20240306  # ScienceQA 划分随机种子
@@ -125,6 +136,19 @@ echo "======================================================"
 mkdir -p $save_dir
 mkdir -p $data_dir
 
+# 校验测试入口是否存在
+if [ ! -f "${root_dir}vq_lord/sciqa_process.py" ]; then
+    echo "错误: 未找到测试入口 ${root_dir}vq_lord/sciqa_process.py"
+    echo "当前 root_dir=${root_dir}"
+    exit 1
+fi
+
+# 校验 VQ codebook 是否存在（不存在时 sciqa_process 会记录 vq_codebook_loaded=false）
+if [ ! -f "${vq_codebook_path}" ]; then
+    echo "警告: 未找到 VQ codebook: ${vq_codebook_path}"
+    echo "将继续运行，但结果中 vq_codebook_loaded 很可能为 false"
+fi
+
 # ================== 训练结果验证 ==================
 if [ "$stage" -ge 3 ]; then
     echo "======================================================"
@@ -136,8 +160,12 @@ if [ "$stage" -ge 3 ]; then
         --adapter_path=$save_dir/stage3_lord_final \
         --split=$scienceqa_eval_split \
         --max_samples=200 \
-        --max_new_tokens=64 \
+        --max_new_tokens=128 \
         --use_4bit=$use_4bit \
+        --use_vq=1 \
+        --vq_codebook_size=8192 \
+        --freeze_vision_tower=0 \
+        --vq_codebook_path=$vq_codebook_path \
         --save_path=$save_dir/sciqa_eval.json
 
     echo "======================================================"
@@ -145,3 +173,4 @@ if [ "$stage" -ge 3 ]; then
     echo "结果保存在: $save_dir/sciqa_eval.json"
     echo "======================================================"
 fi
+

@@ -52,12 +52,20 @@ class VectorQuantizer(nn.Module):
         
         # Codebook: 离散 token 的嵌入表
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        self.embedding.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
-        
+        # 使用 N(0,1) 初始化，而非 uniform(-1/N,1/N)（后者范围过小导致 codebook collapse）
+        self.embedding.weight.data.normal_(0, 1.0)
+
+        # 首 batch 数据驱动初始化标记
+        self.register_buffer("_initialized", torch.tensor(0, dtype=torch.long))
+
         if use_ema:
             # EMA 更新所需的缓冲区
             self.register_buffer("ema_cluster_size", torch.zeros(num_embeddings))
             self.register_buffer("ema_embedding_sum", self.embedding.weight.clone())
+
+        # Dead code 检测：记录每个 code 连续未被选中的步数
+        self.register_buffer("_code_idle_steps", torch.zeros(num_embeddings, dtype=torch.long))
+        self.dead_code_threshold = 100  # 连续 100 步未使用则重置
         
     def forward(
         self, 
@@ -81,6 +89,12 @@ class VectorQuantizer(nn.Module):
         
         # 展平为 [batch * seq_len, embedding_dim]
         z_flat = z.reshape(-1, dim)
+
+        # ===== 首 batch 数据驱动初始化 =====
+        # 用实际视觉特征初始化 codebook，避免尺度不匹配导致 collapse
+        if self.training and self._initialized.item() == 0:
+            self._init_codebook_from_data(z_flat)
+            self._initialized.fill_(1)
         
         # 计算到每个 codebook embedding 的距离
         # [batch * seq_len, num_embeddings]
@@ -108,6 +122,9 @@ class VectorQuantizer(nn.Module):
                 codebook_loss = F.mse_loss(quantized, z.detach())
                 commitment_loss = self.commitment_cost * F.mse_loss(z, quantized.detach())
                 loss = codebook_loss + commitment_loss
+
+            # Dead code restart：将长期未使用的 code 重置为当前 batch 中的随机特征
+            self._restart_dead_codes(z_flat, indices)
         else:
             loss = torch.tensor(0.0, device=z.device)
         
@@ -154,6 +171,67 @@ class VectorQuantizer(nn.Module):
             self.ema_embedding_sum / cluster_size.unsqueeze(1)
         )
     
+    @torch.no_grad()
+    def _init_codebook_from_data(self, z_flat: torch.Tensor):
+        """用首 batch 的实际视觉特征初始化 codebook（随机采样 + 扰动）。"""
+        n_data = z_flat.shape[0]
+        n_codes = self.num_embeddings
+
+        if n_data >= n_codes:
+            # 数据够多：随机采样 n_codes 个不重复的特征向量
+            perm = torch.randperm(n_data, device=z_flat.device)[:n_codes]
+            self.embedding.weight.data.copy_(z_flat[perm])
+        else:
+            # 数据不够：循环采样 + 添加小扰动避免重复
+            repeats = (n_codes + n_data - 1) // n_data
+            pool = z_flat.repeat(repeats, 1)[:n_codes]
+            noise = torch.randn_like(pool) * pool.std() * 0.05
+            self.embedding.weight.data.copy_(pool + noise)
+
+        # 同步 EMA 缓冲区
+        if self.use_ema:
+            self.ema_embedding_sum.data.copy_(self.embedding.weight.data)
+            self.ema_cluster_size.fill_(1.0)  # 初始假设每个 code 被使用过 1 次
+
+        used = min(n_data, n_codes)
+        print(f"[VQ] 首 batch 数据驱动初始化 codebook: "
+              f"{n_data} 个特征 → {n_codes} 个 code (unique={used})")
+
+    @torch.no_grad()
+    def _restart_dead_codes(self, z_flat: torch.Tensor, indices: torch.Tensor):
+        """将长期未使用的 dead code 重置为当前 batch 中的随机特征向量。"""
+        # 统计本次使用的 code
+        used_mask = torch.zeros(self.num_embeddings, dtype=torch.bool, device=z_flat.device)
+        used_mask.scatter_(0, indices, True)
+
+        # 更新 idle 计数
+        self._code_idle_steps[used_mask] = 0
+        self._code_idle_steps[~used_mask] += 1
+
+        # 找到 dead codes
+        dead_mask = self._code_idle_steps >= self.dead_code_threshold
+        n_dead = dead_mask.sum().item()
+        if n_dead == 0:
+            return
+
+        # 从当前 batch 随机采样替换 dead codes
+        dead_indices = dead_mask.nonzero(as_tuple=False).squeeze(-1)
+        n_data = z_flat.shape[0]
+        replace_idx = torch.randint(0, n_data, (n_dead,), device=z_flat.device)
+        noise = torch.randn(n_dead, z_flat.shape[1], device=z_flat.device) * 0.01
+        self.embedding.weight.data[dead_indices] = z_flat[replace_idx] + noise
+
+        # 同步 EMA 缓冲区
+        if self.use_ema:
+            self.ema_embedding_sum.data[dead_indices] = self.embedding.weight.data[dead_indices]
+            self.ema_cluster_size[dead_indices] = 1.0
+
+        # 重置 idle 计数
+        self._code_idle_steps[dead_indices] = 0
+
+        print(f"[VQ] Dead code restart: 重置了 {n_dead} 个 dead codes "
+              f"(threshold={self.dead_code_threshold})")
+
     def get_codebook_logits(self, z: torch.Tensor) -> torch.Tensor:
         """
         仅计算 logits，不进行量化

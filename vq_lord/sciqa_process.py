@@ -354,7 +354,7 @@ def run_eval(
     answer_mode: str,
     run_config: Optional[dict] = None,
 ):
-    dataset = load_dataset("/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/dataset/ScienceQA", split=split)
+    dataset = load_dataset("/root/autodl-tmp/datasets/ScienceQA", split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
     if max_samples > 0 and len(dataset_with_images) > max_samples:
