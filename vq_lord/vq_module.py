@@ -66,6 +66,13 @@ class VectorQuantizer(nn.Module):
         # Dead code 检测：记录每个 code 连续未被选中的步数
         self.register_buffer("_code_idle_steps", torch.zeros(num_embeddings, dtype=torch.long))
         self.dead_code_threshold = 100  # 连续 100 步未使用则重置
+
+    def _codebook_weight_for_compute(self, ref: torch.Tensor) -> torch.Tensor:
+        """按输入特征的 dtype/device 暂时投影 codebook，避免 matmul dtype mismatch。"""
+        weight = self.embedding.weight
+        if weight.device != ref.device or weight.dtype != ref.dtype:
+            weight = weight.to(device=ref.device, dtype=ref.dtype)
+        return weight
         
     def forward(
         self, 
@@ -95,20 +102,22 @@ class VectorQuantizer(nn.Module):
         if self.training and self._initialized.item() == 0:
             self._init_codebook_from_data(z_flat)
             self._initialized.fill_(1)
+
+        codebook_weight = self._codebook_weight_for_compute(z_flat)
         
         # 计算到每个 codebook embedding 的距离
         # [batch * seq_len, num_embeddings]
         distances = (
             torch.sum(z_flat ** 2, dim=1, keepdim=True)
-            + torch.sum(self.embedding.weight ** 2, dim=1)
-            - 2 * torch.matmul(z_flat, self.embedding.weight.t())
+            + torch.sum(codebook_weight ** 2, dim=1)
+            - 2 * torch.matmul(z_flat, codebook_weight.t())
         )
         
         # 找到最近的 code
         indices = torch.argmin(distances, dim=1)
         
         # 获取量化后的嵌入
-        quantized = self.embedding(indices).view(batch_size, seq_len, dim)
+        quantized = F.embedding(indices, codebook_weight).view(batch_size, seq_len, dim)
         
         # 计算损失
         if self.training:
@@ -143,17 +152,19 @@ class VectorQuantizer(nn.Module):
     
     def _ema_update(self, z_flat: torch.Tensor, indices: torch.Tensor):
         """使用 EMA 更新 codebook"""
+        z_update = z_flat.to(dtype=self.embedding.weight.dtype)
+
         # One-hot 编码
-        encodings = F.one_hot(indices, self.num_embeddings).float()
+        encodings = F.one_hot(indices, self.num_embeddings).to(dtype=self.embedding.weight.dtype)
         
         # 更新聚类大小
-        cluster_size = encodings.sum(0)
+        cluster_size = encodings.sum(0).to(dtype=self.ema_cluster_size.dtype)
         self.ema_cluster_size.data.mul_(self.ema_decay).add_(
             cluster_size, alpha=1 - self.ema_decay
         )
         
         # 更新嵌入和
-        embedding_sum = encodings.t() @ z_flat
+        embedding_sum = (encodings.t() @ z_update).to(dtype=self.ema_embedding_sum.dtype)
         self.ema_embedding_sum.data.mul_(self.ema_decay).add_(
             embedding_sum, alpha=1 - self.ema_decay
         )
@@ -239,11 +250,12 @@ class VectorQuantizer(nn.Module):
         """
         batch_size, seq_len, dim = z.shape
         z_flat = z.reshape(-1, dim)
+        codebook_weight = self._codebook_weight_for_compute(z_flat)
         
         distances = (
             torch.sum(z_flat ** 2, dim=1, keepdim=True)
-            + torch.sum(self.embedding.weight ** 2, dim=1)
-            - 2 * torch.matmul(z_flat, self.embedding.weight.t())
+            + torch.sum(codebook_weight ** 2, dim=1)
+            - 2 * torch.matmul(z_flat, codebook_weight.t())
         )
         
         logits = -distances.view(batch_size, seq_len, self.num_embeddings)

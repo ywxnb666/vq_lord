@@ -55,81 +55,24 @@ export vq_codebook_path="${save_dir}stage2_vision/vq_codebook.pt"  # VQ Codebook
 # 模型路径
 export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
 # export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
-export victim_model="gpt-4-vision-preview"
-
-# ================== VQ-LoRD 参数配置 ==================
-
-# VQ 参数
-export vq_codebook_size=8192    # Codebook 大小
-export vq_commitment_cost=0.25  # Commitment loss 权重
-export freeze_vision_tower=0    # 是否冻结原始视觉编码器 (0=不冻结, 1=冻结)
-
-# 损失权重
-export alpha=1.0                # 视觉蒸馏损失权重
-export beta=0.25                # VQ 损失权重
-export temperature=1.5          # 蒸馏温度
-
-# ================== 训练参数选择区 (请二选一取消注释) ==================
-
-# --- 选项 A: 针对 A800 80GB PCIe 优化 (默认) ---
-# export stage=3                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
-# export epochs=3                 # 训练轮数
-# export batch_size=1             # 批次大小 (LLaVA-Next 不支持 bs>1, 不同图片 patch 数不同)
-# export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
-# export lr=2e-5                  # 学习率 (等效bs更大,lr适当降低)
-# export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
-# export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
-# # LoRA 参数
-# export use_lora=1               # 使用 LoRA
-# export lora_rank=64             # LoRA rank (80GB可支持更大rank,提升拟合能力)
-# export lora_alpha_val=128       # LoRA alpha (通常为rank的2倍)
-# # 量化
-# export use_4bit=1               # 使用 4-bit 量化
-
-# --- 选项 B: 针对 H200 141GB SXM 优化 (高性能) ---
-export stage=3                  # 训练阶段
-export epochs=5                 # 训练轮数 (算力充裕，可多训练几轮)
-export batch_size=1             # 批次大小 (保持1以应对动态分辨率)
-export grad_accum=32            # 梯度累积步数 (H200显存巨大，大幅增加等效BS至32，稳定训练)
-export lr=4e-5                  # 学习率 (BS增大，LR适当增加)
-export max_length=4096          # 最大序列长度 (141GB显存可支持极长上下文，提升指令跟随)
-export max_new_tokens=512       # LoRD生成最长token数 (生成更详细的推理过程)
-# LoRA 参数
-export use_lora=1               # 使用 LoRA
-export lora_rank=256            # LoRA rank (H200可支持极大秩，接近全量微调效果)
-export lora_alpha_val=512       # LoRA alpha 
-# 量化
-export use_4bit=1               # 使用 4-bit 量化（若需全精度训练请设为0）
-
-# ---------------------
-
-# 数据
-export train_num=500           # 训练样本数 (更多数据充分利用算力)
-export dataset_name="scienceqa" # 使用 ScienceQA 数据集
-# ScienceQA 数据路径（优先本地目录，其次回退到 HF 数据集名）
-if [ -d "${root_dir}downloads/dataset/ScienceQA" ]; then
-    export scienceqa_path="${root_dir}downloads/dataset/ScienceQA"
-elif [ -d "/root/autodl-tmp/datasets/ScienceQA" ]; then
-    export scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
-else
-    export scienceqa_path="ScienceQA"
-fi
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
-export scienceqa_seed=20240306  # ScienceQA 划分随机种子
+export adapter_path="${save_dir}/stage3_lord_final"
+export eval_max_samples=200
+export eval_max_new_tokens=128
+export use_4bit=1
+export use_vq=1
+export vq_codebook_size=8192
+export freeze_vision_tower=0
+export save_path="${save_dir}/sciqa_eval.json"
 
 # 日志和保存
-export log_step=10
-export save_step=100
-
-# ================== 训练执行 ==================
-
 echo "======================================================"
 echo "VQ-LoRD 测试开始"
 echo "======================================================"
 echo "模型路径: $model_path"
-echo "教师模型: $victim_model"
-echo "VQ Codebook 大小: $vq_codebook_size"
+echo "Adapter 路径: $adapter_path"
+echo "VQ codebook 路径: $vq_codebook_path"
 echo "======================================================"
 
 # 创建必要目录
@@ -149,28 +92,25 @@ if [ ! -f "${vq_codebook_path}" ]; then
     echo "将继续运行，但结果中 vq_codebook_loaded 很可能为 false"
 fi
 
-# ================== 训练结果验证 ==================
-if [ "$stage" -ge 3 ]; then
-    echo "======================================================"
-    echo "开始 ScienceQA 验证"
-    echo "======================================================"
+echo "======================================================"
+echo "开始 ScienceQA 验证"
+echo "======================================================"
 
-    $python ${root_dir}vq_lord/sciqa_process.py \
-        --model_path=$model_path \
-        --adapter_path=$save_dir/stage3_lord_final \
-        --split=$scienceqa_eval_split \
-        --max_samples=200 \
-        --max_new_tokens=128 \
-        --use_4bit=$use_4bit \
-        --use_vq=1 \
-        --vq_codebook_size=8192 \
-        --freeze_vision_tower=0 \
-        --vq_codebook_path=$vq_codebook_path \
-        --save_path=$save_dir/sciqa_eval.json
+$python ${root_dir}vq_lord/sciqa_process.py \
+    --model_path=$model_path \
+    --adapter_path=$adapter_path \
+    --split=$scienceqa_eval_split \
+    --max_samples=$eval_max_samples \
+    --max_new_tokens=$eval_max_new_tokens \
+    --use_4bit=$use_4bit \
+    --use_vq=$use_vq \
+    --vq_codebook_size=$vq_codebook_size \
+    --freeze_vision_tower=$freeze_vision_tower \
+    --vq_codebook_path=$vq_codebook_path \
+    --save_path=$save_path
 
-    echo "======================================================"
-    echo "ScienceQA 验证完成"
-    echo "结果保存在: $save_dir/sciqa_eval.json"
-    echo "======================================================"
-fi
+echo "======================================================"
+echo "ScienceQA 验证完成"
+echo "结果保存在: $save_path"
+echo "======================================================"
 

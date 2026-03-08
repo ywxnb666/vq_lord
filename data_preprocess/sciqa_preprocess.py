@@ -59,7 +59,17 @@ def build_scienceqa_samples(
 	seed: int,
 ) -> List[dict]:
 	"""复用 train_vq_lord.py 的采样语义，只保留有图像样本。"""
-	dataset = load_dataset(dataset_path, split=split)
+	try:
+		dataset = load_dataset(dataset_path, split=split)
+	except Exception as exc:
+		offline = os.environ.get("HF_DATASETS_OFFLINE", "0") == "1"
+		if offline and not os.path.exists(dataset_path):
+			raise RuntimeError(
+				f"无法加载 ScienceQA: dataset_path={dataset_path}。当前处于离线模式，且该路径不是本地目录。"
+			) from exc
+		raise RuntimeError(
+			f"无法加载 ScienceQA: dataset_path={dataset_path}, split={split}"
+		) from exc
 	dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
 	all_indices = list(range(len(dataset_with_images)))
@@ -114,7 +124,11 @@ def extract_image_hw(image) -> Tuple[int, int]:
 
 
 def estimate_patch_count(processor: LlavaNextProcessor, image) -> int:
-	inputs = processor(images=image, return_tensors="pt")
+	image_processor = getattr(processor, "image_processor", None)
+	if image_processor is not None:
+		inputs = image_processor(images=image, return_tensors="pt")
+	else:
+		inputs = processor(text="", images=image, return_tensors="pt")
 	pixel_values = inputs["pixel_values"]
 	if pixel_values.dim() == 5:
 		return int(pixel_values.shape[1])
