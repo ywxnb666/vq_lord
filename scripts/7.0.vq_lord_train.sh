@@ -80,9 +80,8 @@ export vq_dead_code_threshold=200  # Dead code restart 阈值，可试 100 / 500
 export freeze_vision_tower=0    # 是否冻结原始视觉编码器 (0=不冻结, 1=冻结)
 
 # 损失权重
-export alpha=1.0                # 视觉蒸馏损失权重
 export beta=0.25                # VQ 损失权重
-export temperature=1.5          # 蒸馏温度
+export temperature=1.5          # Stage3 采样温度
 
 # ================== 训练参数选择区 (请二选一取消注释) ==================
 
@@ -256,7 +255,6 @@ run_train_stage() {
         --vq_commitment_cost=$vq_commitment_cost \
         --vq_dead_code_threshold=$vq_dead_code_threshold \
         --freeze_vision_tower=$freeze_vision_tower \
-        --alpha=$alpha \
         --beta=$beta \
         --temperature=$temperature \
         --stage=$stage_id \

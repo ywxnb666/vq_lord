@@ -49,7 +49,7 @@ def _new_init(self, *args, **kwargs):
 LlavaNextProcessor.__init__ = _new_init
 # ==========================================
 
-from vq_module import VQVisionEncoder
+from vq_module2 import VQVisionEncoder
 from data_collector import GPT4VDataCollector, VQLORDDataset
 
 import torch.nn.functional as F
@@ -915,7 +915,7 @@ def setup_args():
     parser.add_argument("--vq_commitment_cost", type=float, default=0.25,
                        help="VQ commitment loss 权重")
     parser.add_argument("--vq_dead_code_threshold", type=int, default=100,
-                       help="VQ dead code restart 阈值：连续多少步未使用后重置 code")
+                       help="兼容保留参数；VectorQuantizer2 路径下未使用")
     parser.add_argument("--freeze_vision_tower", type=int, default=0,
                        help="是否冻结原始 vision tower")
     
@@ -1083,73 +1083,37 @@ def add_vq_to_model(model, args):
     """
     为模型添加 VQ 层
     
-    关键：使用 forward hook 将 VQ 量化后的特征替换原始视觉特征
+    关键：使用 VQVisionEncoder 直接包装 vision tower，
+    将视觉编码与 VQ codebook 量化串成统一前向链路
     """
     print("添加 VQ 离散化层...")
     
     # 获取 vision tower
-    vision_tower = model.vision_tower
+    original_vision_tower = model.vision_tower
     
     # 创建 VQ Vision Encoder
     vq_vision_encoder = VQVisionEncoder(
-        vision_tower=vision_tower,
+        vision_tower=original_vision_tower,
         num_embeddings=args.vq_codebook_size,
         commitment_cost=args.vq_commitment_cost,
         freeze_vision_tower=bool(args.freeze_vision_tower),
     )
-    vq_vision_encoder.vq.dead_code_threshold = int(args.vq_dead_code_threshold)
 
     try:
-        vision_device = next(vision_tower.parameters()).device
+        vision_device = next(original_vision_tower.parameters()).device
         vq_vision_encoder.to(vision_device)
     except StopIteration:
         pass
     
-    # 保存到模型
+    # 保存到模型，并以包装器替换原始 vision tower
     model.vq_vision_encoder = vq_vision_encoder
-    
-    # 保存 VQ 损失的容器 (用于训练时获取)
-    model._vq_loss_container = {"loss": None, "logits": None}
-    
-    # 注册 forward hook，在 vision_tower 输出后应用 VQ
-    def vq_hook(module, input, output):
-        """在 vision tower 输出后应用 VQ 量化"""
-        # 处理不同的输出格式
-        if hasattr(output, "last_hidden_state"):
-            vision_features = output.last_hidden_state
-        elif isinstance(output, tuple):
-            vision_features = output[0]
-        else:
-            vision_features = output
-        
-        # 应用 VQ 量化
-        if model.vq_vision_encoder.vq.embedding.weight.device != vision_features.device:
-            model.vq_vision_encoder.vq.to(vision_features.device)
-        quantized, indices, vq_loss, logits = model.vq_vision_encoder.vq(
-            vision_features, return_logits=True
-        )
-        
-        # 保存 VQ 损失供训练使用
-        model._vq_loss_container["loss"] = vq_loss
-        # model._vq_loss_container["logits"] = logits  # 节省显存，不保存未使用的 logits
-        model._vq_loss_container["indices"] = indices
-        
-        # 返回量化后的特征（替换原始特征）
-        if hasattr(output, "last_hidden_state"):
-            # 如果是 BaseModelOutputWithPooling 类型
-            output.last_hidden_state = quantized
-            return output
-        elif isinstance(output, tuple):
-            return (quantized,) + output[1:]
-        else:
-            return quantized
-    
-    # 注册 hook (注意：这会修改原模型行为)
-    model._vq_hook_handle = vision_tower.register_forward_hook(vq_hook)
+    model.vision_tower = vq_vision_encoder
+    model._vq_loss_container = vq_vision_encoder.vq_cache
+    model._vq_hook_handle = None
     
     print(
         f"VQ 层已添加，codebook 大小: {args.vq_codebook_size}, "
-        f"dead_code_threshold: {vq_vision_encoder.vq.dead_code_threshold}"
+        f"quantizer=VectorQuantizer2, chain=vision_tower->vq_codebook"
     )
     return model
 
@@ -1195,9 +1159,6 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
     print("阶段 1: VQ Codebook 预训练")
     print("=" * 50)
 
-    # 注意：不再关闭 EMA。保留 EMA 更新让 codebook 跟随数据分布移动，
-    # 配合 dead code restart 机制可避免 codebook collapse。
-    
     # 设置模型为训练模式
     model.train()
     
@@ -1239,16 +1200,13 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
                 batch_size, num_patches, channels, height, width = pixel_values.shape
                 pixel_values = pixel_values.view(batch_size * num_patches, channels, height, width)
             
-            # 前向传播（VQ hook 自动执行 EMA 更新 + dead code restart）
+            # 前向传播（VQ hook 自动执行离散化并返回 VQ loss）
             _ = model.vision_tower(pixel_values)
             
             # 获取 hook 中缓存的 VQ 损失与索引
             vq_loss = model._vq_loss_container["loss"]
             vq_indices = model._vq_loss_container.get("indices")
             
-            # EMA 模式: codebook 已在 hook 中通过 EMA 原地更新，
-            # vision_tower 冻结 → loss 无梯度 → 跳过 backward。
-            # 非 EMA 模式: 需要 backward + optimizer.step()。
             if vq_loss is not None and vq_loss.requires_grad:
                 optimizer.zero_grad()
                 vq_loss.backward()
@@ -1454,13 +1412,7 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
 
         param.requires_grad = bool(is_lora or is_vq or is_projector or is_vision)
 
-    # 冻结 VQ codebook：关闭 EMA 和 dead code restart，
-    # 避免 Stage3 多次 forward 导致 codebook 过激进更新。
-    # STE 仍正常传递梯度到 vision_tower，commitment loss 仍约束 z→codebook。
-    _vq = model.vq_vision_encoder.vq
-    _vq.use_ema = False
-    _vq.dead_code_threshold = 10**9  # 实质禁用 dead code restart
-    print(f"[Stage3] VQ codebook 已冻结 (use_ema=False, dead_code restart 禁用)")
+    print("[Stage3] VQ codebook 通过 requires_grad=False 冻结；无 EMA/dead-code 状态需要切换")
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Stage3 可训练参数量: {trainable_params:,}")
@@ -1807,25 +1759,15 @@ def save_vq_codebook(model, codebook_path: str):
 
 
 def _mark_vq_codebook_loaded(vq_module):
-    """加载 codebook 后，同步内部状态，避免训练首批再次数据驱动初始化。"""
-    if hasattr(vq_module, "_initialized"):
-        vq_module._initialized.fill_(1)
-
-    if getattr(vq_module, "use_ema", False):
-        if hasattr(vq_module, "ema_embedding_sum"):
-            vq_module.ema_embedding_sum.data.copy_(vq_module.embedding.weight.data)
-        if hasattr(vq_module, "ema_cluster_size"):
-            vq_module.ema_cluster_size.data.clamp_(min=1.0)
-
-    if hasattr(vq_module, "_code_idle_steps"):
-        vq_module._code_idle_steps.zero_()
+    """加载 codebook 后保留统一入口；VectorQuantizer2 无额外内部状态需要同步。"""
+    return None
 
 
 def load_vq_codebook(model, codebook_path: str):
     codebook = torch.load(codebook_path, map_location="cpu")
     model.vq_vision_encoder.vq.embedding.weight.data.copy_(codebook)
     _mark_vq_codebook_loaded(model.vq_vision_encoder.vq)
-    print(f"已加载 VQ codebook: {codebook_path} (已禁用首批重初始化)")
+    print(f"已加载 VQ codebook: {codebook_path}")
 
 
 def save_stage2_checkpoint(model, args, ckpt_path: str):
@@ -1861,7 +1803,7 @@ def load_stage2_checkpoint(model, ckpt_path: str):
         codebook = torch.load(vq_path, map_location="cpu")
         model.vq_vision_encoder.vq.embedding.weight.data.copy_(codebook)
         _mark_vq_codebook_loaded(model.vq_vision_encoder.vq)
-        print(f"已加载 VQ codebook: {vq_path} (已禁用首批重初始化)")
+        print(f"已加载 VQ codebook: {vq_path}")
     
     # 加载 LoRA 适配器
     adapter_config = os.path.join(ckpt_path, "adapter_config.json")

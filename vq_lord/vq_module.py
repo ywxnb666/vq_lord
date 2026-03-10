@@ -51,7 +51,7 @@ class VectorQuantizer(nn.Module):
         self.ema_decay = ema_decay
         
         # Codebook: 离散 token 的嵌入表
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         # 使用 N(0,1) 初始化，而非 uniform(-1/N,1/N)（后者范围过小导致 codebook collapse）
         self.embedding.weight.data.normal_(0, 1.0)
 
