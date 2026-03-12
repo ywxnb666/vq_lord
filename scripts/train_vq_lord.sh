@@ -29,21 +29,9 @@ if ! [[ "${OMP_NUM_THREADS}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "HOME: ${HOME}"
-# export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
-export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
+export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
+# export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
 
-# 自动选择空闲 GPU
-# export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
-#                                         --format=csv,noheader,nounits | \
-#                               awk -F ', ' '$2 < 100 && $3 == 0 {print $1}' | \
-#                               paste -sd ",")
-
-# if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
-#     export CUDA_VISIBLE_DEVICES=0
-#     echo "未找到空闲 GPU，使用 GPU 0"
-# else
-#     echo "使用 GPU: $CUDA_VISIBLE_DEVICES"
-# fi
 
 export CUDA_VISIBLE_DEVICES=0
 
@@ -59,17 +47,19 @@ fi
 # 自动定位到当前脚本所在仓库根目录，避免误指向旧工程
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export root_dir="$(cd "${script_dir}/.." && pwd)/"
-export save_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts"
+export save_dir="/root/autodl-tmp/vq_lord_ckpts"
 export data_dir="${root_dir}vq_lord_data/"
 export preprocess_dir="${save_dir}/preprocess"
 
 # 模型路径
-# export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
-export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
-export victim_model="gpt-4-vision-preview"
+export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+# export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+export victim_model="gpt-4o-mini"
 
 export OPENAI_BASE_URL="https://sg.uiuiapi.com/v1"
 export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
+export teacher_api_base="${OPENAI_BASE_URL}"
+export teacher_api_key="${OPENAI_API_KEY}"
 
 # ================== VQ-LoRD 参数配置 ==================
 
@@ -86,41 +76,45 @@ export temperature=1.5          # Stage3 采样温度
 # ================== 训练参数选择区 (请二选一取消注释) ==================
 
 # --- 选项 A: 针对 A800 80GB PCIe 优化 (默认) ---
-# export stage=2                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
-# export stage1_epochs=1          # Stage1 训练轮数
-# export stage2_epochs=3          # Stage2 训练轮数
-# export stage3_epochs=1          # Stage3 训练轮数
-# export batch_size=4             # 常规/回退 DataLoader 批次大小；启用分桶时由 bucket_batch_size 控制
-# export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
-# export lr=2e-5                  # 学习率 (等效bs更大,lr适当降低)
-# export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
-# export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
-# # LoRA 参数
-# export use_lora=1               # 使用 LoRA
-# export lora_rank=64             # LoRA rank (80GB可支持更大rank,提升拟合能力)
-# export lora_alpha_val=128       # LoRA alpha (通常为rank的2倍)
-# # 量化
-# export use_4bit=1               # 使用 4-bit 量化
-
-# --- 选项 B: 针对 H200 141GB SXM 优化 (高性能) ---
-export stage=3                  # 训练阶段
+export stage=2                  # 训练阶段 (1=VQ预训练, 2=视觉蒸馏, 3=全部)
 export stage1_epochs=1          # Stage1 训练轮数
-export stage2_epochs=1          # Stage2 训练轮数
+export stage2_epochs=3          # Stage2 训练轮数
 export stage3_epochs=1          # Stage3 训练轮数
-export batch_size=8             # 常规/回退 DataLoader 批次大小；启用分桶时由 bucket_batch_size 控制
-export grad_accum=8             # 全局回退梯度累积步数
-export stage2_grad_accum=4      # Stage2 单独梯度累积；0 表示回退到 grad_accum
-export stage3_grad_accum=4      # Stage3 单独梯度累积；0 表示回退到 grad_accum
-export lr=4e-5                  # 学习率 (BS增大，LR适当增加)
-export max_length=1024          # 最大序列长度 (141GB显存可支持极长上下文，提升指令跟随)
-export max_new_tokens=256       # LoRD生成最长token数 (生成更详细的推理过程)
+export batch_size=4             # 常规/回退 DataLoader 批次大小；启用分桶时由 bucket_batch_size 控制
+export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
+export lr=2e-5                  # 学习率 (等效bs更大,lr适当降低)
+export stage1_lr=3e-5           # Stage1 专用学习率；0 表示回退到 lr*5。当前默认取本轮调参中更稳的配置
+export stage1_recon_weight=1.0  # Stage1 特征重建损失权重
+export stage1_cosine_weight=0.25 # Stage1 余弦一致性损失权重
+export stage1_vq_weight=1.0     # Stage1 VQ 损失权重；保持 1.0，避免过度削弱码本约束
+export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
+export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
 # LoRA 参数
 export use_lora=1               # 使用 LoRA
-export lora_rank=256            # LoRA rank (H200可支持极大秩，接近全量微调效果)
-export lora_alpha_val=512       # LoRA alpha 
+export lora_rank=64             # LoRA rank (80GB可支持更大rank,提升拟合能力)
+export lora_alpha_val=128       # LoRA alpha (通常为rank的2倍)
 # 量化
-export use_4bit=0               # 使用 4-bit 量化（若需全精度训练请设为0）
-export model_dtype="bfloat16"   # 非 4bit 模式下使用 bfloat16 / float16 / float32
+export use_4bit=1               # 使用 4-bit 量化
+
+# --- 选项 B: 针对 H200 141GB SXM 优化 (高性能) ---
+# export stage=3                  # 训练阶段
+# export stage1_epochs=1          # Stage1 训练轮数
+# export stage2_epochs=1          # Stage2 训练轮数
+# export stage3_epochs=1          # Stage3 训练轮数
+# export batch_size=8             # 常规/回退 DataLoader 批次大小；启用分桶时由 bucket_batch_size 控制
+# export grad_accum=8             # 全局回退梯度累积步数
+# export stage2_grad_accum=4      # Stage2 单独梯度累积；0 表示回退到 grad_accum
+# export stage3_grad_accum=4      # Stage3 单独梯度累积；0 表示回退到 grad_accum
+# export lr=4e-5                  # 学习率 (BS增大，LR适当增加)
+# export max_length=1024          # 最大序列长度 (141GB显存可支持极长上下文，提升指令跟随)
+# export max_new_tokens=256       # LoRD生成最长token数 (生成更详细的推理过程)
+# # LoRA 参数
+# export use_lora=1               # 使用 LoRA
+# export lora_rank=256            # LoRA rank (H200可支持极大秩，接近全量微调效果)
+# export lora_alpha_val=512       # LoRA alpha 
+# # 量化
+# export use_4bit=0               # 使用 4-bit 量化（若需全精度训练请设为0）
+# export model_dtype="bfloat16"   # 非 4bit 模式下使用 bfloat16 / float16 / float32
 
 # # ---------------------
 
@@ -128,7 +122,8 @@ export model_dtype="bfloat16"   # 非 4bit 模式下使用 bfloat16 / float16 / 
 export train_num=500           # 训练样本数（0表示使用全部数据）
 export dataset_name="scienceqa" # 使用 ScienceQA 数据集
 # ScienceQA 数据路径（优先环境变量，其次本地目录，最后才回退到 HF 数据集名）
-SCIENCEQA_PATH="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
+# SCIENCEQA_PATH="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
+SCIENCEQA_PATH="/root/autodl-tmp/datasets/ScienceQA"
 
 if [ -n "${SCIENCEQA_PATH:-}" ]; then
     export scienceqa_path="$SCIENCEQA_PATH"
@@ -144,7 +139,7 @@ fi
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
 export scienceqa_seed=20240306  # ScienceQA 划分随机种子
-export collect_teacher_data=1    # 自动补齐 GPT-4V 教师回答
+export collect_teacher_data=1    # 自动补齐教师模型回答
 export strict_teacher_distill=1  # 严格模式：缺少教师回答则报错
 export teacher_lang="en"        # 教师回答统一语言: zh / en
 export bucket_by="patches"      # 预处理分桶方式: patches / size / none
@@ -180,6 +175,8 @@ echo "use_4bit: $use_4bit"
 echo "model_dtype: $model_dtype"
 echo "训练阶段: $stage"
 echo "Stage1 epochs: $stage1_epochs"
+echo "Stage1 lr: $stage1_lr"
+echo "Stage1 recon/cos/vq: $stage1_recon_weight / $stage1_cosine_weight / $stage1_vq_weight"
 echo "Stage2 epochs: $stage2_epochs"
 echo "Stage3 epochs: $stage3_epochs"
 echo "保存路径: $save_dir"
@@ -195,8 +192,8 @@ mkdir -p $data_dir
 mkdir -p $preprocess_dir
 
 # 校验训练入口是否存在
-if [ ! -f "${root_dir}vq_lord/train_vq_lord.py" ]; then
-    echo "错误: 未找到训练入口 ${root_dir}vq_lord/train_vq_lord.py"
+if [ ! -f "${root_dir}vq_lord2/train_vq_lord2.py" ]; then
+    echo "错误: 未找到训练入口 ${root_dir}vq_lord2/train_vq_lord2.py"
     echo "当前 root_dir=${root_dir}"
     exit 1
 fi
@@ -248,9 +245,11 @@ run_train_stage() {
     echo "开始 Stage${stage_id} 训练，epochs=${stage_epochs}"
     echo "======================================================"
 
-    $python ${root_dir}vq_lord/train_vq_lord.py \
+    $python ${root_dir}vq_lord2/train_vq_lord2.py \
         --model_path=$model_path \
         --victim_model=$victim_model \
+        --teacher_api_base=$teacher_api_base \
+        --teacher_api_key=$teacher_api_key \
         --vq_codebook_size=$vq_codebook_size \
         --vq_commitment_cost=$vq_commitment_cost \
         --vq_dead_code_threshold=$vq_dead_code_threshold \
@@ -261,6 +260,10 @@ run_train_stage() {
         --epochs=$stage_epochs \
         --batch_size=$batch_size \
         --lr=$lr \
+        --stage1_lr=$stage1_lr \
+        --stage1_recon_weight=$stage1_recon_weight \
+        --stage1_cosine_weight=$stage1_cosine_weight \
+        --stage1_vq_weight=$stage1_vq_weight \
         --max_length=$max_length \
         --use_lora=$use_lora \
         --lora_rank=$lora_rank \
