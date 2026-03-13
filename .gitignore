@@ -26,6 +26,7 @@ doc/
 *.pkkl
 *.out
 *_ckpts/
+maybe_backend
 
 /LoRA-LoRD-ckptsvaryTrainNum___41allenai/
 /vArY_TrAiN_num_LoRA-LoRD-ckpts/

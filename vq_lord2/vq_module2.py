@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
-from typing import Tuple, Optional
+from typing import Dict, Tuple, Optional
 
 
 class VectorQuantizer2(nn.Module):
@@ -27,9 +27,6 @@ class VectorQuantizer2(nn.Module):
     主要修改部分：
 
     """
-    # NOTE: due to a bug the beta term was applied to the wrong term. for
-    # backwards compatibility we use the buggy version by default, but you can
-    # specify legacy=False to fix it.
     def __init__(
         self, 
         num_embeddings: int = 8192, 
@@ -217,6 +214,18 @@ class VQVisionEncoder(nn.Module):
             "hidden_size", 
             1024
         )
+
+        # 参考 VQGAN 的 quant_conv/post_quant_conv，在量化前后加入可学习投影。
+        self.pre_quant = nn.Sequential(
+            nn.LayerNorm(self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        self.post_quant = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        self.compute_dtype = torch.float32
         
         # VQ 层
         self.vq = VectorQuantizer2(
@@ -234,7 +243,52 @@ class VQVisionEncoder(nn.Module):
             "logits": None,
             "indices": None,
             "features": None,
+            "pre_quant_features": None,
+            "reconstructed_features": None,
+            "target_features": None,
         }
+
+    def get_vq_state(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        return {
+            "vq": self.vq.state_dict(),
+            "pre_quant": self.pre_quant.state_dict(),
+            "post_quant": self.post_quant.state_dict(),
+        }
+
+    def load_vq_state(self, state: Dict[str, Dict[str, torch.Tensor]]) -> None:
+        if not isinstance(state, dict):
+            raise TypeError("VQ state 必须是 dict")
+
+        if "vq" in state:
+            self.vq.load_state_dict(state["vq"], strict=False)
+        if "pre_quant" in state:
+            self.pre_quant.load_state_dict(state["pre_quant"], strict=False)
+        if "post_quant" in state:
+            self.post_quant.load_state_dict(state["post_quant"], strict=False)
+
+    def stage1_parameters(self):
+        for module in (self.pre_quant, self.vq, self.post_quant):
+            yield from module.parameters()
+
+    def _align_vq_modules(self, reference: torch.Tensor) -> None:
+        if not isinstance(reference, torch.Tensor):
+            return
+        target_device = reference.device
+        for module in (self.pre_quant, self.vq, self.post_quant):
+            module.to(device=target_device, dtype=self.compute_dtype)
+
+    def _prepare_vq_input(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.dtype]:
+        original_dtype = features.dtype
+        compute_features = features.to(dtype=self.compute_dtype)
+        return compute_features, original_dtype
+
+    def encode_features(self, pixel_values: torch.Tensor, *args, **kwargs):
+        if self.freeze_vision_tower:
+            with torch.no_grad():
+                tower_output = self.vision_tower(pixel_values, *args, **kwargs)
+        else:
+            tower_output = self.vision_tower(pixel_values, *args, **kwargs)
+        return tower_output, self._extract_hidden_states(tower_output)
 
     def _extract_hidden_states(self, tower_output):
         if hasattr(tower_output, "last_hidden_state"):
@@ -278,6 +332,40 @@ class VQVisionEncoder(nn.Module):
         self.vq_cache["features"] = quantized
 
         return quantized, indices, vq_loss, logits
+
+    def stage1_forward(
+        self,
+        pixel_values: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            _, target_features = self.encode_features(pixel_values, *args, **kwargs)
+
+        target_features = target_features.detach()
+        self._align_vq_modules(target_features)
+        target_features_compute, _ = self._prepare_vq_input(target_features)
+        pre_quant_features = self.pre_quant(target_features_compute)
+        quantized, indices, vq_loss, logits = self.quantize_features(
+            pre_quant_features,
+            return_vq_logits=True,
+        )
+        reconstructed_features = self.post_quant(quantized)
+
+        self.vq_cache["pre_quant_features"] = pre_quant_features
+        self.vq_cache["reconstructed_features"] = reconstructed_features
+        self.vq_cache["target_features"] = target_features_compute
+        self.vq_cache["features"] = reconstructed_features
+
+        return {
+            "target_features": target_features_compute,
+            "pre_quant_features": pre_quant_features,
+            "quantized_features": quantized,
+            "reconstructed_features": reconstructed_features,
+            "indices": indices,
+            "vq_loss": vq_loss,
+            "logits": logits,
+        }
     
     def forward(
         self,
@@ -300,31 +388,36 @@ class VQVisionEncoder(nn.Module):
             vq_loss: VQ 损失
             logits: VQ logits (可用于蒸馏)
         """
-        # 通过视觉编码器
-        if self.freeze_vision_tower:
-            with torch.no_grad():
-                tower_output = self.vision_tower(pixel_values, *args, **kwargs)
-        else:
-            tower_output = self.vision_tower(pixel_values, *args, **kwargs)
-
-        vision_features = self._extract_hidden_states(tower_output)
+        tower_output, vision_features = self.encode_features(pixel_values, *args, **kwargs)
+        self._align_vq_modules(vision_features)
+        vision_features_compute, original_dtype = self._prepare_vq_input(vision_features)
+        pre_quant_features = self.pre_quant(vision_features_compute)
         quantized, indices, vq_loss, logits = self.quantize_features(
-            vision_features,
+            pre_quant_features,
             return_vq_logits=return_vq_logits,
         )
+        reconstructed_features = self.post_quant(quantized)
+        reconstructed_output = reconstructed_features.to(dtype=original_dtype)
+
+        self.vq_cache["pre_quant_features"] = pre_quant_features
+        self.vq_cache["reconstructed_features"] = reconstructed_output
+        self.vq_cache["target_features"] = vision_features.detach()
+        self.vq_cache["features"] = reconstructed_output
 
         if return_details:
-            return quantized, indices, vq_loss, logits
+            return reconstructed_output, indices, vq_loss, logits
 
-        return self._replace_hidden_states(tower_output, quantized)
+        return self._replace_hidden_states(tower_output, reconstructed_output)
     
     def get_vision_logits(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         只获取 VQ logits，用于蒸馏
         """
         with torch.no_grad():
-            tower_output = self.vision_tower(pixel_values)
-            vision_features = self._extract_hidden_states(tower_output)
+            _, vision_features = self.encode_features(pixel_values)
+            self._align_vq_modules(vision_features)
+            vision_features, _ = self._prepare_vq_input(vision_features)
+            vision_features = self.pre_quant(vision_features)
         
         return self.vq.get_codebook_logits(vision_features)
 

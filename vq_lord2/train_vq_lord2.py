@@ -9,7 +9,7 @@ VQ-LoRD 主训练脚本
 训练流程:
 1. 加载预训练 LLaVA 模型
 2. 添加 VQ 层到 Vision Encoder
-3. 加载 GPT-4V 收集的视觉数据
+3. 加载教师模型收集的视觉数据
 4. 三阶段训练: VQ预训练 → 视觉蒸馏 → LoRD联合训练
 
     Author: VQ-LoRD Project
@@ -154,7 +154,7 @@ def normalize_teacher_response(text: str, lang: str = "zh") -> str:
 
 def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
     """
-    为 ScienceQA 样本补充 GPT-4V 教师回答（带缓存）
+    为 ScienceQA 样本补充教师模型回答（带缓存）
 
     说明：
     - 若缓存存在，优先读取缓存；
@@ -196,21 +196,23 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
 
     if need_collect and args.collect_teacher_data:
         collector = GPT4VDataCollector(
+            api_key=(args.teacher_api_key if args.teacher_api_key else None),
+            base_url=(args.teacher_api_base if args.teacher_api_base else None),
             model=args.victim_model,
             save_dir=args.data_dir,
         )
 
         if not collector.api_key:
             msg = (
-                "需要采集 GPT-4V 教师回答，但未检测到 OPENAI_API_KEY。"
-                "可设置环境变量，或提供已有 teacher cache。"
+                "需要采集教师模型回答，但未检测到 API Key。"
+                "可通过 --teacher_api_key 或 OPENAI_API_KEY 提供。"
             )
             if args.strict_teacher_distill:
                 raise RuntimeError(msg)
             print(f"警告: {msg}")
         else:
             print(f"开始采集教师回答，待补齐样本数: {len(need_collect)}")
-            for rank, (idx, key) in enumerate(tqdm(need_collect, desc="采集 GPT-4V 教师回答"), start=1):
+            for rank, (idx, key) in enumerate(tqdm(need_collect, desc="采集教师模型回答"), start=1):
                 sample = samples[idx]
                 image = sample.get("image")
                 instruction = sample.get("instruction", "")
@@ -863,12 +865,9 @@ def _load_parameter_state(model, parameter_state: dict, state_name: str):
 
 def save_stage3_checkpoint(model, save_dir: str):
     os.makedirs(save_dir, exist_ok=True)
-    model.save_pretrained(save_dir)
+    model.save_pretrained(save_dir, safe_serialization=False)
 
-    torch.save(
-        model.vq_vision_encoder.vq.embedding.weight.detach().cpu(),
-        os.path.join(save_dir, "vq_codebook.pt")
-    )
+    save_vq_codebook(model, os.path.join(save_dir, "vq_codebook.pt"))
     torch.save(
         _get_trainable_parameter_state(model),
         os.path.join(save_dir, "trainable_model_state.pt")
@@ -889,10 +888,8 @@ def load_stage3_checkpoint(model, ckpt_dir: str, device: str):
 
     vq_resume_path = os.path.join(ckpt_dir, "vq_codebook.pt")
     if os.path.exists(vq_resume_path):
-        cb = torch.load(vq_resume_path, map_location="cpu")
-        model.vq_vision_encoder.vq.embedding.weight.data.copy_(cb)
-        _mark_vq_codebook_loaded(model.vq_vision_encoder.vq)
-        print(f"[Resume] 已加载 Stage3 VQ codebook: {vq_resume_path}")
+        load_vq_codebook(model, vq_resume_path)
+        print(f"[Resume] 已加载 Stage3 VQ stack: {vq_resume_path}")
 
     return model
 
@@ -908,6 +905,10 @@ def setup_args():
     parser.add_argument("--victim_model", type=str,
                        default="gpt-4-vision-preview",
                        help="教师模型 (API)")
+    parser.add_argument("--teacher_api_base", type=str, default="",
+                       help="教师 API Base URL（OpenAI 兼容）")
+    parser.add_argument("--teacher_api_key", type=str, default="",
+                       help="教师 API Key（留空则回退到 OPENAI_API_KEY）")
     
     # VQ 参数
     parser.add_argument("--vq_codebook_size", type=int, default=8192,
@@ -934,6 +935,14 @@ def setup_args():
                        help="批次大小")
     parser.add_argument("--lr", type=float, default=3e-5,
                        help="学习率")
+    parser.add_argument("--stage1_lr", type=float, default=0.0,
+                       help="Stage1 学习率，<=0 时使用 lr*5")
+    parser.add_argument("--stage1_recon_weight", type=float, default=1.0,
+                       help="Stage1 特征重建损失权重")
+    parser.add_argument("--stage1_cosine_weight", type=float, default=0.25,
+                       help="Stage1 特征余弦损失权重")
+    parser.add_argument("--stage1_vq_weight", type=float, default=1.0,
+                       help="Stage1 VQ 损失权重")
     parser.add_argument("--max_length", type=int, default=512,
                        help="最大序列长度")
     
@@ -981,9 +990,9 @@ def setup_args():
     parser.add_argument("--teacher_cache_path", type=str, default="",
                        help="ScienceQA 教师回答缓存路径 (json)")
     parser.add_argument("--collect_teacher_data", type=int, default=1,
-                       help="是否自动采集缺失的 GPT-4V 教师回答")
+                       help="是否自动采集缺失的教师模型回答")
     parser.add_argument("--strict_teacher_distill", type=int, default=1,
-                       help="严格蒸馏模式：若缺失 GPT-4V 教师回答则报错")
+                       help="严格蒸馏模式：若缺失教师模型回答则报错")
     parser.add_argument("--teacher_lang", type=str, default="zh", choices=["zh", "en"],
                        help="教师回答统一语言：zh 或 en")
     parser.add_argument("--reuse_vq_codebook", type=int, default=1,
@@ -1152,30 +1161,40 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
     """
     阶段 1: VQ Codebook 预训练
     
-    目标：训练 VQ 层学习好的图像离散表示
-    注意：这个阶段只训练 VQ codebook，不训练其他组件
+    目标：参考 VQGAN 的 encode->quantize->decode 闭环，
+    在固定 vision tower 的前提下训练出可重建原始视觉特征的 VQ stack。
     """
     print("\n" + "=" * 50)
     print("阶段 1: VQ Codebook 预训练")
     print("=" * 50)
 
-    # 设置模型为训练模式
-    model.train()
-    
-    # 只训练 VQ 层
-    for name, param in model.named_parameters():
-        if "vq" in name.lower() and torch.is_floating_point(param):
+    model.eval()
+    vq_encoder = model.vq_vision_encoder
+
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in vq_encoder.stage1_parameters():
+        if torch.is_floating_point(param):
             param.requires_grad = True
-        else:
-            param.requires_grad = False
+
+    vq_encoder.pre_quant.train()
+    vq_encoder.vq.train()
+    vq_encoder.post_quant.train()
+    vq_encoder.vision_tower.eval()
     
     # 统计可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"可训练参数量: {trainable_params:,}")
+
+    stage1_lr = args.stage1_lr if args.stage1_lr > 0 else args.lr * 5
+    print(
+        f"[Stage1] lr={stage1_lr}, recon_w={args.stage1_recon_weight}, "
+        f"cos_w={args.stage1_cosine_weight}, vq_w={args.stage1_vq_weight}"
+    )
     
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr * 5,  # VQ 预训练用更大学习率
+        lr=stage1_lr,
     )
     
     log_dir = os.path.join(args.save_path, "logs")
@@ -1184,13 +1203,16 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
 
     if not os.path.exists(metrics_path):
         with open(metrics_path, "w", encoding="utf-8") as f:
-            f.write("stage,step,loss,loss_ema,codebook_used\n")
+            f.write("stage,step,total_loss,recon_loss,cosine_loss,vq_loss,loss_ema,codebook_used\n")
 
     global_step = 0
     loss_ema = None
     for epoch in range(args.epochs):
         maybe_set_dataloader_epoch(dataloader, epoch)
         epoch_loss = 0.0
+        epoch_recon = 0.0
+        epoch_cosine = 0.0
+        epoch_vq = 0.0
         for batch in tqdm(dataloader, desc=f"VQ预训练 Epoch {epoch+1}"):
             global_step += 1
             
@@ -1200,21 +1222,55 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
                 batch_size, num_patches, channels, height, width = pixel_values.shape
                 pixel_values = pixel_values.view(batch_size * num_patches, channels, height, width)
             
-            # 前向传播（VQ hook 自动执行离散化并返回 VQ loss）
-            _ = model.vision_tower(pixel_values)
-            
-            # 获取 hook 中缓存的 VQ 损失与索引
-            vq_loss = model._vq_loss_container["loss"]
-            vq_indices = model._vq_loss_container.get("indices")
-            
-            if vq_loss is not None and vq_loss.requires_grad:
-                optimizer.zero_grad()
-                vq_loss.backward()
-                optimizer.step()
-            
+            optimizer.zero_grad(set_to_none=True)
+            stage1_out = vq_encoder.stage1_forward(pixel_values)
+
+            target_features = stage1_out["target_features"]
+            reconstructed_features = stage1_out["reconstructed_features"]
+            vq_loss = stage1_out["vq_loss"]
+            vq_indices = stage1_out.get("indices")
+
+            recon_loss = F.mse_loss(reconstructed_features, target_features)
+            cosine_loss = 1.0 - F.cosine_similarity(
+                reconstructed_features.float(),
+                target_features.float(),
+                dim=-1,
+            ).mean()
+            total_loss = (
+                args.stage1_recon_weight * recon_loss
+                + args.stage1_cosine_weight * cosine_loss
+                + args.stage1_vq_weight * vq_loss
+            )
+
+            if not torch.isfinite(total_loss):
+                print(
+                    f"[Stage1][Warn] step={global_step} 出现非有限损失，"
+                    f"跳过该 batch: recon={recon_loss.item()}, cos={cosine_loss.item()}, "
+                    f"vq={vq_loss.item() if isinstance(vq_loss, torch.Tensor) else vq_loss}"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            total_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_([
+                p for p in model.parameters() if p.requires_grad
+            ], max_norm=1.0)
+            if isinstance(grad_norm, torch.Tensor) and not torch.isfinite(grad_norm):
+                print(f"[Stage1][Warn] step={global_step} 梯度范数非有限，跳过 optimizer.step()")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            optimizer.step()
+
+            total_loss_val = total_loss.item()
+            recon_loss_val = recon_loss.item()
+            cosine_loss_val = cosine_loss.item()
             vq_loss_val = vq_loss.item() if vq_loss is not None else 0.0
-            epoch_loss += vq_loss_val
-            loss_ema = vq_loss_val if loss_ema is None else (0.95 * loss_ema + 0.05 * vq_loss_val)
+
+            epoch_loss += total_loss_val
+            epoch_recon += recon_loss_val
+            epoch_cosine += cosine_loss_val
+            epoch_vq += vq_loss_val
+            loss_ema = total_loss_val if loss_ema is None else (0.95 * loss_ema + 0.05 * total_loss_val)
 
             if vq_indices is not None:
                 codebook_used = torch.unique(vq_indices).numel()
@@ -1222,15 +1278,29 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
                 codebook_used = 0
             
             if global_step % args.log_step == 0:
-                print(f"Step {global_step}, VQ Loss: {vq_loss_val:.4f}")
+                print(
+                    f"Step {global_step}, Total: {total_loss_val:.4f}, "
+                    f"Recon: {recon_loss_val:.4f}, Cos: {cosine_loss_val:.4f}, VQ: {vq_loss_val:.4f}"
+                )
+                tb_writer.add_scalar("stage1/total_loss", total_loss_val, global_step)
+                tb_writer.add_scalar("stage1/recon_loss", recon_loss_val, global_step)
+                tb_writer.add_scalar("stage1/cosine_loss", cosine_loss_val, global_step)
                 tb_writer.add_scalar("stage1/vq_loss", vq_loss_val, global_step)
-                tb_writer.add_scalar("stage1/vq_loss_ema", loss_ema, global_step)
+                tb_writer.add_scalar("stage1/loss_ema", loss_ema, global_step)
                 tb_writer.add_scalar("stage1/codebook_used", codebook_used, global_step)
                 with open(metrics_path, "a", encoding="utf-8") as f:
-                    f.write(f"stage1,{global_step},{vq_loss_val:.6f},{loss_ema:.6f},{codebook_used}\n")
+                    f.write(
+                        f"stage1,{global_step},{total_loss_val:.6f},{recon_loss_val:.6f},"
+                        f"{cosine_loss_val:.6f},{vq_loss_val:.6f},{loss_ema:.6f},{codebook_used}\n"
+                    )
         
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch+1} 平均 VQ Loss: {avg_loss:.4f}")
+        num_batches = len(dataloader)
+        avg_loss = epoch_loss / num_batches
+        print(
+            f"Epoch {epoch+1} 平均损失: Total={avg_loss:.4f}, "
+            f"Recon={epoch_recon / num_batches:.4f}, Cos={epoch_cosine / num_batches:.4f}, "
+            f"VQ={epoch_vq / num_batches:.4f}"
+        )
     
     return model
 
@@ -1239,7 +1309,7 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
     """
     阶段 2: 视觉能力蒸馏
     
-    目标：通过视觉问答蒸馏，让学生模型学习 GPT-4V 的视觉理解能力
+    目标：通过视觉问答蒸馏，让学生模型学习教师模型的视觉理解能力
     训练：VQ 层 + Vision Encoder（如果未冻结）+ Projector
     """
     print("\n" + "=" * 50)
@@ -1749,24 +1819,35 @@ def save_checkpoint(model, args, suffix=""):
     save_path = os.path.join(args.save_path, suffix)
     os.makedirs(save_path, exist_ok=True)
     
-    model.save_pretrained(save_path)
+    model.save_pretrained(save_path, safe_serialization=False)
     print(f"模型已保存至 {save_path}")
+
+
+def _get_vq_state_path(codebook_path: str) -> str:
+    return os.path.join(os.path.dirname(codebook_path), "vq_encoder_state.pt")
 
 
 def save_vq_codebook(model, codebook_path: str):
     os.makedirs(os.path.dirname(codebook_path), exist_ok=True)
     torch.save(model.vq_vision_encoder.vq.embedding.weight.detach().cpu(), codebook_path)
+    torch.save(model.vq_vision_encoder.get_vq_state(), _get_vq_state_path(codebook_path))
 
 
-def _mark_vq_codebook_loaded(vq_module):
-    """加载 codebook 后保留统一入口；VectorQuantizer2 无额外内部状态需要同步。"""
-    return None
+def save_stage1_checkpoint(model, args):
+    """Stage1 只保存后续蒸馏真正需要的 VQ stack，避免整模型落盘占用大量磁盘。"""
+    save_dir = os.path.join(args.save_path, "stage1_vq")
+    os.makedirs(save_dir, exist_ok=True)
+    save_vq_codebook(model, args.vq_codebook_path)
+    print(f"Stage1 VQ stack 已保存至 {save_dir}")
 
 
 def load_vq_codebook(model, codebook_path: str):
     codebook = torch.load(codebook_path, map_location="cpu")
     model.vq_vision_encoder.vq.embedding.weight.data.copy_(codebook)
-    _mark_vq_codebook_loaded(model.vq_vision_encoder.vq)
+    vq_state_path = _get_vq_state_path(codebook_path)
+    if os.path.exists(vq_state_path):
+        vq_state = torch.load(vq_state_path, map_location="cpu")
+        model.vq_vision_encoder.load_vq_state(vq_state)
     print(f"已加载 VQ codebook: {codebook_path}")
 
 
@@ -1774,12 +1855,10 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
     """保存 Stage2 检查点（包括 VQ codebook 和 LoRA 权重）"""
     os.makedirs(ckpt_path, exist_ok=True)
     
-    # 保存 VQ codebook
-    vq_path = os.path.join(ckpt_path, "vq_codebook.pt")
-    torch.save(model.vq_vision_encoder.vq.embedding.weight.detach().cpu(), vq_path)
+    save_vq_codebook(model, os.path.join(ckpt_path, "vq_codebook.pt"))
     
     # 保存 LoRA 适配器
-    model.save_pretrained(ckpt_path)
+    model.save_pretrained(ckpt_path, safe_serialization=False)
     
     # 保存配置信息
     import json
@@ -1797,13 +1876,9 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
 
 def load_stage2_checkpoint(model, ckpt_path: str):
     """加载 Stage2 检查点"""
-    # 加载 VQ codebook
     vq_path = os.path.join(ckpt_path, "vq_codebook.pt")
     if os.path.exists(vq_path):
-        codebook = torch.load(vq_path, map_location="cpu")
-        model.vq_vision_encoder.vq.embedding.weight.data.copy_(codebook)
-        _mark_vq_codebook_loaded(model.vq_vision_encoder.vq)
-        print(f"已加载 VQ codebook: {vq_path}")
+        load_vq_codebook(model, vq_path)
     
     # 加载 LoRA 适配器
     adapter_config = os.path.join(ckpt_path, "adapter_config.json")
@@ -1871,7 +1946,7 @@ def main():
             seed=args.scienceqa_seed,
         )
 
-        # 关键：为每条样本补齐 GPT-4V 教师回答，供 Stage2/Stage3 蒸馏使用
+        # 关键：为每条样本补齐教师模型回答，供 Stage2/Stage3 蒸馏使用
         train_samples = attach_gpt4v_teacher_responses(train_samples, args)
 
         train_dataset = ScienceQADataset(
@@ -2037,8 +2112,7 @@ def main():
             load_vq_codebook(model, args.vq_codebook_path)
         else:
             model = train_stage1_vq(model, stage1_dataloader, args, tb_writer)
-            save_checkpoint(model, args, "stage1_vq")
-            save_vq_codebook(model, args.vq_codebook_path)
+            save_stage1_checkpoint(model, args)
     
     if args.stage >= 2:
         stage2_dataloader = build_train_dataloader(stage_id=2)

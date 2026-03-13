@@ -2,10 +2,10 @@
 ======================================================================
 DATA_COLLECTOR ---
 
-GPT-4V 数据收集模块
+教师模型数据收集模块
 
 核心功能:
-1. 收集视觉问答数据 (从 GPT-4V 获取回答)
+1. 收集视觉问答数据 (从教师模型获取回答)
 2. 收集详细图像描述
 3. 构建 VQ-LoRD 训练数据
 
@@ -47,9 +47,9 @@ class ImageDescriptionItem:
 
 class GPT4VDataCollector:
     """
-    GPT-4V 数据收集器
+    教师模型数据收集器
     
-    用于从 GPT-4V 收集视觉理解数据，构建 VQ-LoRD 训练集
+    用于从教师模型收集视觉理解数据，构建 VQ-LoRD 训练集
     
     Args:
         api_key: OpenAI API 密钥
@@ -154,7 +154,7 @@ class GPT4VDataCollector:
         max_tokens: int = 500,
     ) -> Optional[str]:
         """
-        查询 GPT-4V
+        查询教师模型
         
         Args:
             image_path: 图片路径
@@ -162,7 +162,7 @@ class GPT4VDataCollector:
             max_tokens: 最大生成 token 数
             
         Returns:
-            GPT-4V 的回答，失败返回 None
+            教师模型回答，失败返回 None
         """
         try:
             client = self._get_openai_client()
@@ -216,7 +216,7 @@ class GPT4VDataCollector:
             return None
 
         except Exception as e:
-            print(f"GPT-4V 查询失败: {e}")
+            print(f"教师模型查询失败: {e}")
             return None
 
     def query_gpt4v_image(
@@ -227,7 +227,7 @@ class GPT4VDataCollector:
         image_format: str = "PNG",
     ) -> Optional[str]:
         """
-        使用 PIL.Image 直接查询 GPT-4V
+        使用 PIL.Image 直接查询教师模型
 
         Args:
             image: PIL 图像
@@ -236,7 +236,7 @@ class GPT4VDataCollector:
             image_format: 编码格式（默认 PNG）
 
         Returns:
-            GPT-4V 回答文本，失败返回 None
+            教师模型回答文本，失败返回 None
         """
         try:
             client = self._get_openai_client()
@@ -277,7 +277,7 @@ class GPT4VDataCollector:
 
             return None
         except Exception as e:
-            print(f"GPT-4V 查询失败: {e}")
+            print(f"教师模型查询失败: {e}")
             return None
     
     def collect_visual_qa_data(
