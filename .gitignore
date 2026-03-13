@@ -13,7 +13,6 @@ vArY_TrAiN_nUm_ckpts
 *ckpt
 test/
 *512.pkl
-*.json
 NEW_VARYING_QUERYTIME_CKPTS/
 SCALE_VARYING_CKPTS/
 STEALED_PKLS
