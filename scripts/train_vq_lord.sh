@@ -65,13 +65,17 @@ export teacher_api_key="${OPENAI_API_KEY}"
 
 # VQ 参数
 export vq_codebook_size=512    # Codebook 大小
-export vq_commitment_cost=0.25  # Commitment loss 权重
-export vq_dead_code_threshold=200  # Dead code restart 阈值，可试 100 / 500 / 1000
+export vq_commitment_cost=0.5  # Commitment loss 权重（Stage1 上比 0.25 更稳）
+export vq_dead_code_threshold=1.0  # dead code EMA 阈值（用于重置低使用 code）
+export vq_usage_decay=0.99       # code 使用率 EMA 衰减
+export vq_dead_code_reset_interval=20  # 每 20 step 尝试重置 dead code
+export vq_legacy_loss=0          # 0=使用修正版 VQ loss（非 legacy）
 export freeze_vision_tower=0    # 是否冻结原始视觉编码器 (0=不冻结, 1=冻结)
 
 # 损失权重
 export beta=0.25                # VQ 损失权重
 export temperature=1.5          # Stage3 采样温度
+export tau1=0.01                # Stage3 冷启动阈值
 
 # ================== 训练参数选择区 (请二选一取消注释) ==================
 
@@ -83,10 +87,18 @@ export stage3_epochs=0          # Stage3 训练轮数
 export batch_size=4             # 常规/回退 DataLoader 批次大小；启用分桶时由 bucket_batch_size 控制
 export grad_accum=8             # 梯度累积步数 (等效batch_size=8)
 export lr=2e-5                  # 学习率 (等效bs更大,lr适当降低)
-export stage1_lr=3e-5           # Stage1 专用学习率；0 表示回退到 lr*5。当前默认取本轮调参中更稳的配置
+export stage1_lr=5e-5           # Stage1 专用学习率；0 表示回退到 lr*5。此默认值对当前配置更稳
 export stage1_recon_weight=1.0  # Stage1 特征重建损失权重
 export stage1_cosine_weight=0.25 # Stage1 余弦一致性损失权重
 export stage1_vq_weight=1.0     # Stage1 VQ 损失权重；保持 1.0，避免过度削弱码本约束
+export stage1_grad_clip=5.0     # Stage1 梯度裁剪阈值（<=0 关闭）
+export stage2_answer_weight=1.0     # Stage2 强答案监督权重
+export stage2_rationale_weight=0.3  # Stage2 弱解释监督权重
+export stage2_prepost_lr_scale=0.5  # Stage2 pre/post quant 学习率缩放
+export stage2_vision_lr_scale=0.2   # Stage2 vision tower 学习率缩放
+export stage2_grad_clip=1.0         # Stage2 梯度裁剪阈值
+export stage3_lr_scale=0.2          # Stage3 默认更小学习率，避免破坏 Stage2 warm start
+export stage3_train_projector=0     # Stage3 默认冻结 projector
 export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
 export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
 # LoRA 参数
@@ -161,6 +173,8 @@ echo "教师模型: $victim_model"
 echo "ScienceQA 路径: $scienceqa_path"
 echo "VQ Codebook 大小: $vq_codebook_size"
 echo "VQ dead code threshold: $vq_dead_code_threshold"
+echo "VQ usage decay/reset interval: $vq_usage_decay / $vq_dead_code_reset_interval"
+echo "VQ legacy loss: $vq_legacy_loss"
 echo "回退 batch_size: $batch_size"
 echo "全局回退 grad_accum: $grad_accum"
 echo "Stage2 grad_accum: $stage2_grad_accum"
@@ -172,7 +186,11 @@ echo "Stage1 epochs: $stage1_epochs"
 echo "Stage1 lr: $stage1_lr"
 echo "Stage1 recon/cos/vq: $stage1_recon_weight / $stage1_cosine_weight / $stage1_vq_weight"
 echo "Stage2 epochs: $stage2_epochs"
+echo "Stage2 answer/rationale: $stage2_answer_weight / $stage2_rationale_weight"
+echo "Stage2 prepost/vision lr scale: $stage2_prepost_lr_scale / $stage2_vision_lr_scale"
+echo "Stage2 grad_clip: $stage2_grad_clip"
 echo "Stage3 epochs: $stage3_epochs"
+echo "Stage3 tau1/lr_scale/train_projector: $tau1 / $stage3_lr_scale / $stage3_train_projector"
 echo "保存路径: $save_dir"
 echo "Stage1/2 分桶文件: $scienceqa_preprocessed_path"
 echo "Stage1/2 分桶 batch size: $bucket_batch_size"
@@ -251,9 +269,13 @@ run_train_stage() {
         --vq_codebook_size=$vq_codebook_size \
         --vq_commitment_cost=$vq_commitment_cost \
         --vq_dead_code_threshold=$vq_dead_code_threshold \
+        --vq_usage_decay=$vq_usage_decay \
+        --vq_dead_code_reset_interval=$vq_dead_code_reset_interval \
+        --vq_legacy_loss=$vq_legacy_loss \
         --freeze_vision_tower=$freeze_vision_tower \
         --beta=$beta \
         --temperature=$temperature \
+        --tau1=$tau1 \
         --stage=$stage_id \
         --epochs=$stage_epochs \
         --batch_size=$batch_size \
@@ -262,6 +284,7 @@ run_train_stage() {
         --stage1_recon_weight=$stage1_recon_weight \
         --stage1_cosine_weight=$stage1_cosine_weight \
         --stage1_vq_weight=$stage1_vq_weight \
+        --stage1_grad_clip=$stage1_grad_clip \
         --max_length=$max_length \
         --use_lora=$use_lora \
         --lora_rank=$lora_rank \
@@ -270,7 +293,14 @@ run_train_stage() {
         --model_dtype=$model_dtype \
         --grad_accum=$grad_accum \
         --stage2_grad_accum=$stage2_grad_accum \
+        --stage2_answer_weight=$stage2_answer_weight \
+        --stage2_rationale_weight=$stage2_rationale_weight \
+        --stage2_prepost_lr_scale=$stage2_prepost_lr_scale \
+        --stage2_vision_lr_scale=$stage2_vision_lr_scale \
+        --stage2_grad_clip=$stage2_grad_clip \
         --stage3_grad_accum=$stage3_grad_accum \
+        --stage3_lr_scale=$stage3_lr_scale \
+        --stage3_train_projector=$stage3_train_projector \
         --max_new_tokens=$max_new_tokens \
         --data_dir=$data_dir \
         --train_num=$train_num \

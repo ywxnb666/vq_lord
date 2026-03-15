@@ -89,8 +89,9 @@ def build_scienceqa_samples(
         for choice_idx, choice in enumerate(choices):
             choices_text += f"({chr(65 + choice_idx)}) {choice}\n"
 
-        answer_idx = item.get("answer", 0)
+        answer_idx = int(item.get("answer", 0))
         answer = choices[answer_idx] if choices and answer_idx < len(choices) else ""
+        answer_letter = chr(65 + answer_idx) if 0 <= answer_idx < 26 else "A"
         lecture = item.get("lecture", "")
         solution = item.get("solution", "")
 
@@ -104,6 +105,11 @@ def build_scienceqa_samples(
             "sample_id": sampled_pos,
             "source_index": dataset_idx,
             "image": item.get("image"),
+            "question": question,
+            "choices": choices,
+            "answer_idx": answer_idx,
+            "answer_letter": answer_letter,
+            "answer_text": answer,
             "instruction": instruction,
             "response": response,
         })
@@ -150,6 +156,30 @@ def normalize_teacher_response(text: str, lang: str = "zh") -> str:
         text = text.replace("解释：", "Explanation:")
         text = text.replace("答案：", "Answer:")
     return text
+
+
+def _extract_teacher_rationale(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    explanation_markers = ["Explanation:", "解释："]
+    answer_markers = ["\nAnswer:", "\n答案：", "Answer:", "答案："]
+
+    rationale = cleaned
+    for marker in explanation_markers:
+        if marker in rationale:
+            rationale = rationale.split(marker, 1)[1].strip()
+            break
+
+    for marker in answer_markers:
+        if marker in rationale:
+            rationale = rationale.split(marker, 1)[0].strip()
+
+    return rationale.strip()
 
 
 def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
@@ -295,22 +325,26 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
 
 
 class ScienceQADataset(torch.utils.data.Dataset):
-    """ScienceQA 多模态数据集包装"""
+    """ScienceQA 多模态数据集包装（兼容 Stage2 双监督与 Stage3 单监督）。"""
 
     def __init__(
         self,
         processor,
+        scienceqa_path: str = "ScienceQA",
         split: str = "train",
         train_num: int = 500,
         max_length: int = 512,
         samples: Optional[List[dict]] = None,
         seed: int = 20240306,
+        teacher_lang: str = "zh",
     ):
         self.processor = processor
         self.max_length = max_length
+        self.teacher_lang = teacher_lang
 
         if samples is None:
             samples = build_scienceqa_samples(
+                scienceqa_path=scienceqa_path,
                 split=split,
                 train_num=train_num,
                 seed=seed,
@@ -321,42 +355,59 @@ class ScienceQADataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _build_targets(self, item: dict, instruction_text: str) -> tuple[str, str, bool]:
+        answer_letter = item.get("answer_letter", "A")
+        if not isinstance(answer_letter, str) or len(answer_letter) == 0:
+            answer_letter = "A"
+        answer_letter = answer_letter.strip().upper()[0]
+
+        # 固定答案锚点，确保 Stage2/Stage3 指标口径一致。
+        answer_target = f"Answer: {answer_letter}"
+
+        teacher_response = item.get("teacher_response", item.get("response", ""))
+        teacher_response = teacher_response.replace("<image>", "").replace("< image >", "").replace("<Image>", "")
+        rationale = _extract_teacher_rationale(teacher_response)
+        has_rationale = bool(rationale)
+        rationale_prefix = ""
+
+        if has_rationale:
+            if self.teacher_lang == "zh":
+                rationale_prefix = f"解释：{rationale}"
+            else:
+                rationale_prefix = f"Explanation: {rationale}"
+            rationale_target = f"{rationale_prefix}\n{answer_target}"
+        else:
+            rationale_target = answer_target
+
+        # 预截断 rationale 文本，保留图文 token 对齐。
+        max_text_tokens = self.max_length
+        instr_tokens = self.processor.tokenizer.encode(instruction_text, add_special_tokens=False)
+        ratio_tokens = self.processor.tokenizer.encode(rationale_target, add_special_tokens=False)
+        budget = max_text_tokens - len(instr_tokens) - 2
+        if budget > 0 and len(ratio_tokens) > budget:
+            answer_tokens = self.processor.tokenizer.encode(answer_target, add_special_tokens=False)
+            if has_rationale and len(answer_tokens) < budget:
+                prefix_tokens = self.processor.tokenizer.encode(rationale_prefix, add_special_tokens=False)
+                keep_prefix_tokens = prefix_tokens[:max(0, budget - len(answer_tokens) - 1)]
+                trimmed_prefix = self.processor.tokenizer.decode(keep_prefix_tokens, skip_special_tokens=True).strip()
+                rationale_target = f"{trimmed_prefix}\n{answer_target}" if trimmed_prefix else answer_target
+                has_rationale = bool(trimmed_prefix)
+            else:
+                rationale_target = answer_target
+                has_rationale = False
+
+        return answer_target, rationale_target, has_rationale
+
     def __getitem__(self, idx):
         item = self.samples[idx]
         image = item["image"]
         image_sizes_default = torch.tensor([image.height, image.width], dtype=torch.long)
 
-        instruction = item['instruction']
-        response = item.get('teacher_response', item.get('response', ''))
-        response = response.replace("<image>", "").replace("< image >", "").replace("<Image>", "")
+        instruction = item.get("instruction", "")
         instruction_text = instruction.replace("<image>", "").replace("< image >", "").replace("<Image>", "").strip()
-
-        # 预截断文本部分（不能截断 processor 输出，否则会破坏 <image> token 对齐）
-        # 先估算 response 的 token 数，超出预算则截断 response
-        max_text_tokens = self.max_length  # 纯文本 token 预算
-        instr_tokens = self.processor.tokenizer.encode(instruction, add_special_tokens=False)
-        resp_tokens = self.processor.tokenizer.encode(response, add_special_tokens=False)
-        budget = max_text_tokens - len(instr_tokens) - 2  # 留 2 给特殊 token
-        if budget > 0 and len(resp_tokens) > budget:
-            resp_tokens = resp_tokens[:budget]
-            response = self.processor.tokenizer.decode(resp_tokens, skip_special_tokens=True)
+        answer_target, rationale_target, has_rationale = self._build_targets(item, instruction_text)
 
         if hasattr(self.processor, "apply_chat_template"):
-            full_conv = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": instruction_text},
-                        {"type": "image"},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": response},
-                    ],
-                },
-            ]
             prompt_conv = [
                 {
                     "role": "user",
@@ -366,21 +417,30 @@ class ScienceQADataset(torch.utils.data.Dataset):
                     ],
                 }
             ]
+            full_conv = prompt_conv + [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": rationale_target},
+                    ],
+                }
+            ]
+            answer_conv = prompt_conv + [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": answer_target},
+                    ],
+                }
+            ]
 
-            full_text = self.processor.apply_chat_template(full_conv, add_generation_prompt=False)
             prompt_text = self.processor.apply_chat_template(prompt_conv, add_generation_prompt=True)
+            full_text = self.processor.apply_chat_template(full_conv, add_generation_prompt=False)
+            answer_text = self.processor.apply_chat_template(answer_conv, add_generation_prompt=False)
         else:
-            # 兼容无 chat template 的老版本
-            full_text = f"<image>\n{instruction_text}\n{response}"
             prompt_text = f"<image>\n{instruction_text}"
-
-        inputs = self.processor(
-            text=full_text,
-            images=image,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
-        )
+            full_text = f"{prompt_text}\n{rationale_target}"
+            answer_text = f"{prompt_text}\n{answer_target}"
 
         prompt_inputs = self.processor(
             text=prompt_text,
@@ -389,23 +449,56 @@ class ScienceQADataset(torch.utils.data.Dataset):
             padding="longest",
             truncation=False,
         )
+        full_inputs = self.processor(
+            text=full_text,
+            images=image,
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+        )
+        answer_inputs = self.processor(
+            text=answer_text,
+            images=image,
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+        )
 
-        # 对 LLaVA-Next，直接使用原图尺寸最稳妥，避免 processor 返回形状差异导致 patch 计算异常
         image_sizes = image_sizes_default
-
         pad_id = self.processor.tokenizer.pad_token_id
-        labels = inputs["input_ids"].squeeze(0).clone()
+
+        full_labels = full_inputs["input_ids"].squeeze(0).clone()
+        answer_labels = answer_inputs["input_ids"].squeeze(0).clone()
+
         prompt_len = prompt_inputs["input_ids"].shape[1]
-        prompt_len = min(prompt_len, labels.shape[0])
-        labels[:prompt_len] = -100
-        labels = labels.masked_fill(labels == pad_id, -100)
+        prompt_len = min(prompt_len, full_labels.shape[0], answer_labels.shape[0])
+
+        full_labels[:prompt_len] = -100
+        answer_labels[:prompt_len] = -100
+
+        full_labels = full_labels.masked_fill(full_labels == pad_id, -100)
+        answer_labels = answer_labels.masked_fill(answer_labels == pad_id, -100)
+        answer_letter = str(item.get("answer_letter", "A") or "A").strip().upper()[0]
 
         return {
-            "input_ids": inputs["input_ids"].squeeze(0),
-            "attention_mask": inputs["attention_mask"].squeeze(0),
-            "pixel_values": inputs["pixel_values"].squeeze(0),
+            # 兼容 Stage3/旧逻辑
+            "input_ids": full_inputs["input_ids"].squeeze(0),
+            "attention_mask": full_inputs["attention_mask"].squeeze(0),
+            "labels": full_labels,
+            # Stage2 双监督
+            "prompt_input_ids": prompt_inputs["input_ids"].squeeze(0),
+            "prompt_attention_mask": prompt_inputs["attention_mask"].squeeze(0),
+            "full_input_ids": full_inputs["input_ids"].squeeze(0),
+            "full_attention_mask": full_inputs["attention_mask"].squeeze(0),
+            "full_labels": full_labels,
+            "answer_input_ids": answer_inputs["input_ids"].squeeze(0),
+            "answer_attention_mask": answer_inputs["attention_mask"].squeeze(0),
+            "answer_labels": answer_labels,
+            "pixel_values": full_inputs["pixel_values"].squeeze(0),
             "image_sizes": image_sizes,
-            "labels": labels,
+            "has_rationale": int(has_rationale),
+            "answer_idx": int(item.get("answer_idx", 0)),
+            "answer_letter": answer_letter,
             "data_type": "scienceqa",
         }
 
@@ -915,8 +1008,14 @@ def setup_args():
                        help="VQ codebook 大小")
     parser.add_argument("--vq_commitment_cost", type=float, default=0.25,
                        help="VQ commitment loss 权重")
-    parser.add_argument("--vq_dead_code_threshold", type=int, default=100,
-                       help="兼容保留参数；VectorQuantizer2 路径下未使用")
+    parser.add_argument("--vq_dead_code_threshold", type=float, default=1.0,
+                       help="EMA 使用率低于该阈值的 code 视为 dead code")
+    parser.add_argument("--vq_usage_decay", type=float, default=0.99,
+                       help="code 使用率 EMA 衰减系数")
+    parser.add_argument("--vq_dead_code_reset_interval", type=int, default=20,
+                       help="每隔多少 step 尝试重置 dead code；<=0 表示关闭")
+    parser.add_argument("--vq_legacy_loss", type=int, default=0,
+                       help="是否使用 taming 的 legacy VQ loss（1=legacy,0=修正版）")
     parser.add_argument("--freeze_vision_tower", type=int, default=0,
                        help="是否冻结原始 vision tower")
     
@@ -943,6 +1042,8 @@ def setup_args():
                        help="Stage1 特征余弦损失权重")
     parser.add_argument("--stage1_vq_weight", type=float, default=1.0,
                        help="Stage1 VQ 损失权重")
+    parser.add_argument("--stage1_grad_clip", type=float, default=5.0,
+                       help="Stage1 梯度裁剪阈值；<=0 关闭")
     parser.add_argument("--max_length", type=int, default=512,
                        help="最大序列长度")
     
@@ -955,8 +1056,22 @@ def setup_args():
                        help="梯度累积步数 (等效增大 batch size)")
     parser.add_argument("--stage2_grad_accum", type=int, default=0,
                        help="Stage2 梯度累积步数，0 表示回退到 grad_accum")
+    parser.add_argument("--stage2_answer_weight", type=float, default=1.0,
+                       help="Stage2 答案监督权重")
+    parser.add_argument("--stage2_rationale_weight", type=float, default=0.3,
+                       help="Stage2 解释监督权重")
+    parser.add_argument("--stage2_prepost_lr_scale", type=float, default=0.5,
+                       help="Stage2 pre/post quant 学习率缩放")
+    parser.add_argument("--stage2_vision_lr_scale", type=float, default=0.2,
+                       help="Stage2 视觉塔学习率缩放")
+    parser.add_argument("--stage2_grad_clip", type=float, default=1.0,
+                       help="Stage2 梯度裁剪阈值；<=0 关闭")
     parser.add_argument("--stage3_grad_accum", type=int, default=0,
                        help="Stage3 梯度累积步数，0 表示回退到 grad_accum")
+    parser.add_argument("--stage3_lr_scale", type=float, default=0.2,
+                       help="Stage3 学习率缩放，默认低于 Stage2")
+    parser.add_argument("--stage3_train_projector", type=int, default=0,
+                       help="Stage3 是否继续训练 projector，默认冻结以保护 Stage2 建立的视觉桥")
     
     # LoRA 参数
     parser.add_argument("--use_lora", type=int, default=1,
@@ -1105,6 +1220,10 @@ def add_vq_to_model(model, args):
         vision_tower=original_vision_tower,
         num_embeddings=args.vq_codebook_size,
         commitment_cost=args.vq_commitment_cost,
+        legacy=bool(args.vq_legacy_loss),
+        dead_code_threshold=args.vq_dead_code_threshold,
+        usage_decay=args.vq_usage_decay,
+        dead_code_reset_interval=args.vq_dead_code_reset_interval,
         freeze_vision_tower=bool(args.freeze_vision_tower),
     )
 
@@ -1122,7 +1241,9 @@ def add_vq_to_model(model, args):
     
     print(
         f"VQ 层已添加，codebook 大小: {args.vq_codebook_size}, "
-        f"quantizer=VectorQuantizer2, chain=vision_tower->vq_codebook"
+        f"quantizer=VectorQuantizer2(legacy={bool(args.vq_legacy_loss)}), "
+        f"dead_code_threshold={args.vq_dead_code_threshold}, "
+        f"reset_interval={args.vq_dead_code_reset_interval}, chain=vision_tower->vq_codebook"
     )
     return model
 
@@ -1189,12 +1310,15 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
     stage1_lr = args.stage1_lr if args.stage1_lr > 0 else args.lr * 5
     print(
         f"[Stage1] lr={stage1_lr}, recon_w={args.stage1_recon_weight}, "
-        f"cos_w={args.stage1_cosine_weight}, vq_w={args.stage1_vq_weight}"
+        f"cos_w={args.stage1_cosine_weight}, vq_w={args.stage1_vq_weight}, "
+        f"grad_clip={args.stage1_grad_clip}"
     )
-    
-    optimizer = torch.optim.AdamW(
+
+    # 对齐 taming VQGAN：Stage1 使用 Adam(无 weight decay)，避免 codebook 被 AdamW 拉向 0。
+    optimizer = torch.optim.Adam(
         [p for p in model.parameters() if p.requires_grad],
         lr=stage1_lr,
+        betas=(0.5, 0.9),
     )
     
     log_dir = os.path.join(args.save_path, "logs")
@@ -1203,7 +1327,10 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
 
     if not os.path.exists(metrics_path):
         with open(metrics_path, "w", encoding="utf-8") as f:
-            f.write("stage,step,total_loss,recon_loss,cosine_loss,vq_loss,loss_ema,codebook_used\n")
+            f.write(
+                "stage,step,total_loss,recon_loss,cosine_loss,vq_loss,loss_ema,"
+                "codebook_used,perplexity,dead_code_resets,dead_code_count\n"
+            )
 
     global_step = 0
     loss_ema = None
@@ -1252,13 +1379,15 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
                 continue
 
             total_loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_([
-                p for p in model.parameters() if p.requires_grad
-            ], max_norm=1.0)
-            if isinstance(grad_norm, torch.Tensor) and not torch.isfinite(grad_norm):
-                print(f"[Stage1][Warn] step={global_step} 梯度范数非有限，跳过 optimizer.step()")
-                optimizer.zero_grad(set_to_none=True)
-                continue
+            grad_norm = None
+            if args.stage1_grad_clip > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_([
+                    p for p in model.parameters() if p.requires_grad
+                ], max_norm=args.stage1_grad_clip)
+                if isinstance(grad_norm, torch.Tensor) and not torch.isfinite(grad_norm):
+                    print(f"[Stage1][Warn] step={global_step} 梯度范数非有限，跳过 optimizer.step()")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             optimizer.step()
 
             total_loss_val = total_loss.item()
@@ -1276,11 +1405,20 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
                 codebook_used = torch.unique(vq_indices).numel()
             else:
                 codebook_used = 0
-            
+
+            perplexity = vq_encoder.vq_cache.get("perplexity")
+            if isinstance(perplexity, torch.Tensor):
+                perplexity_val = float(perplexity.detach().item())
+            else:
+                perplexity_val = 0.0
+            dead_code_resets = int(vq_encoder.vq_cache.get("dead_code_resets", 0))
+            dead_code_count = int(vq_encoder.vq_cache.get("dead_code_count", 0))
+
             if global_step % args.log_step == 0:
                 print(
                     f"Step {global_step}, Total: {total_loss_val:.4f}, "
-                    f"Recon: {recon_loss_val:.4f}, Cos: {cosine_loss_val:.4f}, VQ: {vq_loss_val:.4f}"
+                    f"Recon: {recon_loss_val:.4f}, Cos: {cosine_loss_val:.4f}, VQ: {vq_loss_val:.4f}, "
+                    f"used={codebook_used}, ppl={perplexity_val:.2f}, reset={dead_code_resets}, dead={dead_code_count}"
                 )
                 tb_writer.add_scalar("stage1/total_loss", total_loss_val, global_step)
                 tb_writer.add_scalar("stage1/recon_loss", recon_loss_val, global_step)
@@ -1288,10 +1426,14 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
                 tb_writer.add_scalar("stage1/vq_loss", vq_loss_val, global_step)
                 tb_writer.add_scalar("stage1/loss_ema", loss_ema, global_step)
                 tb_writer.add_scalar("stage1/codebook_used", codebook_used, global_step)
+                tb_writer.add_scalar("stage1/perplexity", perplexity_val, global_step)
+                tb_writer.add_scalar("stage1/dead_code_resets", dead_code_resets, global_step)
+                tb_writer.add_scalar("stage1/dead_code_count", dead_code_count, global_step)
                 with open(metrics_path, "a", encoding="utf-8") as f:
                     f.write(
                         f"stage1,{global_step},{total_loss_val:.6f},{recon_loss_val:.6f},"
-                        f"{cosine_loss_val:.6f},{vq_loss_val:.6f},{loss_ema:.6f},{codebook_used}\n"
+                        f"{cosine_loss_val:.6f},{vq_loss_val:.6f},{loss_ema:.6f},{codebook_used},"
+                        f"{perplexity_val:.6f},{dead_code_resets},{dead_code_count}\n"
                     )
         
         num_batches = len(dataloader)
@@ -1305,103 +1447,283 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
     return model
 
 
+def _compute_answer_slot_top1(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    """统计答案监督段最后一个 token 的 top-1 命中率。"""
+    if logits is None or labels is None:
+        return 0.0
+    if logits.dim() != 3 or labels.dim() != 2:
+        return 0.0
+
+    pred_ids = logits.argmax(dim=-1)
+    total = 0
+    correct = 0
+    batch_size = min(pred_ids.shape[0], labels.shape[0])
+
+    for i in range(batch_size):
+        valid_positions = torch.nonzero(labels[i] != -100, as_tuple=False)
+        if valid_positions.numel() == 0:
+            continue
+
+        target_pos = int(valid_positions[-1].item())
+        if target_pos <= 0 or target_pos >= pred_ids.shape[1]:
+            continue
+
+        target_token = int(labels[i, target_pos].item())
+        pred_token = int(pred_ids[i, target_pos - 1].item())
+        correct += int(pred_token == target_token)
+        total += 1
+
+    if total == 0:
+        return 0.0
+    return float(correct) / float(total)
+
+
+def _get_stage2_vq_loss(model, device: str, dtype: torch.dtype) -> torch.Tensor:
+    vq_loss = model._vq_loss_container.get("loss", None)
+    if isinstance(vq_loss, torch.Tensor):
+        return vq_loss
+    return torch.zeros((), device=device, dtype=dtype)
+
+
+def _get_stage2_vq_stats(model) -> tuple[float, int, int]:
+    perplexity = model._vq_loss_container.get("perplexity", None)
+    if isinstance(perplexity, torch.Tensor):
+        perplexity_val = float(perplexity.detach().item())
+    else:
+        perplexity_val = 0.0
+    dead_code_resets = int(model._vq_loss_container.get("dead_code_resets", 0))
+    dead_code_count = int(model._vq_loss_container.get("dead_code_count", 0))
+    return perplexity_val, dead_code_resets, dead_code_count
+
+
 def train_stage2_vision(model, dataloader, args, tb_writer):
     """
     阶段 2: 视觉能力蒸馏
-    
-    目标：通过视觉问答蒸馏，让学生模型学习教师模型的视觉理解能力
-    训练：VQ 层 + Vision Encoder（如果未冻结）+ Projector
+
+    目标：在固定 Stage1 codebook 的前提下，利用答案强监督 + 解释弱监督
+    将视觉能力迁移到可被 Stage3 继续优化的生成策略。
     """
     print("\n" + "=" * 50)
     print("阶段 2: 视觉能力蒸馏")
     print("=" * 50)
-    
+
     image_token_id = _get_image_token_id(model)
-    
     model.train()
-    
-    # 训练 VQ + Vision (如果未冻结) + Projector
+
+    main_params = []
+    prepost_params = []
+    vision_params = []
+
     for name, param in model.named_parameters():
         if not torch.is_floating_point(param):
             param.requires_grad = False
             continue
-        if any(key in name.lower() for key in ["vq", "projector", "multi_modal_projector"]):
+
+        name_l = name.lower()
+        is_lora = "lora_" in name_l or "modules_to_save" in name_l
+        is_projector = "projector" in name_l or "multi_modal_projector" in name_l
+        is_prepost = "pre_quant" in name_l or "post_quant" in name_l
+        is_vq_embedding = "vq.embedding.weight" in name_l
+        is_vision = "vision" in name_l and not args.freeze_vision_tower
+
+        if is_vq_embedding:
+            param.requires_grad = False
+            continue
+
+        if is_lora or is_projector:
             param.requires_grad = True
-        elif "vision" in name.lower() and not args.freeze_vision_tower:
+            main_params.append(param)
+        elif is_prepost:
             param.requires_grad = True
+            prepost_params.append(param)
+        elif is_vision:
+            param.requires_grad = True
+            vision_params.append(param)
         else:
             param.requires_grad = False
-    
+
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"可训练参数量: {trainable_params:,}")
-    
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-    )
+
+    param_groups = []
+    if main_params:
+        param_groups.append({"params": main_params, "lr": args.lr})
+    if prepost_params:
+        param_groups.append({"params": prepost_params, "lr": args.lr * float(args.stage2_prepost_lr_scale)})
+    if vision_params:
+        param_groups.append({"params": vision_params, "lr": args.lr * float(args.stage2_vision_lr_scale)})
+
+    if not param_groups:
+        raise RuntimeError("Stage2 没有可训练参数，请检查冻结策略")
+
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
     grad_accum = max(1, int(getattr(args, "stage2_grad_accum", 0) or getattr(args, "grad_accum", 1)))
-    print(f"[Stage2] grad_accum={grad_accum}")
-    
+    print(
+        f"[Stage2] grad_accum={grad_accum}, "
+        f"answer_w={args.stage2_answer_weight}, rationale_w={args.stage2_rationale_weight}, "
+        f"prepost_lr_scale={args.stage2_prepost_lr_scale}, "
+        f"vision_lr_scale={args.stage2_vision_lr_scale}, grad_clip={args.stage2_grad_clip}"
+    )
+
     global_step = 0
     for epoch in range(args.epochs):
         maybe_set_dataloader_epoch(dataloader, epoch)
-        epoch_loss = 0.0
+        epoch_total = 0.0
+        epoch_answer = 0.0
+        epoch_rationale = 0.0
+        epoch_vq = 0.0
+        epoch_vq_ratio = 0.0
+        epoch_vq_perplexity = 0.0
+        epoch_acc = 0.0
+        epoch_count = 0
+
         optimizer.zero_grad(set_to_none=True)
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"视觉蒸馏 Epoch {epoch+1}")):
             global_step += 1
-            
-            input_ids = batch["input_ids"].to(args.device)
-            attention_mask = batch["attention_mask"].to(args.device)
-            pixel_values = batch["pixel_values"].to(args.device)
-            image_sizes = batch.get("image_sizes")
-            image_sizes = sanitize_image_sizes(image_sizes, batch_size=input_ids.size(0))
-            labels = batch["labels"].to(args.device)
 
-            # 首个 batch 做一次 sanity check
+            pixel_values = batch["pixel_values"].to(args.device)
+            image_sizes = sanitize_image_sizes(batch.get("image_sizes"), batch_size=pixel_values.shape[0])
+
+            # 新版双监督输入（ScienceQA）
+            use_dual_targets = all(
+                key in batch for key in (
+                    "answer_input_ids", "answer_attention_mask", "answer_labels",
+                    "full_input_ids", "full_attention_mask", "full_labels",
+                )
+            )
+
+            if use_dual_targets:
+                answer_input_ids = batch["answer_input_ids"].to(args.device)
+                answer_attention_mask = batch["answer_attention_mask"].to(args.device)
+                answer_labels = batch["answer_labels"].to(args.device)
+
+                full_input_ids = batch["full_input_ids"].to(args.device)
+                full_attention_mask = batch["full_attention_mask"].to(args.device)
+                full_labels = batch["full_labels"].to(args.device)
+                has_rationale = batch.get("has_rationale")
+                if has_rationale is None:
+                    rationale_labels = full_labels
+                    has_any_rationale = True
+                else:
+                    has_rationale = has_rationale.to(args.device).bool()
+                    rationale_labels = full_labels.masked_fill(~has_rationale.unsqueeze(1), -100)
+                    has_any_rationale = bool(has_rationale.any().item())
+            else:
+                # 兼容旧路径（vq_lord 数据）
+                full_input_ids = batch["input_ids"].to(args.device)
+                full_attention_mask = batch["attention_mask"].to(args.device)
+                full_labels = batch["labels"].to(args.device)
+                rationale_labels = full_labels
+                has_any_rationale = True
+                answer_input_ids = full_input_ids
+                answer_attention_mask = full_attention_mask
+                answer_labels = full_labels
+
             if global_step == 1:
-                n_img = (input_ids == image_token_id).sum(dim=1)
+                n_img = (full_input_ids == image_token_id).sum(dim=1)
                 if (n_img == 0).any():
                     raise RuntimeError(
                         f"首个 batch 缺少 image token: counts={n_img.tolist()}, id={image_token_id}"
                     )
-            
-            # 前向传播（VQ hook 会自动应用）
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+
+            # 前向1：答案监督
+            outputs_answer = model(
+                input_ids=answer_input_ids,
+                attention_mask=answer_attention_mask,
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
-                labels=labels,
+                labels=answer_labels,
             )
-            
-            # 获取 VQ 损失
-            vq_loss = model._vq_loss_container.get("loss", torch.tensor(0.0, device=args.device))
-            if vq_loss is None:
-                vq_loss = torch.tensor(0.0, device=args.device)
-            
-            # 计算总损失
-            text_loss = outputs.loss
-            total_loss = text_loss + args.beta * vq_loss
-            total_loss_val = total_loss.item()
+            answer_loss = outputs_answer.loss
+            answer_vq_loss = _get_stage2_vq_loss(model, args.device, answer_loss.dtype)
+
+            # 前向2：解释/完整回答监督（无解释样本可退化为 0）
+            if has_any_rationale:
+                outputs_full = model(
+                    input_ids=full_input_ids,
+                    attention_mask=full_attention_mask,
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    labels=rationale_labels,
+                )
+                rationale_loss = outputs_full.loss
+                # 同一张图的 VQ 路径应近似一致；有第二次图像前向时取最新值。
+                vq_loss = _get_stage2_vq_loss(model, args.device, answer_loss.dtype)
+            else:
+                rationale_loss = torch.zeros((), device=args.device, dtype=answer_loss.dtype)
+                vq_loss = answer_vq_loss
+
+            total_loss = (
+                float(args.stage2_answer_weight) * answer_loss
+                + float(args.stage2_rationale_weight) * rationale_loss
+                + args.beta * vq_loss
+            )
+
+            if not torch.isfinite(total_loss):
+                print(
+                    f"[Stage2][Warn] step={global_step} 非有限损失，跳过。"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             (total_loss / grad_accum).backward()
+
             if (batch_idx + 1) % grad_accum == 0 or batch_idx == len(dataloader) - 1:
+                if args.stage2_grad_clip > 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        max_norm=float(args.stage2_grad_clip),
+                    )
+                    if isinstance(grad_norm, torch.Tensor) and not torch.isfinite(grad_norm):
+                        print(f"[Stage2][Warn] step={global_step} 梯度范数非有限，跳过 optimizer.step()")
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
-            epoch_loss += total_loss_val
-            
+
+            answer_loss_val = float(answer_loss.item())
+            rationale_loss_val = float(rationale_loss.item())
+            vq_loss_val = float(vq_loss.item())
+            total_loss_val = float(total_loss.item())
+            weighted_vq_ratio = float(args.beta) * vq_loss_val / max(answer_loss_val, 1e-8)
+            perplexity_val, dead_code_resets, dead_code_count = _get_stage2_vq_stats(model)
+            answer_acc_proxy = _compute_answer_slot_top1(outputs_answer.logits, answer_labels)
+
+            epoch_total += total_loss_val
+            epoch_answer += answer_loss_val
+            epoch_rationale += rationale_loss_val
+            epoch_vq += vq_loss_val
+            epoch_vq_ratio += weighted_vq_ratio
+            epoch_vq_perplexity += perplexity_val
+            epoch_acc += answer_acc_proxy
+            epoch_count += 1
+
             if global_step % args.log_step == 0:
-                vq_val = vq_loss.item() if hasattr(vq_loss, 'item') else vq_loss
-                print(f"Step {global_step}, Total: {total_loss_val:.4f}, "
-                      f"Text: {text_loss.item():.4f}, VQ: {vq_val:.4f}")
+                print(
+                    f"Step {global_step}, Total: {total_loss_val:.4f}, "
+                    f"Answer: {answer_loss_val:.4f}, Rationale: {rationale_loss_val:.4f}, "
+                    f"VQ: {vq_loss_val:.4f}, VQ/Answer: {weighted_vq_ratio:.4f}, "
+                    f"PPL: {perplexity_val:.2f}, Dead: {dead_code_count}, "
+                    f"AnswerAccProxy: {answer_acc_proxy:.4f}"
+                )
                 tb_writer.add_scalar("stage2/total_loss", total_loss_val, global_step)
-                tb_writer.add_scalar("stage2/text_loss", text_loss.item(), global_step)
-                tb_writer.add_scalar("stage2/vq_loss", vq_val, global_step)
-        
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch+1} 平均损失: {avg_loss:.4f}")
-    
+                tb_writer.add_scalar("stage2/answer_loss", answer_loss_val, global_step)
+                tb_writer.add_scalar("stage2/rationale_loss", rationale_loss_val, global_step)
+                tb_writer.add_scalar("stage2/vq_loss", vq_loss_val, global_step)
+                tb_writer.add_scalar("stage2/vq_answer_ratio", weighted_vq_ratio, global_step)
+                tb_writer.add_scalar("stage2/vq_perplexity", perplexity_val, global_step)
+                tb_writer.add_scalar("stage2/dead_code_resets", dead_code_resets, global_step)
+                tb_writer.add_scalar("stage2/dead_code_count", dead_code_count, global_step)
+                tb_writer.add_scalar("stage2/answer_only_accuracy_proxy", answer_acc_proxy, global_step)
+
+        denom = max(1, epoch_count)
+        print(
+            f"Epoch {epoch+1} 平均损失: Total={epoch_total/denom:.4f}, "
+            f"Answer={epoch_answer/denom:.4f}, Rationale={epoch_rationale/denom:.4f}, "
+            f"VQ={epoch_vq/denom:.4f}, VQ/Answer={epoch_vq_ratio/denom:.4f}, "
+            f"PPL={epoch_vq_perplexity/denom:.2f}, AnswerAccProxy={epoch_acc/denom:.4f}"
+        )
+
     return model
 
 
@@ -1461,8 +1783,12 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
     max_new_tokens = getattr(args, 'max_new_tokens', 64)  # 生成长度
     
     grad_accum = max(1, int(getattr(args, 'stage3_grad_accum', 0) or getattr(args, 'grad_accum', 1)))
+    stage3_lr = float(args.lr) * float(getattr(args, "stage3_lr_scale", 1.0))
     
-    print(f"LoRD 参数: tau1={tau1}, max_new_tokens={max_new_tokens}, grad_accum={grad_accum}")
+    print(
+        f"LoRD 参数: tau1={tau1}, max_new_tokens={max_new_tokens}, grad_accum={grad_accum}, "
+        f"lr={stage3_lr}, train_projector={int(bool(args.stage3_train_projector))}"
+    )
 
     image_token_id = _get_image_token_id(model)
 
@@ -1477,7 +1803,7 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
         is_lora = "lora_" in name_l or "modules_to_save" in name_l
         # VQ codebook 在 Stage3 冻结 — Stage1+2 已训练好，Stage3 专注 LoRD 对比学习
         is_vq = False
-        is_projector = "projector" in name_l or "multi_modal_projector" in name_l
+        is_projector = ("projector" in name_l or "multi_modal_projector" in name_l) and bool(args.stage3_train_projector)
         is_vision = ("vision" in name_l) and (not args.freeze_vision_tower)
 
         param.requires_grad = bool(is_lora or is_vq or is_projector or is_vision)
@@ -1489,7 +1815,7 @@ def train_stage3_lord(model, dataloader, args, tb_writer):
     
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
+        lr=stage3_lr,
     )
     
     # ========== 断点续训：加载已有的 Stage3 checkpoint ==========
@@ -1867,6 +2193,11 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
         "freeze_vision_tower": args.freeze_vision_tower,
         "beta": args.beta,
         "stage": 2,
+        "stage2_answer_weight": float(args.stage2_answer_weight),
+        "stage2_rationale_weight": float(args.stage2_rationale_weight),
+        "stage2_train_lora": 1,
+        "stage2_train_codebook": 0,
+        "stage2_answer_format": "letter",
     }
     with open(os.path.join(ckpt_path, "stage2_config.json"), "w") as f:
         json.dump(config_info, f, indent=2)
@@ -1883,22 +2214,19 @@ def load_stage2_checkpoint(model, ckpt_path: str):
     # 加载 LoRA 适配器
     adapter_config = os.path.join(ckpt_path, "adapter_config.json")
     if os.path.exists(adapter_config):
-        # 如果模型已经是 PeftModel，则加载权重
-        if hasattr(model, 'load_adapter'):
-            model.load_adapter(ckpt_path, adapter_name="stage2")
-            model.set_adapter("stage2")
+        adapter_weights = os.path.join(ckpt_path, "adapter_model.safetensors")
+        if os.path.exists(adapter_weights):
+            from safetensors.torch import load_file
+            state_dict = load_file(adapter_weights)
         else:
-            # 直接加载状态字典
-            adapter_weights = os.path.join(ckpt_path, "adapter_model.safetensors")
-            if os.path.exists(adapter_weights):
-                from safetensors.torch import load_file
-                state_dict = load_file(adapter_weights)
-                model.load_state_dict(state_dict, strict=False)
+            adapter_weights_bin = os.path.join(ckpt_path, "adapter_model.bin")
+            if os.path.exists(adapter_weights_bin):
+                state_dict = torch.load(adapter_weights_bin, map_location="cpu")
             else:
-                adapter_weights_bin = os.path.join(ckpt_path, "adapter_model.bin")
-                if os.path.exists(adapter_weights_bin):
-                    state_dict = torch.load(adapter_weights_bin, map_location="cpu")
-                    model.load_state_dict(state_dict, strict=False)
+                state_dict = None
+        if state_dict is not None:
+            # 直接覆盖现有 default adapter，避免额外 adapter name 干扰 Stage3 参数遍历。
+            model.load_state_dict(state_dict, strict=False)
         print(f"已加载 LoRA 权重: {ckpt_path}")
     
     print(f"Stage2 检查点加载完成")
@@ -1951,9 +2279,11 @@ def main():
 
         train_dataset = ScienceQADataset(
             processor=processor,
+            scienceqa_path=args.scienceqa_path,
             max_length=args.max_length,
             samples=train_samples,
             seed=args.scienceqa_seed,
+            teacher_lang=args.teacher_lang,
         )
         train_bucket_meta = load_scienceqa_preprocessed_buckets(
             args.scienceqa_preprocessed_path,
@@ -1999,23 +2329,28 @@ def main():
                     width = int(pixel_values.shape[-1])
                     image_sizes_list[idx] = torch.tensor([height, width], dtype=torch.long)
 
-        # --- 对不等长的 1D 张量做 right-padding 对齐 ---
+        # --- 对不等长 1D 张量做 right-padding 对齐 ---
         pad_token_id = processor.tokenizer.pad_token_id or 0
-        # 需要 pad 的 key 及其填充值
         pad_keys = {
             "input_ids": pad_token_id,
             "attention_mask": 0,
             "labels": -100,
+            "prompt_input_ids": pad_token_id,
+            "prompt_attention_mask": 0,
+            "full_input_ids": pad_token_id,
+            "full_attention_mask": 0,
+            "full_labels": -100,
+            "answer_input_ids": pad_token_id,
+            "answer_attention_mask": 0,
+            "answer_labels": -100,
         }
 
-        # 先找出每个需要 pad 的 key 的最大长度
         max_lens = {}
         for key in pad_keys:
             lengths = [b[key].shape[-1] for b in batch if key in b and isinstance(b[key], torch.Tensor)]
             if lengths:
                 max_lens[key] = max(lengths)
 
-        # 对每个样本做 padding
         for b in batch:
             for key, pad_val in pad_keys.items():
                 if key not in b or not isinstance(b[key], torch.Tensor):
@@ -2031,7 +2366,6 @@ def main():
         if all(isinstance(pv, torch.Tensor) for pv in pv_list):
             pv_shapes = [pv.shape for pv in pv_list]
             if len(set(pv_shapes)) > 1:
-                # patch 数不同，pad 第 0 维到最大值
                 max_patches = max(s[0] for s in pv_shapes)
                 for i, pv in enumerate(pv_list):
                     if pv.shape[0] < max_patches:
@@ -2041,7 +2375,6 @@ def main():
                         )
                         batch[i]["pixel_values"] = torch.cat([pv, pad_tensor], dim=0)
 
-        # --- 组装 collated dict ---
         base = []
         for b in batch:
             item = dict(b)

@@ -31,7 +31,10 @@ class VectorQuantizer2(nn.Module):
         self, 
         num_embeddings: int = 8192, 
         embedding_dim: int = 1024, 
-        commitment_cost: float = 0.25, 
+        commitment_cost: float = 0.25,
+        dead_code_threshold: float = 0.0,
+        usage_decay: float = 0.99,
+        dead_code_reset_interval: int = 0,
         remap=None, 
         unknown_index="random",
         sane_index_shape=False, 
@@ -43,9 +46,15 @@ class VectorQuantizer2(nn.Module):
         self.embedding_dim = embedding_dim
         self.beta = commitment_cost
         self.legacy = legacy
+        self.dead_code_threshold = max(0.0, float(dead_code_threshold))
+        self.usage_decay = float(usage_decay)
+        self.dead_code_reset_interval = int(dead_code_reset_interval)
 
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
+        self.register_buffer("ema_cluster_size", torch.zeros(self.num_embeddings))
+        self.register_buffer("usage_update_steps", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("last_dead_code_resets", torch.zeros(1, dtype=torch.long))
 
         self.remap = remap
         if self.remap is not None:
@@ -61,6 +70,50 @@ class VectorQuantizer2(nn.Module):
             self.re_embed = num_embeddings
 
         self.sane_index_shape = sane_index_shape
+
+    @torch.no_grad()
+    def _update_usage_and_maybe_refresh_codes(
+        self,
+        min_encoding_indices: torch.Tensor,
+        z_flattened: torch.Tensor,
+    ) -> torch.Tensor:
+        counts = torch.bincount(
+            min_encoding_indices,
+            minlength=self.num_embeddings,
+        ).to(self.ema_cluster_size.dtype)
+
+        self.usage_update_steps += 1
+        self.last_dead_code_resets.zero_()
+        self.ema_cluster_size.mul_(self.usage_decay).add_(counts, alpha=1.0 - self.usage_decay)
+
+        if (
+            not self.training
+            or self.dead_code_threshold <= 0.0
+            or self.dead_code_reset_interval <= 0
+            or int(self.usage_update_steps.item()) % self.dead_code_reset_interval != 0
+            or z_flattened.numel() == 0
+        ):
+            return counts
+
+        # 仅重置“本 batch 未命中且 EMA 使用率过低”的 code，避免扰动活跃 code。
+        dead_mask = (self.ema_cluster_size < self.dead_code_threshold) & (counts <= 0)
+        num_dead = int(dead_mask.sum().item())
+        if num_dead <= 0:
+            return counts
+
+        sample_ids = torch.randint(
+            low=0,
+            high=z_flattened.shape[0],
+            size=(num_dead,),
+            device=z_flattened.device,
+        )
+        refreshed = z_flattened[sample_ids].to(dtype=self.embedding.weight.dtype)
+        refreshed = refreshed + 1e-3 * torch.randn_like(refreshed)
+        self.embedding.weight.data[dead_mask] = refreshed
+        self.ema_cluster_size[dead_mask] = max(1.0, self.dead_code_threshold)
+        self.last_dead_code_resets.fill_(num_dead)
+
+        return counts
 
     def remap_to_used(self, inds):
         ishape = inds.shape
@@ -108,8 +161,10 @@ class VectorQuantizer2(nn.Module):
             torch.einsum('bd,dn->bn', z_flattened, rearrange(self.embedding.weight, 'n d -> d n'))
 
         min_encoding_indices = torch.argmin(d, dim=1)
+        counts = self._update_usage_and_maybe_refresh_codes(min_encoding_indices, z_flattened)
         z_q = self.embedding(min_encoding_indices).view(*flat_shape, self.embedding_dim)
-        perplexity = None
+        avg_probs = counts / counts.sum().clamp(min=1.0)
+        perplexity = torch.exp(-(avg_probs * torch.log(avg_probs + 1e-10)).sum())
         min_encodings = None
 
         # compute loss for embedding
@@ -199,6 +254,10 @@ class VQVisionEncoder(nn.Module):
         vision_tower: nn.Module,
         num_embeddings: int = 8192,
         commitment_cost: float = 0.25,
+        legacy: bool = False,
+        dead_code_threshold: float = 0.0,
+        usage_decay: float = 0.99,
+        dead_code_reset_interval: int = 0,
         freeze_vision_tower: bool = False,
     ):
         super().__init__()
@@ -232,6 +291,10 @@ class VQVisionEncoder(nn.Module):
             num_embeddings=num_embeddings,
             embedding_dim=self.hidden_size,
             commitment_cost=commitment_cost,
+            legacy=legacy,
+            dead_code_threshold=dead_code_threshold,
+            usage_decay=usage_decay,
+            dead_code_reset_interval=dead_code_reset_interval,
         )
         
         if freeze_vision_tower:
@@ -246,6 +309,9 @@ class VQVisionEncoder(nn.Module):
             "pre_quant_features": None,
             "reconstructed_features": None,
             "target_features": None,
+            "perplexity": None,
+            "dead_code_resets": 0,
+            "dead_code_count": 0,
         }
 
     def get_vq_state(self) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -330,6 +396,16 @@ class VQVisionEncoder(nn.Module):
         self.vq_cache["logits"] = logits
         self.vq_cache["indices"] = indices
         self.vq_cache["features"] = quantized
+        self.vq_cache["perplexity"] = info[0] if isinstance(info, tuple) else None
+
+        dead_code_resets = int(getattr(self.vq, "last_dead_code_resets", torch.zeros(1)).item())
+        self.vq_cache["dead_code_resets"] = dead_code_resets
+
+        if self.vq.dead_code_threshold > 0:
+            dead_code_count = int((self.vq.ema_cluster_size < self.vq.dead_code_threshold).sum().item())
+        else:
+            dead_code_count = 0
+        self.vq_cache["dead_code_count"] = dead_code_count
 
         return quantized, indices, vq_loss, logits
 

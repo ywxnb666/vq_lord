@@ -23,8 +23,8 @@ export BNB_CUDA_VERSION=121
 export HF_ENDPOINT="https://hf-mirror.com"
 export HF_DATASETS_OFFLINE=1
 
-# 避免 libgomp 报 OMP_NUM_THREADS 非法值
-if ! [[ "${OMP_NUM_THREADS}" =~ ^[0-9]+$ ]]; then
+# 避免 libgomp 报 OMP_NUM_THREADS 非法值（必须为正整数）
+if ! [[ "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
     export OMP_NUM_THREADS=8
 fi
 
@@ -62,14 +62,18 @@ export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
 # ================== VQ-LoRD 参数配置 ==================
 
 # VQ 参数
-export vq_codebook_size=512    # Codebook 大小 (降低至512测试坍缩情况)
-export vq_commitment_cost=0.05   # Commitment loss 权重 (极大地降低，释放特征聚拢牵引)
-export vq_dead_code_threshold=50  # Dead code restart 阈值 (大幅降低以增加重启频率)
+export vq_codebook_size=512    # 回调到 512（按你的要求）
+export vq_commitment_cost=0.25  # 与 taming 的 VQ commitment 一致
+export vq_dead_code_threshold=1.0  # dead code EMA 阈值（用于重置低使用 code）
+export vq_usage_decay=0.99       # code 使用率 EMA 衰减
+export vq_dead_code_reset_interval=10  # 第六轮：更频繁重置 dead code，测试是否提升码本利用率；20好像也不错
+export vq_legacy_loss=0          # 0=使用修正版 VQ loss（非 legacy）
 export freeze_vision_tower=0    # 是否冻结原始视觉编码器 (0=不冻结, 1=冻结)
 
 # 损失权重
 export beta=0.25                # VQ 损失权重
 export temperature=1.5          # Stage3 采样温度
+export tau1=0.01                # Stage3 冷启动阈值
 
 # ================== 训练参数选择区 (请二选一取消注释) ==================
 
@@ -81,18 +85,26 @@ export stage3_epochs=0          # Stage3 训练轮数
 export batch_size=4             # 常规/回退 DataLoader 批次大小
 export grad_accum=8             # 梯度累积步数 (等效batch_size=32)
 export lr=2e-5                  # 学习率
-export stage1_lr=1e-4           # Stage1 专用学习率 (调大冲出局部最优点)
+export stage1_lr=5e-5           # 回到当前更优学习率，再只测 commitment 强度
 export stage1_recon_weight=1.0  # Stage1 特征重建损失权重
-export stage1_cosine_weight=0.5 # Stage1 余弦一致性损失权重 (调大保留语义)
-export stage1_vq_weight=1.0     # Stage1 VQ 损失权重
+export stage1_cosine_weight=0.25 # 第三轮：回到稳态语义约束权重
+export stage1_vq_weight=1.0     # 保持 VQ 约束
+export stage1_grad_clip=5.0     # Stage1 梯度裁剪阈值（<=0 关闭）
+export stage2_answer_weight=1.0     # Stage2 强答案监督权重
+export stage2_rationale_weight=0.3  # Stage2 弱解释监督权重
+export stage2_prepost_lr_scale=0.5  # Stage2 pre/post quant 学习率缩放
+export stage2_vision_lr_scale=0.2   # Stage2 vision tower 学习率缩放
+export stage2_grad_clip=1.0         # Stage2 梯度裁剪阈值
+export stage3_lr_scale=0.2          # Stage3 默认更小学习率
+export stage3_train_projector=0     # Stage3 默认冻结 projector
 export max_length=1024          # 最大序列长度 (80GB充分利用长上下文)
 export max_new_tokens=256       # LoRD生成最大token数 (更完整的回复用于对比)
 # LoRA 参数
-export use_lora=1               # 使用 LoRA
+export use_lora=0               # Stage1-only 调参不需要 LoRA，减少无效开销
 export lora_rank=64             # LoRA rank (80GB可支持更大rank,提升拟合能力)
 export lora_alpha_val=128       # LoRA alpha (通常为rank的2倍)
 # 量化
-export use_4bit=1               # 使用 4-bit 量化
+export use_4bit=0               # 当前环境 bitsandbytes 版本不兼容，Stage1 改用 bfloat16
 
 # --- 选项 B: 针对 H200 141GB SXM 优化 (高性能) ---
 # export stage=3                  # 训练阶段
@@ -117,7 +129,7 @@ export model_dtype="bfloat16"   # 非 4bit 模式下使用 bfloat16 / float16 / 
 # # ---------------------
 
 # 数据
-export train_num=0           # 训练样本数（0表示使用全部数据）
+export train_num=0           # 使用全部训练样本（你要求的设置）
 export dataset_name="scienceqa" # 使用 ScienceQA 数据集
 # ScienceQA 数据路径（优先环境变量，其次本地目录，最后才回退到 HF 数据集名）
 # SCIENCEQA_PATH="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
@@ -137,8 +149,8 @@ fi
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
 export scienceqa_seed=20240306  # ScienceQA 划分随机种子
-export collect_teacher_data=1    # 自动补齐 GPT-4V 教师回答
-export strict_teacher_distill=1  # 严格模式：缺少教师回答则报错
+export collect_teacher_data=0    # Stage1 调参默认不额外采集教师回答（避免网络依赖）
+export strict_teacher_distill=0  # Stage1 调参默认不要求教师回答全覆盖
 export teacher_lang="en"        # 教师回答统一语言: zh / en
 export bucket_by="patches"      # 预处理分桶方式: patches / size / none
 export bucket_batch_size=4       # Stage1/2 分桶 batch size
@@ -148,11 +160,11 @@ export disable_bucket_for_stage3=0  # Stage3 启用分桶
 export scienceqa_preprocessed_path="${preprocess_dir}/scienceqa_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_${bucket_by}_bs${bucket_batch_size}.json"
 export stage1_codebook_path="${save_dir}/stage1_vq/vq_codebook.pt"
 export stage2_ckpt_path="${save_dir}/stage2_vision"
-export reuse_vq_codebook=1
+export reuse_vq_codebook=0   # 调参时强制重新训练 Stage1，避免误复用旧 codebook
 export reuse_stage2=1
 
 # 日志和保存
-export log_step=100
+export log_step=20
 export save_step=100
 
 # ================== 训练执行 ==================
@@ -165,6 +177,8 @@ echo "教师模型: $victim_model"
 echo "ScienceQA 路径: $scienceqa_path"
 echo "VQ Codebook 大小: $vq_codebook_size"
 echo "VQ dead code threshold: $vq_dead_code_threshold"
+echo "VQ usage decay/reset interval: $vq_usage_decay / $vq_dead_code_reset_interval"
+echo "VQ legacy loss: $vq_legacy_loss"
 echo "回退 batch_size: $batch_size"
 echo "全局回退 grad_accum: $grad_accum"
 echo "Stage2 grad_accum: $stage2_grad_accum"
@@ -176,7 +190,11 @@ echo "Stage1 epochs: $stage1_epochs"
 echo "Stage1 lr: $stage1_lr"
 echo "Stage1 recon/cos/vq: $stage1_recon_weight / $stage1_cosine_weight / $stage1_vq_weight"
 echo "Stage2 epochs: $stage2_epochs"
+echo "Stage2 answer/rationale: $stage2_answer_weight / $stage2_rationale_weight"
+echo "Stage2 prepost/vision lr scale: $stage2_prepost_lr_scale / $stage2_vision_lr_scale"
+echo "Stage2 grad_clip: $stage2_grad_clip"
 echo "Stage3 epochs: $stage3_epochs"
+echo "Stage3 tau1/lr_scale/train_projector: $tau1 / $stage3_lr_scale / $stage3_train_projector"
 echo "保存路径: $save_dir"
 echo "Stage1/2 分桶文件: $scienceqa_preprocessed_path"
 echo "Stage1/2 分桶 batch size: $bucket_batch_size"
@@ -218,17 +236,21 @@ echo "分桶方式: $bucket_by"
 echo "分桶 batch size: $bucket_batch_size"
 echo "======================================================"
 
-$python ${root_dir}data_preprocess/sciqa_preprocess.py \
-    --dataset-path=$scienceqa_path \
-    --model-path=$model_path \
-    --split=$scienceqa_split \
-    --train-num=$train_num \
-    --seed=$scienceqa_seed \
-    --bucket-by=$bucket_by \
-    --bucket-batch-size=$bucket_batch_size \
-    --bucket-drop-last=$bucket_drop_last \
-    --shuffle=1 \
-    --save-json=$scienceqa_preprocessed_path
+if [ -f "$scienceqa_preprocessed_path" ]; then
+    echo "检测到已存在预处理文件，跳过预处理: $scienceqa_preprocessed_path"
+else
+    $python ${root_dir}data_preprocess/sciqa_preprocess.py \
+        --dataset-path=$scienceqa_path \
+        --model-path=$model_path \
+        --split=$scienceqa_split \
+        --train-num=$train_num \
+        --seed=$scienceqa_seed \
+        --bucket-by=$bucket_by \
+        --bucket-batch-size=$bucket_batch_size \
+        --bucket-drop-last=$bucket_drop_last \
+        --shuffle=1 \
+        --save-json=$scienceqa_preprocessed_path
+fi
 
 if [ ! -f "$scienceqa_preprocessed_path" ]; then
     echo "错误: 预处理结果不存在 $scienceqa_preprocessed_path"
@@ -249,9 +271,13 @@ run_train_stage() {
         --vq_codebook_size=$vq_codebook_size \
         --vq_commitment_cost=$vq_commitment_cost \
         --vq_dead_code_threshold=$vq_dead_code_threshold \
+        --vq_usage_decay=$vq_usage_decay \
+        --vq_dead_code_reset_interval=$vq_dead_code_reset_interval \
+        --vq_legacy_loss=$vq_legacy_loss \
         --freeze_vision_tower=$freeze_vision_tower \
         --beta=$beta \
         --temperature=$temperature \
+        --tau1=$tau1 \
         --stage=$stage_id \
         --epochs=$stage_epochs \
         --batch_size=$batch_size \
@@ -260,6 +286,7 @@ run_train_stage() {
         --stage1_recon_weight=$stage1_recon_weight \
         --stage1_cosine_weight=$stage1_cosine_weight \
         --stage1_vq_weight=$stage1_vq_weight \
+        --stage1_grad_clip=$stage1_grad_clip \
         --max_length=$max_length \
         --use_lora=$use_lora \
         --lora_rank=$lora_rank \
@@ -268,7 +295,14 @@ run_train_stage() {
         --model_dtype=$model_dtype \
         --grad_accum=$grad_accum \
         --stage2_grad_accum=$stage2_grad_accum \
+        --stage2_answer_weight=$stage2_answer_weight \
+        --stage2_rationale_weight=$stage2_rationale_weight \
+        --stage2_prepost_lr_scale=$stage2_prepost_lr_scale \
+        --stage2_vision_lr_scale=$stage2_vision_lr_scale \
+        --stage2_grad_clip=$stage2_grad_clip \
         --stage3_grad_accum=$stage3_grad_accum \
+        --stage3_lr_scale=$stage3_lr_scale \
+        --stage3_train_projector=$stage3_train_projector \
         --max_new_tokens=$max_new_tokens \
         --data_dir=$data_dir \
         --train_num=$train_num \
