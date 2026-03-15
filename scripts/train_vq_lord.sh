@@ -29,8 +29,27 @@ if ! [[ "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 echo "HOME: ${HOME}"
-export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
-# export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
+
+# 路径模式切换：0=A800(/root), 1=H200(/inspire)
+export USE_H200_PATHS=0
+if [ "${USE_H200_PATHS}" = "1" ]; then
+    export SERVER_NAME="H200"
+    default_python="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
+    default_script_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/scripts"
+    default_root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
+    default_save_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts"
+    default_model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+    default_scienceqa_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
+else
+    export SERVER_NAME="A800"
+    default_python="/root/autodl-tmp/conda/envs/align_vq/bin/python"
+    default_script_dir="/root/workspace/align_vq/scripts"
+    default_root_dir="/root/workspace/align_vq/"
+    default_save_dir="/root/autodl-tmp/vq_lord_ckpts"
+    default_model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+    default_scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
+fi
+export python="${default_python}"
 
 
 export CUDA_VISIBLE_DEVICES=0
@@ -45,15 +64,14 @@ fi
 
 # 项目路径
 # 自动定位到当前脚本所在仓库根目录，避免误指向旧工程
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export root_dir="$(cd "${script_dir}/.." && pwd)/"
-export save_dir="/root/autodl-tmp/vq_lord_ckpts"
+export script_dir="${default_script_dir}"
+export root_dir="${default_root_dir}"
+export save_dir="${default_save_dir}"
 export data_dir="${root_dir}vq_lord_data/"
 export preprocess_dir="${save_dir}/preprocess"
 
 # 模型路径
-export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
-# export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+export model_path="${default_model_path}"
 export victim_model="gpt-4o-mini"
 
 export OPENAI_BASE_URL="https://sg.uiuiapi.com/v1"
@@ -139,8 +157,7 @@ export model_dtype="${model_dtype:-bfloat16}"
 export train_num=0           # 训练样本数（0表示使用全部数据）
 export dataset_name="scienceqa" # 使用 ScienceQA 数据集
 # ScienceQA 数据路径（优先环境变量，其次本地目录，最后才回退到 HF 数据集名）
-# scienceqa_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
-scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
+export scienceqa_path="${default_scienceqa_path}"
 
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
@@ -168,6 +185,8 @@ export save_step=100
 echo "======================================================"
 echo "VQ-LoRD 训练开始"
 echo "======================================================"
+echo "路径模式: $SERVER_NAME (USE_H200_PATHS=$USE_H200_PATHS)"
+echo "python: $python"
 echo "模型路径: $model_path"
 echo "教师模型: $victim_model"
 echo "ScienceQA 路径: $scienceqa_path"
@@ -221,7 +240,7 @@ if [ "$scienceqa_path" = "ScienceQA" ] && [ "${HF_DATASETS_OFFLINE:-0}" = "1" ];
     echo "1) 导出 SCIENCEQA_PATH=/你的本地/ScienceQA 路径"
     echo "2) 把数据放到 ${root_dir}downloads/dataset/ScienceQA"
     echo "3) 把数据放到 ${root_dir}downloads/datasets/ScienceQA"
-    echo "4) 把数据放到 /root/autodl-tmp/datasets/ScienceQA"
+    echo "4) 把数据放到 $default_scienceqa_path"
     exit 1
 fi
 

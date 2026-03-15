@@ -1447,8 +1447,12 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
     return model
 
 
-def _compute_answer_slot_top1(logits: torch.Tensor, labels: torch.Tensor) -> float:
-    """统计答案监督段最后一个 token 的 top-1 命中率。"""
+def _compute_answer_slot_top1(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    eos_token_id: Optional[int] = None,
+) -> float:
+    """统计答案字母位点的 top-1 命中率（忽略末尾 eos）。"""
     if logits is None or labels is None:
         return 0.0
     if logits.dim() != 3 or labels.dim() != 2:
@@ -1464,7 +1468,14 @@ def _compute_answer_slot_top1(logits: torch.Tensor, labels: torch.Tensor) -> flo
         if valid_positions.numel() == 0:
             continue
 
-        target_pos = int(valid_positions[-1].item())
+        candidate_positions = valid_positions
+        if eos_token_id is not None:
+            non_eos_mask = labels[i, valid_positions] != int(eos_token_id)
+            non_eos_positions = valid_positions[non_eos_mask]
+            if non_eos_positions.numel() > 0:
+                candidate_positions = non_eos_positions
+
+        target_pos = int(candidate_positions[-1].item())
         if target_pos <= 0 or target_pos >= pred_ids.shape[1]:
             continue
 
@@ -1687,7 +1698,11 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
             total_loss_val = float(total_loss.item())
             weighted_vq_ratio = float(args.beta) * vq_loss_val / max(answer_loss_val, 1e-8)
             perplexity_val, dead_code_resets, dead_code_count = _get_stage2_vq_stats(model)
-            answer_acc_proxy = _compute_answer_slot_top1(outputs_answer.logits, answer_labels)
+            answer_acc_proxy = _compute_answer_slot_top1(
+                outputs_answer.logits,
+                answer_labels,
+                eos_token_id=getattr(model.config, "eos_token_id", None),
+            )
 
             epoch_total += total_loss_val
             epoch_answer += answer_loss_val
@@ -1723,6 +1738,13 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
             f"VQ={epoch_vq/denom:.4f}, VQ/Answer={epoch_vq_ratio/denom:.4f}, "
             f"PPL={epoch_vq_perplexity/denom:.2f}, AnswerAccProxy={epoch_acc/denom:.4f}"
         )
+        tb_writer.add_scalar("stage2_epoch/total_loss", epoch_total / denom, epoch + 1)
+        tb_writer.add_scalar("stage2_epoch/answer_loss", epoch_answer / denom, epoch + 1)
+        tb_writer.add_scalar("stage2_epoch/rationale_loss", epoch_rationale / denom, epoch + 1)
+        tb_writer.add_scalar("stage2_epoch/vq_loss", epoch_vq / denom, epoch + 1)
+        tb_writer.add_scalar("stage2_epoch/vq_answer_ratio", epoch_vq_ratio / denom, epoch + 1)
+        tb_writer.add_scalar("stage2_epoch/vq_perplexity", epoch_vq_perplexity / denom, epoch + 1)
+        tb_writer.add_scalar("stage2_epoch/answer_only_accuracy_proxy", epoch_acc / denom, epoch + 1)
 
     return model
 

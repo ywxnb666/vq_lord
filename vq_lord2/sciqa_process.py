@@ -239,6 +239,19 @@ def load_vq_codebook_for_inference(model, vq_codebook_path: str):
     emb = base_model.vq_vision_encoder.vq.embedding.weight
     codebook = codebook.to(device=emb.device, dtype=emb.dtype)
     emb.data.copy_(codebook)
+
+    # 与训练侧保持一致：除 codebook 外，还需恢复 pre/post quant 与量化器状态。
+    vq_state_path = os.path.join(os.path.dirname(vq_codebook_path), "vq_encoder_state.pt")
+    if os.path.exists(vq_state_path):
+        try:
+            vq_state = torch.load(vq_state_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            # 兼容旧版 PyTorch
+            vq_state = torch.load(vq_state_path, map_location="cpu")
+        base_model.vq_vision_encoder.load_vq_state(vq_state)
+    else:
+        print(f"[Warning] vq_encoder_state not found, pre/post quant stays random: {vq_state_path}")
+
     return True
 
 

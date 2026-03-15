@@ -21,8 +21,25 @@ export HF_ENDPOINT="https://hf-mirror.com"
 export HF_DATASETS_OFFLINE=1
 
 echo "HOME: ${HOME}"
-export python=${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3
-# export python=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python
+
+# 路径模式切换：0=A800(/root), 1=H200(/inspire)
+export USE_H200_PATHS=0
+if [ "${USE_H200_PATHS}" = "1" ]; then
+    export SERVER_NAME="H200"
+    default_python="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
+    default_script_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/scripts"
+    default_root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
+    default_save_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts/"
+    default_model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+else
+    export SERVER_NAME="A800"
+    default_python="/root/autodl-tmp/conda/envs/align_vq/bin/python"
+    default_script_dir="/root/workspace/align_vq/scripts"
+    default_root_dir="/root/workspace/align_vq/"
+    default_save_dir="/root/autodl-tmp/vq_lord_ckpts/"
+    default_model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+fi
+export python="${default_python}"
 
 # 自动选择空闲 GPU
 # export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
@@ -45,16 +62,15 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 项目路径
 # 自动定位到当前脚本所在仓库根目录，避免误指向旧工程（旧工程的 sciqa_process.py 不支持 --scienceqa_path）
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export root_dir="$(cd "${script_dir}/.." && pwd)/"
+export script_dir="${default_script_dir}"
+export root_dir="${default_root_dir}"
 # export root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
-export save_dir="/root/autodl-tmp/vq_lord_ckpts/"
+export save_dir="${default_save_dir}"
 export data_dir="${root_dir}vq_lord_data/"
 export vq_codebook_path="${save_dir}stage2_vision/vq_codebook.pt"  # VQ Codebook 保存路径
 
 # 模型路径
-export model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
-# export model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+export model_path="${default_model_path}"
 export scienceqa_split="train"  # ScienceQA split
 export scienceqa_eval_split="validation"  # ScienceQA 验证/测试 split
 export adapter_path="${save_dir}/stage3_lord_final"
@@ -70,6 +86,8 @@ export save_path="${save_dir}/sciqa_eval.json"
 echo "======================================================"
 echo "VQ-LoRD 测试开始"
 echo "======================================================"
+echo "路径模式: $SERVER_NAME (USE_H200_PATHS=$USE_H200_PATHS)"
+echo "python: $python"
 echo "模型路径: $model_path"
 echo "Adapter 路径: $adapter_path"
 echo "VQ codebook 路径: $vq_codebook_path"
@@ -113,4 +131,3 @@ echo "======================================================"
 echo "ScienceQA 验证完成"
 echo "结果保存在: $save_path"
 echo "======================================================"
-

@@ -134,7 +134,7 @@ Stage2 为每个样本构造两个监督目标：
 - `stage2/dead_code_count`
 - `stage2/total_loss`
 - `stage2/answer_only_accuracy_proxy`
-  说明：使用答案监督段最后一个 token 的 top-1 命中率作为在线代理指标；在当前模板下，该位置对应最终答案字母
+  说明：使用答案字母位点的 top-1 命中率作为在线代理指标；计算时应忽略末尾 `eos`，避免把 `eot/eos` 误当作答案 token
 
 VQ 监控规则固定如下：
 - `stage2/vq_answer_ratio = beta * vq_loss / answer_loss`
@@ -278,3 +278,40 @@ VQ 监控规则固定如下：
 4. `lora_rank`
 5. `stage2_rationale_weight`
 6. `stage2_vision_lr_scale`
+
+## First Tuning Plan (Round-1)
+### Goal
+- 在不引入教师 token 概率蒸馏的前提下，建立可信 Stage2 评估闭环，并完成第一轮可复现调参。
+
+### Step 1: Fix Evaluation Reliability (Blocking)
+1. 修复 `vq_lord2/sciqa_process.py` 的 VQ 推理加载一致性：
+- 除 `vq_codebook.pt` 外，必须同时加载 `vq_encoder_state.pt`（含 `pre_quant/post_quant`）。
+- 若缺失 `vq_encoder_state.pt`，必须打印告警，提示评估不可信。
+2. 修复 `stage2/answer_only_accuracy_proxy` 位点定义：
+- 从“最后监督 token”改为“答案字母位点（忽略 eos）”。
+3. 增加 epoch 级日志：
+- 新增 `stage2_epoch/*` 指标，用于观察跨 epoch 趋势，避免单 batch 噪声误判。
+
+### Step 2: Round-1 Training (No New Objective)
+1. 训练配置：
+- `epochs=3`
+- `beta=0.05`
+- `stage2_answer_weight=1.0`
+- `stage2_rationale_weight=0.2`
+- `stage2_prepost_lr_scale=0.2`
+- `stage2_vision_lr_scale=0.2`
+2. 本轮不引入新损失项：
+- 不加入 `choice_ce_loss`
+- 不加入教师 top-token 概率相关蒸馏
+- 不改 Stage1 codebook size
+3. 每轮结束评估：
+- 保存 Stage2 checkpoint
+- 使用修复后的 `vq_lord2/sciqa_process.py` 在 `validation` 上跑 `answer_mode=hybrid`，记录 `val_acc` 与答案格式率。
+
+### Step 3: Go/No-Go Decision
+1. 若 `val_acc` 随 epoch 上升且最终 `>50%`：
+- 视为 Stage2 warm-start 基本达标，进入 Stage3 小步验证（前 100-200 step 冷启动率）。
+2. 若 `val_acc` 停滞：
+- 第二轮再引入 `warmup+cosine` 调度，保持其余配置不变复跑。
+3. 若 `val_acc` 明显偏低（如 `<45%`）且格式率正常：
+- 优先排查 Stage1 表征利用率（`vq_perplexity/dead_code_count`），再决定是否调整 Stage1，而非直接增大 codebook。

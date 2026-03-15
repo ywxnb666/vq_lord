@@ -14,16 +14,35 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 
 # Python 路径（可被外部覆盖）
-export python="${python:-${HOME}/autodl-tmp/conda/envs/align_vq/bin/python3}"
+# 路径模式切换：0=A800(/root), 1=H200(/inspire)
+export USE_H200_PATHS=0
+if [ "${USE_H200_PATHS}" = "1" ]; then
+    export SERVER_NAME="H200"
+    default_python="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
+    default_script_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/scripts"
+    default_root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
+    default_save_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts"
+    default_model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+    default_scienceqa_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
+else
+    export SERVER_NAME="A800"
+    default_python="/root/autodl-tmp/conda/envs/align_vq/bin/python"
+    default_script_dir="/root/workspace/align_vq/scripts"
+    default_root_dir="/root/workspace/align_vq/"
+    default_save_dir="/root/autodl-tmp/vq_lord_ckpts"
+    default_model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+    default_scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
+fi
+export python="${default_python}"
 
 # 项目路径
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export root_dir="$(cd "${script_dir}/.." && pwd)/"
-export save_dir="${save_dir:-/root/autodl-tmp/vq_lord_ckpts}"
-export preprocess_dir="${preprocess_dir:-${save_dir}/preprocess}"
+export script_dir="${default_script_dir}"
+export root_dir="${default_root_dir}"
+export save_dir="${default_save_dir}"
+export preprocess_dir="${save_dir}/preprocess"
 
 # 模型与数据参数（默认对齐 train_vq_lord.sh）
-export model_path="${model_path:-/root/autodl-tmp/models/llama3-llava-next-8b-hf}"
+export model_path="${default_model_path}"
 export train_num="${train_num:-0}"
 export scienceqa_split="${scienceqa_split:-train}"
 export scienceqa_seed="${scienceqa_seed:-20240306}"
@@ -43,8 +62,8 @@ elif [ -d "${root_dir}downloads/dataset/ScienceQA" ]; then
     export scienceqa_path="${root_dir}downloads/dataset/ScienceQA"
 elif [ -d "${root_dir}downloads/datasets/ScienceQA" ]; then
     export scienceqa_path="${root_dir}downloads/datasets/ScienceQA"
-elif [ -d "/root/autodl-tmp/datasets/ScienceQA" ]; then
-    export scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
+elif [ -d "$default_scienceqa_path" ]; then
+    export scienceqa_path="$default_scienceqa_path"
 else
     export scienceqa_path="ScienceQA"
 fi
@@ -54,6 +73,7 @@ export scienceqa_preprocessed_path="${scienceqa_preprocessed_path:-${preprocess_
 echo "======================================================"
 echo "ScienceQA 预处理开始"
 echo "======================================================"
+echo "路径模式: $SERVER_NAME (USE_H200_PATHS=$USE_H200_PATHS)"
 echo "python: $python"
 echo "root_dir: $root_dir"
 echo "model_path: $model_path"
@@ -106,4 +126,3 @@ echo "ScienceQA 预处理完成"
 echo "输出文件: $scienceqa_preprocessed_path"
 echo "训练时请传入: --scienceqa_preprocessed_path=$scienceqa_preprocessed_path"
 echo "======================================================"
-
