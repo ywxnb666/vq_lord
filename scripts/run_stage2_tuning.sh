@@ -71,7 +71,7 @@ export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
 # ================== Stage2 调参参数（对齐上次全量 Stage2 计划） ==================
 
 # VQ 参数
-export vq_codebook_size=512
+export vq_codebook_size=1024
 export vq_commitment_cost=0.25
 export vq_dead_code_threshold=1.0
 export vq_usage_decay=0.995
