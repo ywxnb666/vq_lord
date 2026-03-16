@@ -1134,6 +1134,8 @@ def setup_args():
                        help="日志间隔")
     parser.add_argument("--save_step", type=int, default=100,
                        help="保存间隔")
+    parser.add_argument("--save_each_epoch", type=int, default=0,
+                       help="是否在 Stage1/2/3 每个 epoch 结束时额外保存一次检查点")
     
     parser.add_argument("--device", type=str, default="cuda",
                        help="训练设备")
@@ -1443,6 +1445,11 @@ def train_stage1_vq(model, dataloader, args, tb_writer):
             f"Recon={epoch_recon / num_batches:.4f}, Cos={epoch_cosine / num_batches:.4f}, "
             f"VQ={epoch_vq / num_batches:.4f}"
         )
+        if int(getattr(args, "save_each_epoch", 0)) == 1:
+            epoch_dir = os.path.join(args.save_path, f"stage1_vq_epoch{epoch+1}")
+            epoch_codebook_path = os.path.join(epoch_dir, "vq_codebook.pt")
+            save_vq_codebook(model, epoch_codebook_path)
+            print(f"Stage1 Epoch 检查点已保存至 {epoch_dir}")
     
     return model
 
@@ -1745,6 +1752,9 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
         tb_writer.add_scalar("stage2_epoch/vq_answer_ratio", epoch_vq_ratio / denom, epoch + 1)
         tb_writer.add_scalar("stage2_epoch/vq_perplexity", epoch_vq_perplexity / denom, epoch + 1)
         tb_writer.add_scalar("stage2_epoch/answer_only_accuracy_proxy", epoch_acc / denom, epoch + 1)
+        if int(getattr(args, "save_each_epoch", 0)) == 1:
+            epoch_ckpt_path = os.path.join(args.save_path, f"stage2_vision_epoch{epoch+1}")
+            save_stage2_checkpoint(model, args, epoch_ckpt_path)
 
     return model
 

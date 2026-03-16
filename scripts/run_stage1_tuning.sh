@@ -52,7 +52,7 @@ fi
 export python="${default_python}"
 
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
@@ -190,6 +190,7 @@ export reuse_stage2=1
 # 日志和保存
 export log_step=20
 export save_step=100
+export save_each_epoch=1
 
 # ================== 训练执行 ==================
 
@@ -221,6 +222,7 @@ echo "Stage2 prepost/vision lr scale: $stage2_prepost_lr_scale / $stage2_vision_
 echo "Stage2 grad_clip: $stage2_grad_clip"
 echo "Stage3 epochs: $stage3_epochs"
 echo "Stage3 tau1/lr_scale/train_projector: $tau1 / $stage3_lr_scale / $stage3_train_projector"
+echo "save_each_epoch: $save_each_epoch"
 echo "保存路径: $save_dir"
 echo "Stage1/2 分桶文件: $scienceqa_preprocessed_path"
 echo "Stage1/2 分桶 batch size: $bucket_batch_size"
@@ -350,6 +352,7 @@ run_train_stage() {
         --save_path=$save_dir \
         --log_step=$log_step \
         --save_step=$save_step \
+        --save_each_epoch=$save_each_epoch \
         --device="cuda"
 }
 

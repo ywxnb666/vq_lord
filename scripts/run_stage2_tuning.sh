@@ -49,7 +49,7 @@ export CUDA_VISIBLE_DEVICES=0
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-if [ "${DEBUG_CUDA:-1}" = "1" ]; then
+if [ "${DEBUG_CUDA:-0}" = "1" ]; then
     export CUDA_LAUNCH_BLOCKING=1
 fi
 
@@ -126,7 +126,7 @@ export collect_teacher_data=0
 export strict_teacher_distill=0
 export teacher_lang="en"
 
-# 分桶：训练使用 bs=2；预处理文件沿用已存在的 bs=4
+# 分桶（默认 A800: 训练 bs=2，预处理 bs=4；H200 分支会覆盖为 bs=8）
 export bucket_by="patches"
 export bucket_batch_size=2
 export stage3_bucket_batch_size=2
@@ -144,6 +144,7 @@ export reuse_stage2=0
 # 日志和保存
 export log_step=100
 export save_step=100
+export save_each_epoch=1
 
 # 评估与决策参数（Step3）
 export eval_split="validation"
@@ -162,6 +163,24 @@ export stage3_smoke_train_num=200
 export stage3_smoke_epochs=1
 export stage3_smoke_save_dir="${save_dir}/stage3_smoke"
 
+# H200 专用 Stage2 推荐参数（仅在 USE_H200_PATHS=1 生效）
+if [ "${USE_H200_PATHS}" = "1" ]; then
+    export stage2_epochs=3
+    export batch_size=8
+    export grad_accum=4
+    export stage2_grad_accum=4
+    export lr=3e-5
+    export max_length=1024
+    export bucket_batch_size=8
+    export stage3_bucket_batch_size=8
+    export preprocess_bucket_batch_size=8
+    export log_step=50
+    export eval_max_samples=500
+fi
+
+# 若上方覆盖了 preprocess_bucket_batch_size，需要在此重建预处理路径
+export scienceqa_preprocessed_path="${preprocess_dir}/scienceqa_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_${bucket_by}_bs${preprocess_bucket_batch_size}.json"
+
 echo "======================================================"
 echo "Stage2 Tuning 开始"
 echo "======================================================"
@@ -177,6 +196,7 @@ echo "stage/epochs: $stage / $stage2_epochs"
 echo "batch_size/grad_accum/stage2_grad_accum: $batch_size / $grad_accum / $stage2_grad_accum"
 echo "beta/answer_w/rationale_w: $beta / $stage2_answer_weight / $stage2_rationale_weight"
 echo "prepost_lr_scale/vision_lr_scale: $stage2_prepost_lr_scale / $stage2_vision_lr_scale"
+echo "save_each_epoch: $save_each_epoch"
 echo "eval: split=$eval_split, max_samples=$eval_max_samples, mode=$eval_answer_mode"
 echo "======================================================"
 
@@ -291,6 +311,7 @@ fi
     --save_path="$save_dir" \
     --log_step="$log_step" \
     --save_step="$save_step" \
+    --save_each_epoch="$save_each_epoch" \
     --device="cuda"
 
 echo "======================================================"
@@ -443,6 +464,7 @@ if [ "$decision" = "GO_STAGE3" ]; then
             --save_path="$stage3_smoke_save_dir" \
             --log_step="$log_step" \
             --save_step="$save_step" \
+            --save_each_epoch="$save_each_epoch" \
             --device="cuda"
     else
         echo "[Stage3 Smoke] 已跳过（AUTO_STAGE3_SMOKE=0）。"
