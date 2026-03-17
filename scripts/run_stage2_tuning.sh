@@ -23,7 +23,7 @@ fi
 echo "HOME: ${HOME}"
 
 # 路径模式切换：0=A800(/root), 1=H200(/inspire)
-export USE_H200_PATHS=0
+export USE_H200_PATHS=1
 if [ "${USE_H200_PATHS}" = "1" ]; then
     export SERVER_NAME="H200"
     default_python="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
@@ -45,7 +45,7 @@ else
 fi
 export python="${default_python}"
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -136,7 +136,7 @@ export preprocess_bucket_batch_size=4
 export scienceqa_preprocessed_path="${preprocess_dir}/scienceqa_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_${bucket_by}_bs${preprocess_bucket_batch_size}.json"
 
 # checkpoint 复用策略
-export stage1_codebook_path="${base_ckpt_dir}/stage1_vq/vq_codebook.pt"
+export stage1_codebook_path="${base_ckpt_dir}/stage1_vq_epoch40/vq_codebook.pt"
 export stage2_ckpt_path="${save_dir}/stage2_vision"
 export reuse_vq_codebook=1
 export reuse_stage2=0
@@ -165,7 +165,7 @@ export stage3_smoke_save_dir="${save_dir}/stage3_smoke"
 
 # H200 专用 Stage2 推荐参数（仅在 USE_H200_PATHS=1 生效）
 if [ "${USE_H200_PATHS}" = "1" ]; then
-    export stage2_epochs=3
+    export stage2_epochs=20
     export batch_size=8
     export grad_accum=4
     export stage2_grad_accum=4
@@ -327,6 +327,7 @@ fi
 "$python" "${root_dir}vq_lord2/sciqa_process.py" \
     --model_path="$model_path" \
     --adapter_path="$stage2_ckpt_path" \
+    --scienceqa_path="$scienceqa_path" \
     --split="$eval_split" \
     --max_samples="$eval_max_samples" \
     --max_new_tokens="$eval_max_new_tokens" \
@@ -424,7 +425,7 @@ if [ "$decision" = "GO_STAGE3" ]; then
             --lr="$lr" \
             --stage1_lr="$stage1_lr" \
             --stage1_recon_weight="$stage1_recon_weight" \
-            --stage1_cosine_weight="$stage1_cosine_weight" \
+            --stage1_cosine_weight="$stage1_cosine_weight" \无jc ji
             --stage1_vq_weight="$stage1_vq_weight" \
             --stage1_grad_clip="$stage1_grad_clip" \
             --max_length="$max_length" \

@@ -31,7 +31,7 @@ fi
 echo "HOME: ${HOME}"
 
 # 路径模式切换：0=A800(/root), 1=H200(/inspire)
-export USE_H200_PATHS=0
+export USE_H200_PATHS=1
 if [ "${USE_H200_PATHS}" = "1" ]; then
     export SERVER_NAME="H200"
     default_python="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
@@ -80,7 +80,7 @@ export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
 # ================== VQ-LoRD 参数配置 ==================
 
 # VQ 参数
-export vq_codebook_size=512    # 回调到 512（按你的要求）
+export vq_codebook_size=1024    # 回调到 512（按你的要求）
 export vq_commitment_cost=0.25  # 与 taming 的 VQ commitment 一致
 export vq_dead_code_threshold=1.0  # dead code EMA 阈值（用于重置低使用 code）
 export vq_usage_decay=0.99       # code 使用率 EMA 衰减
@@ -147,7 +147,7 @@ export model_dtype="bfloat16"   # 非 4bit 模式下使用 bfloat16 / float16 / 
 # H200 专用 Stage1 推荐参数（默认提升 Stage1 质量，不改训练目标）
 if [ "${USE_H200_PATHS}" = "1" ]; then
     export stage=1
-    export stage1_epochs=2
+    export stage1_epochs=50
     export stage2_epochs=0
     export stage3_epochs=0
     export batch_size=8

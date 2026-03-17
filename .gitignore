@@ -27,6 +27,8 @@ doc/
 *.out
 *_ckpts/
 maybe_backend
+vq_lord_ckpts_stage2_tune/
+vq_lord_ckpts_stage2_before/
 
 /LoRA-LoRD-ckptsvaryTrainNum___41allenai/
 /vArY_TrAiN_num_LoRA-LoRD-ckpts/

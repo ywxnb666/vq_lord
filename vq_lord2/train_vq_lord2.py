@@ -21,10 +21,14 @@ import os
 import json
 import hashlib
 import random
+import math
+import time
+import re
+from dataclasses import dataclass
 import torch
 import argparse
 from collections import defaultdict
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from pprint import pprint
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -53,6 +57,11 @@ from vq_module2 import VQVisionEncoder
 from data_collector import GPT4VDataCollector, VQLORDDataset
 
 import torch.nn.functional as F
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - numpy 不是硬依赖
+    np = None
 
 
 def build_scienceqa_samples(
@@ -900,6 +909,8 @@ def _capture_rng_state() -> dict:
         "python_random_state": random.getstate(),
         "torch_rng_state": torch.get_rng_state(),
     }
+    if np is not None:
+        state["numpy_random_state"] = np.random.get_state()
     if torch.cuda.is_available():
         state["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
     return state
@@ -912,6 +923,10 @@ def _restore_rng_state(state: Optional[dict]):
     python_random_state = state.get("python_random_state")
     if python_random_state is not None:
         random.setstate(python_random_state)
+
+    numpy_random_state = state.get("numpy_random_state")
+    if numpy_random_state is not None and np is not None:
+        np.random.set_state(numpy_random_state)
 
     torch_rng_state = state.get("torch_rng_state")
     if torch_rng_state is not None:
@@ -954,6 +969,25 @@ def _load_parameter_state(model, parameter_state: dict, state_name: str):
     if skipped_names:
         preview = ", ".join(skipped_names[:8])
         print(f"[Resume] 未匹配参数示例: {preview}")
+
+
+def _to_cpu_obj(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu_obj(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_obj(v) for v in obj)
+    return obj
+
+
+def _move_optimizer_state_to_device_(optimizer, device: str):
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
 
 
 def save_stage3_checkpoint(model, save_dir: str):
@@ -1050,6 +1084,8 @@ def setup_args():
     # LoRD 超参数
     parser.add_argument("--tau1", type=float, default=0.01,
                        help="LoRD 冷启动阈值: exp(avg_lp) < tau1 时用教师兜底")
+    parser.add_argument("--tau_delta", type=float, default=0.01,
+                       help="LoRD 冷启动改进阈值: delta11 < tau_delta 时配合 tau1 触发冷启动")
     parser.add_argument("--max_new_tokens", type=int, default=128,
                        help="LoRD 生成最大新 token 数")
     parser.add_argument("--grad_accum", type=int, default=4,
@@ -1070,8 +1106,20 @@ def setup_args():
                        help="Stage3 梯度累积步数，0 表示回退到 grad_accum")
     parser.add_argument("--stage3_lr_scale", type=float, default=0.2,
                        help="Stage3 学习率缩放，默认低于 Stage2")
+    parser.add_argument("--stage3_grad_clip", type=float, default=1.0,
+                       help="Stage3 梯度裁剪阈值；<=0 表示关闭")
     parser.add_argument("--stage3_train_projector", type=int, default=0,
                        help="Stage3 是否继续训练 projector，默认冻结以保护 Stage2 建立的视觉桥")
+    parser.add_argument("--sub_stage_num", type=int, default=1,
+                       help="Stage3 外层 sub-stage 数")
+    parser.add_argument("--period_num", type=int, default=0,
+                       help="Stage3 每个 sub-stage 的 period 数；<=0 时回退到 epochs")
+    parser.add_argument("--sub_set_num", type=int, default=0,
+                       help="Stage3 每个 sub-stage 的样本子集大小；<=0 表示全量")
+    parser.add_argument("--stage3_eval_max_samples", type=int, default=0,
+                       help="Stage3 每个 period 评估样本数；<=0 关闭 period 评估")
+    parser.add_argument("--stage3_eval_every_period", type=int, default=1,
+                       help="Stage3 每隔多少个 period 做一次评估")
     
     # LoRA 参数
     parser.add_argument("--use_lora", type=int, default=1,
@@ -1136,6 +1184,14 @@ def setup_args():
                        help="保存间隔")
     parser.add_argument("--save_each_epoch", type=int, default=0,
                        help="是否在 Stage1/2/3 每个 epoch 结束时额外保存一次检查点")
+    parser.add_argument("--stage3_resume_path", type=str, default="",
+                       help="Stage3 断点目录，非空时从该目录恢复（包含模型可训练参数/optimizer/RNG/period状态）")
+    parser.add_argument("--stage3_resume_save_path", type=str, default="",
+                       help="Stage3 断点保存目录，默认 save_path/stage3_resume_latest")
+    parser.add_argument("--stage3_resume_save_optimizer", type=int, default=1,
+                       help="Stage3 断点是否保存 optimizer state（1=保存,0=不保存，文件更小）")
+    parser.add_argument("--stage3_resume_save_interval", type=int, default=1,
+                       help="Stage3 每隔多少个 period 保存一次断点")
     
     parser.add_argument("--device", type=str, default="cuda",
                        help="训练设备")
@@ -1770,8 +1826,15 @@ def log_clip(tnsr, epsilon=1.0):
     return torch.clamp(tnsr, min=lower.item(), max=upper.item())
 
 
-def _compute_generation_log_prob(model, ids, mask, pixel_values, image_sizes, prompt_lens):
-    """计算每个样本仅生成段的平均 log probability。"""
+def _compute_token_log_probs(
+    model,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    pixel_values: torch.Tensor,
+    image_sizes: Optional[torch.Tensor],
+    prompt_lens: torch.Tensor,
+):
+    """返回 token-level log-prob 与生成段 mask。"""
     out = model(
         input_ids=ids,
         attention_mask=mask,
@@ -1788,387 +1851,1035 @@ def _compute_generation_log_prob(model, ids, mask, pixel_values, image_sizes, pr
         if gen_start > 0:
             token_mask[batch_idx, :gen_start] = 0.0
 
-    return (token_log_probs * token_mask).sum(dim=-1) / token_mask.sum(dim=-1).clamp(min=1)
+    return token_log_probs, token_mask
 
 
-def train_stage3_lord(model, dataloader, args, tb_writer):
-    """
-    阶段 3: LoRD 联合训练 (真正的 LoRD 方法)
-    
-    实现 LoRD 核心算法：
-    1. 双样本生成：学生模型生成两个独立序列 S1, S2
-    2. 局部性排序：根据 log prob 确定正负样本 y+, y-
-    3. 冷启动策略：置信度低时使用教师标签 y_vic
-    4. LoRD 损失：对比损失 + 正则化损失
-    
-    损失公式:
-    L_obj = -log(P(y+|x) / P(y-|x)) = -(log P(y+) - log P(y-))
-    L_reg = -clip(log(P(y_vic|x) / P(y-|x)))
-    L_total = L_obj + L_reg + beta * L_vq
-    """
-    print("\n" + "=" * 50)
-    print("阶段 3: LoRD 联合训练 (真正的 LoRD 方法)")
-    print("=" * 50)
-    
-    # LoRD 超参数
-    tau1 = getattr(args, 'tau1', 0.01)  # 冷启动置信度阈值
-    max_new_tokens = getattr(args, 'max_new_tokens', 64)  # 生成长度
-    
-    grad_accum = max(1, int(getattr(args, 'stage3_grad_accum', 0) or getattr(args, 'grad_accum', 1)))
-    stage3_lr = float(args.lr) * float(getattr(args, "stage3_lr_scale", 1.0))
-    
+@dataclass
+class Stage3SampleCacheItem:
+    sample_idx: int
+    prompt_ids: torch.Tensor
+    prompt_mask: torch.Tensor
+    y_vic_ids: torch.Tensor
+    y_vic_mask: torch.Tensor
+    pixel_values: torch.Tensor
+    image_sizes: Optional[torch.Tensor]
+    prompt_len: int
+
+
+@dataclass
+class PeriodState:
+    sample_idx: int
+    y11_ids: torch.Tensor
+    y11_mask: torch.Tensor
+    y12_ids: torch.Tensor
+    y12_mask: torch.Tensor
+    avg_lp_11: float
+    avg_lp_12: float
+    prob_11: float
+    prob_12: float
+
+
+@dataclass
+class PeriodTrainingItem:
+    sample_idx: int
+    y_plus_ids: torch.Tensor
+    y_plus_mask: torch.Tensor
+    y_minus_ids: torch.Tensor
+    y_minus_mask: torch.Tensor
+    y_vic_ids: torch.Tensor
+    y_vic_mask: torch.Tensor
+    old_token_lp_plus: torch.Tensor
+    old_token_mask_plus: torch.Tensor
+    old_token_lp_minus: torch.Tensor
+    old_token_mask_minus: torch.Tensor
+    old_token_lp_vic: torch.Tensor
+    old_token_mask_vic: torch.Tensor
+
+
+def _serialize_period_states(period_states: Optional[Dict[int, PeriodState]]) -> Optional[dict]:
+    if period_states is None:
+        return None
+    payload = {}
+    for sample_idx, state in period_states.items():
+        payload[int(sample_idx)] = {
+            "sample_idx": int(state.sample_idx),
+            "y11_ids": state.y11_ids.detach().cpu(),
+            "y11_mask": state.y11_mask.detach().cpu(),
+            "y12_ids": state.y12_ids.detach().cpu(),
+            "y12_mask": state.y12_mask.detach().cpu(),
+            "avg_lp_11": float(state.avg_lp_11),
+            "avg_lp_12": float(state.avg_lp_12),
+            "prob_11": float(state.prob_11),
+            "prob_12": float(state.prob_12),
+        }
+    return payload
+
+
+def _deserialize_period_states(payload: Optional[dict]) -> Optional[Dict[int, PeriodState]]:
+    if payload is None:
+        return None
+    states: Dict[int, PeriodState] = {}
+    for key, item in payload.items():
+        sample_idx = int(item.get("sample_idx", key))
+        states[sample_idx] = PeriodState(
+            sample_idx=sample_idx,
+            y11_ids=item["y11_ids"].detach().cpu().long(),
+            y11_mask=item["y11_mask"].detach().cpu().long(),
+            y12_ids=item["y12_ids"].detach().cpu().long(),
+            y12_mask=item["y12_mask"].detach().cpu().long(),
+            avg_lp_11=float(item["avg_lp_11"]),
+            avg_lp_12=float(item["avg_lp_12"]),
+            prob_11=float(item["prob_11"]),
+            prob_12=float(item["prob_12"]),
+        )
+    return states
+
+
+def _save_stage3_resume_state(
+    model,
+    optimizer,
+    resume_dir: str,
+    progress: dict,
+    include_optimizer_state: bool = True,
+):
+    os.makedirs(resume_dir, exist_ok=True)
+    payload = {
+        "trainable_model_state": _get_trainable_parameter_state(model),
+        "optimizer_state": _to_cpu_obj(optimizer.state_dict()) if include_optimizer_state else None,
+        "rng_state": _capture_rng_state(),
+        "progress": progress,
+    }
+    torch.save(payload, os.path.join(resume_dir, "stage3_resume_state.pt"))
+    meta = dict(progress)
+    meta["has_period_states"] = bool(meta.get("period_states") is not None)
+    meta["has_optimizer_state"] = bool(include_optimizer_state)
+    meta.pop("period_states", None)
+    with open(os.path.join(resume_dir, "stage3_resume_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[Stage3][Resume] 已保存断点: {resume_dir}")
+
+
+def _load_stage3_resume_state(
+    model,
+    optimizer,
+    resume_dir: str,
+    device: str,
+) -> Optional[dict]:
+    state_path = os.path.join(resume_dir, "stage3_resume_state.pt")
+    if not os.path.exists(state_path):
+        print(f"[Stage3][Resume] 未找到断点文件: {state_path}")
+        return None
+
+    payload = torch.load(state_path, map_location="cpu")
+    _load_parameter_state(model, payload.get("trainable_model_state", {}), "Stage3 resume trainable_model_state")
+
+    optimizer_state = payload.get("optimizer_state")
+    if optimizer_state:
+        optimizer.load_state_dict(optimizer_state)
+        _move_optimizer_state_to_device_(optimizer, device)
+        print("[Stage3][Resume] 已加载 optimizer state")
+    else:
+        print("[Stage3][Resume] 断点中不含 optimizer state，将从当前优化器状态继续")
+
+    _restore_rng_state(payload.get("rng_state"))
+    progress = payload.get("progress", {})
     print(
-        f"LoRD 参数: tau1={tau1}, max_new_tokens={max_new_tokens}, grad_accum={grad_accum}, "
-        f"lr={stage3_lr}, train_projector={int(bool(args.stage3_train_projector))}"
+        f"[Stage3][Resume] 已恢复进度: next_sub_stage={progress.get('next_sub_stage_idx', 0)}, "
+        f"next_period={progress.get('next_period_idx', 0)}, global_step={progress.get('global_step', 0)}"
     )
+    return progress
 
-    image_token_id = _get_image_token_id(model)
 
-    # Stage3 重新显式设置可训练参数，避免沿用 Stage2 冻结状态
-    model.train()
+class PeriodTrainingDataset(torch.utils.data.Dataset):
+    def __init__(self, items: List[PeriodTrainingItem], sample_cache: List[Stage3SampleCacheItem]):
+        self.items = items
+        self.sample_cache = sample_cache
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        pair = self.items[idx]
+        sample = self.sample_cache[pair.sample_idx]
+        return {
+            "y_plus_ids": pair.y_plus_ids,
+            "y_plus_mask": pair.y_plus_mask,
+            "y_minus_ids": pair.y_minus_ids,
+            "y_minus_mask": pair.y_minus_mask,
+            "y_vic_ids": pair.y_vic_ids,
+            "y_vic_mask": pair.y_vic_mask,
+            "old_token_lp_plus": pair.old_token_lp_plus,
+            "old_token_mask_plus": pair.old_token_mask_plus,
+            "old_token_lp_minus": pair.old_token_lp_minus,
+            "old_token_mask_minus": pair.old_token_mask_minus,
+            "old_token_lp_vic": pair.old_token_lp_vic,
+            "old_token_mask_vic": pair.old_token_mask_vic,
+            "pixel_values": sample.pixel_values,
+            "image_sizes": sample.image_sizes,
+            "prompt_len": int(sample.prompt_len),
+        }
+
+
+def _pad_1d_tensor(tensor: torch.Tensor, target_len: int, pad_value: float) -> torch.Tensor:
+    cur_len = int(tensor.shape[0])
+    if cur_len == target_len:
+        return tensor
+    if cur_len > target_len:
+        return tensor[:target_len]
+    return F.pad(tensor, (0, target_len - cur_len), value=pad_value)
+
+
+def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
+    if not batch:
+        return None
+
+    stream_to_old_key = {
+        "y_plus": ("old_token_lp_plus", "old_token_mask_plus"),
+        "y_minus": ("old_token_lp_minus", "old_token_mask_minus"),
+        "y_vic": ("old_token_lp_vic", "old_token_mask_vic"),
+    }
+
+    def _collate_stream(prefix: str):
+        ids_key = f"{prefix}_ids"
+        mask_key = f"{prefix}_mask"
+        old_lp_key, old_mask_key = stream_to_old_key[prefix]
+
+        ids_list = [item[ids_key] for item in batch]
+        mask_list = [item[mask_key] for item in batch]
+        old_lp_list = [item[old_lp_key] for item in batch]
+        old_mask_list = [item[old_mask_key] for item in batch]
+
+        normalized_old_lp = []
+        normalized_old_mask = []
+        for ids, old_lp, old_mask in zip(ids_list, old_lp_list, old_mask_list):
+            expected_len = max(0, int(ids.shape[0]) - 1)
+            normalized_old_lp.append(_pad_1d_tensor(old_lp.float(), expected_len, 0.0))
+            normalized_old_mask.append(_pad_1d_tensor(old_mask.float(), expected_len, 0.0))
+
+        max_ids_len = max(int(x.shape[0]) for x in ids_list)
+        target_old_len = max(0, max_ids_len - 1)
+
+        ids = torch.stack([
+            _pad_1d_tensor(x.long(), max_ids_len, pad_token_id) for x in ids_list
+        ], dim=0)
+        masks = torch.stack([
+            _pad_1d_tensor(x.long(), max_ids_len, 0) for x in mask_list
+        ], dim=0)
+        old_lp = torch.stack([
+            _pad_1d_tensor(x, target_old_len, 0.0) for x in normalized_old_lp
+        ], dim=0)
+        old_mask = torch.stack([
+            _pad_1d_tensor(x, target_old_len, 0.0) for x in normalized_old_mask
+        ], dim=0)
+        return ids, masks, old_lp, old_mask
+
+    plus_ids, plus_mask, old_lp_plus, old_mask_plus = _collate_stream("y_plus")
+    minus_ids, minus_mask, old_lp_minus, old_mask_minus = _collate_stream("y_minus")
+    vic_ids, vic_mask, old_lp_vic, old_mask_vic = _collate_stream("y_vic")
+
+    pv_list = []
+    for item in batch:
+        pv = item["pixel_values"]
+        if pv.dim() == 3:
+            pv = pv.unsqueeze(0)
+        pv_list.append(pv)
+
+    pv_shapes = [tuple(pv.shape) for pv in pv_list]
+    if len(set(pv_shapes)) > 1:
+        max_patches = max(shape[0] for shape in pv_shapes)
+        for i, pv in enumerate(pv_list):
+            if pv.shape[0] < max_patches:
+                pad = torch.zeros(
+                    (max_patches - pv.shape[0],) + pv.shape[1:],
+                    dtype=pv.dtype,
+                    device=pv.device,
+                )
+                pv_list[i] = torch.cat([pv, pad], dim=0)
+    pixel_values = torch.stack(pv_list, dim=0)
+
+    image_sizes_list = [item.get("image_sizes") for item in batch]
+    if any(size is not None for size in image_sizes_list):
+        image_sizes = torch.stack([
+            size if isinstance(size, torch.Tensor) else torch.tensor(size, dtype=torch.long)
+            for size in image_sizes_list
+        ], dim=0)
+    else:
+        image_sizes = None
+
+    prompt_lens = torch.tensor([int(item["prompt_len"]) for item in batch], dtype=torch.long)
+
+    return {
+        "y_plus_ids": plus_ids,
+        "y_plus_mask": plus_mask,
+        "y_minus_ids": minus_ids,
+        "y_minus_mask": minus_mask,
+        "y_vic_ids": vic_ids,
+        "y_vic_mask": vic_mask,
+        "old_token_lp_plus": old_lp_plus,
+        "old_token_mask_plus": old_mask_plus,
+        "old_token_lp_minus": old_lp_minus,
+        "old_token_mask_minus": old_mask_minus,
+        "old_token_lp_vic": old_lp_vic,
+        "old_token_mask_vic": old_mask_vic,
+        "pixel_values": pixel_values,
+        "image_sizes": image_sizes,
+        "prompt_lens": prompt_lens,
+    }
+
+
+def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
+    cache: List[Stage3SampleCacheItem] = []
+    for idx in tqdm(range(len(train_dataset)), desc="构建 Stage3SampleCache"):
+        sample = train_dataset[idx]
+        if sample is None:
+            continue
+
+        prompt_ids = sample.get("prompt_input_ids")
+        prompt_mask = sample.get("prompt_attention_mask")
+        y_vic_ids = sample.get("full_input_ids")
+        y_vic_mask = sample.get("full_attention_mask")
+
+        if prompt_ids is None:
+            prompt_ids = sample["input_ids"]
+        if prompt_mask is None:
+            prompt_mask = sample.get("attention_mask", torch.ones_like(prompt_ids))
+        if y_vic_ids is None:
+            y_vic_ids = sample["input_ids"]
+        if y_vic_mask is None:
+            y_vic_mask = sample.get("attention_mask", torch.ones_like(y_vic_ids))
+
+        prompt_len = int(prompt_ids.shape[0])
+        pixel_values = sample["pixel_values"]
+        if pixel_values.dim() == 3:
+            pixel_values = pixel_values.unsqueeze(0)
+
+        image_sizes = sample.get("image_sizes")
+        if image_sizes is None:
+            image_sizes = torch.tensor([pixel_values.shape[-2], pixel_values.shape[-1]], dtype=torch.long)
+        if isinstance(image_sizes, torch.Tensor):
+            image_sizes = image_sizes[:2].to(dtype=torch.long).cpu()
+        else:
+            image_sizes = torch.tensor(image_sizes, dtype=torch.long)[:2].cpu()
+
+        cache.append(Stage3SampleCacheItem(
+            sample_idx=int(idx),
+            prompt_ids=prompt_ids.detach().cpu().long(),
+            prompt_mask=prompt_mask.detach().cpu().long(),
+            y_vic_ids=y_vic_ids.detach().cpu().long(),
+            y_vic_mask=y_vic_mask.detach().cpu().long(),
+            pixel_values=pixel_values.detach().cpu(),
+            image_sizes=image_sizes,
+            prompt_len=prompt_len,
+        ))
+    return cache
+
+
+def _set_stage3_trainable_params(model, args) -> List[torch.nn.Parameter]:
     for name, param in model.named_parameters():
         if not torch.is_floating_point(param):
             param.requires_grad = False
             continue
-
         name_l = name.lower()
-        is_lora = "lora_" in name_l or "modules_to_save" in name_l
-        # VQ codebook 在 Stage3 冻结 — Stage1+2 已训练好，Stage3 专注 LoRD 对比学习
-        is_vq = False
-        is_projector = ("projector" in name_l or "multi_modal_projector" in name_l) and bool(args.stage3_train_projector)
-        is_vision = ("vision" in name_l) and (not args.freeze_vision_tower)
+        is_lora = "lora_" in name_l
+        is_projector = (
+            ("projector" in name_l or "multi_modal_projector" in name_l)
+            and bool(args.stage3_train_projector)
+        )
+        param.requires_grad = bool(is_lora or is_projector)
+    return [p for p in model.parameters() if p.requires_grad]
 
-        param.requires_grad = bool(is_lora or is_vq or is_projector or is_vision)
 
-    print("[Stage3] VQ codebook 通过 requires_grad=False 冻结；无 EMA/dead-code 状态需要切换")
+def _strip_extra_image_tokens(
+    ids: torch.Tensor,
+    image_token_id: Optional[int],
+    allowed_count: int,
+    replacement_token_id: int,
+) -> torch.Tensor:
+    if image_token_id is None:
+        return ids
+    ids = ids.clone()
+    pos = (ids[0] == int(image_token_id)).nonzero(as_tuple=False).view(-1)
+    if pos.numel() > allowed_count:
+        ids[0, pos[allowed_count:]] = int(replacement_token_id)
+    return ids
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Stage3 可训练参数量: {trainable_params:,}")
-    
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=stage3_lr,
+
+def _generate_candidate_single(
+    model,
+    sample: Stage3SampleCacheItem,
+    args,
+    image_token_id: Optional[int],
+    pad_token_id: int,
+    do_sample: bool = True,
+    temperature: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = args.device
+    prompt_ids = sample.prompt_ids.unsqueeze(0).to(device)
+    prompt_mask = sample.prompt_mask.unsqueeze(0).to(device)
+    pixel_values = sample.pixel_values.unsqueeze(0).to(device)
+    image_sizes = sanitize_image_sizes(sample.image_sizes.unsqueeze(0), batch_size=1)
+    allowed_img_count = int((sample.prompt_ids == int(image_token_id)).sum().item()) if image_token_id is not None else 0
+
+    gen_kwargs = dict(
+        input_ids=prompt_ids,
+        attention_mask=prompt_mask,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+        do_sample=bool(do_sample),
+        max_new_tokens=int(args.max_new_tokens),
+        bad_words_ids=[[int(image_token_id)]] if image_token_id is not None else None,
+        pad_token_id=int(pad_token_id),
     )
-    
-    # ========== 断点续训：加载已有的 Stage3 checkpoint ==========
+    if do_sample:
+        gen_kwargs["temperature"] = float(args.temperature if temperature is None else temperature)
+    with torch.no_grad():
+        generated = model.generate(**gen_kwargs)
+    eos_or_pad = model.config.eos_token_id or int(pad_token_id)
+    generated = _strip_extra_image_tokens(
+        generated,
+        image_token_id=image_token_id,
+        allowed_count=allowed_img_count,
+        replacement_token_id=eos_or_pad,
+    )
+    generated = generated.squeeze(0).detach().cpu().long()
+    generated_mask = (generated != int(pad_token_id)).long()
+    return generated, generated_mask
+
+
+def _extract_answer_letter(text: str) -> Optional[str]:
+    if not text:
+        return None
+    text_u = str(text).strip()
+    patterns = [
+        r"(?:answer|答案)\s*[:：]\s*\(?\s*([A-D])\s*\)?",
+        r"^\s*\(?\s*([A-D])\s*\)?\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text_u, flags=re.IGNORECASE)
+        if m:
+            return str(m.group(1)).upper()
+    return None
+
+
+def _evaluate_stage3_answer_metrics(
+    model,
+    sample_cache: List[Stage3SampleCacheItem],
+    eval_indices: List[int],
+    args,
+    image_token_id: Optional[int],
+    pad_token_id: int,
+    tokenizer,
+    answer_lookup: Dict[int, str],
+) -> Tuple[float, float, int]:
+    if not eval_indices or tokenizer is None:
+        return 0.0, 0.0, 0
+
+    model.eval()
+    use_cache_states = _set_model_use_cache(model, True)
+    gc_states = _set_model_gradient_checkpointing(model, False)
+    try:
+        total = 0
+        fmt_hits = 0
+        acc_hits = 0
+        for idx in eval_indices:
+            sample = sample_cache[idx]
+            ids, _ = _generate_candidate_single(
+                model=model,
+                sample=sample,
+                args=args,
+                image_token_id=image_token_id,
+                pad_token_id=pad_token_id,
+                do_sample=False,
+            )
+            prompt_len = int(sample.prompt_len)
+            gen_ids = ids[prompt_len:] if ids.shape[0] > prompt_len else ids
+            text = tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True)
+            pred = _extract_answer_letter(text)
+            gold = answer_lookup.get(int(idx))
+            total += 1
+            if pred is not None:
+                fmt_hits += 1
+            if pred is not None and gold is not None and pred == gold:
+                acc_hits += 1
+    finally:
+        _restore_model_gradient_checkpointing(gc_states)
+        _restore_model_use_cache(use_cache_states)
+
+    denom = max(1, total)
+    return float(acc_hits) / denom, float(fmt_hits) / denom, int(total)
+
+
+def _score_sequence_no_grad(
+    model,
+    sample: Stage3SampleCacheItem,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    args,
+) -> Tuple[float, float, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        ids_b = ids.unsqueeze(0).to(args.device)
+        mask_b = mask.unsqueeze(0).to(args.device)
+        pixel_values = sample.pixel_values.unsqueeze(0).to(args.device)
+        image_sizes = sanitize_image_sizes(sample.image_sizes.unsqueeze(0), batch_size=1)
+        prompt_lens = torch.tensor([sample.prompt_len], device=ids_b.device, dtype=torch.long)
+
+        token_lp, token_mask = _compute_token_log_probs(
+            model=model,
+            ids=ids_b,
+            mask=mask_b,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            prompt_lens=prompt_lens,
+        )
+        avg_lp_tensor = (token_lp * token_mask).sum(dim=-1) / token_mask.sum(dim=-1).clamp(min=1.0)
+        avg_lp = float(avg_lp_tensor.item())
+        prob = float(math.exp(max(min(avg_lp, 50.0), -50.0)))
+        return avg_lp, prob, token_lp.squeeze(0).detach().cpu(), token_mask.squeeze(0).detach().cpu()
+
+
+def _bootstrap_period_states(
+    model,
+    sample_cache: List[Stage3SampleCacheItem],
+    active_indices: List[int],
+    args,
+    image_token_id: Optional[int],
+    pad_token_id: int,
+) -> Dict[int, PeriodState]:
+    states: Dict[int, PeriodState] = {}
+    model.eval()
+    use_cache_states = _set_model_use_cache(model, True)
+    gc_states = _set_model_gradient_checkpointing(model, False)
+    try:
+        for idx in tqdm(active_indices, desc="Stage3 bootstrap"):
+            sample = sample_cache[idx]
+            cand1_ids, cand1_mask = _generate_candidate_single(model, sample, args, image_token_id, pad_token_id)
+            cand2_ids, cand2_mask = _generate_candidate_single(model, sample, args, image_token_id, pad_token_id)
+            cand1_lp, cand1_prob, _, _ = _score_sequence_no_grad(model, sample, cand1_ids, cand1_mask, args)
+            cand2_lp, cand2_prob, _, _ = _score_sequence_no_grad(model, sample, cand2_ids, cand2_mask, args)
+
+            # period0: y11 固定为 y_vic，y12 取低概率候选
+            low_ids, low_mask, low_lp, low_prob = (
+                (cand1_ids, cand1_mask, cand1_lp, cand1_prob)
+                if cand1_prob <= cand2_prob
+                else (cand2_ids, cand2_mask, cand2_lp, cand2_prob)
+            )
+            y_vic_lp, y_vic_prob, _, _ = _score_sequence_no_grad(
+                model, sample, sample.y_vic_ids, sample.y_vic_mask, args
+            )
+            states[idx] = PeriodState(
+                sample_idx=idx,
+                y11_ids=sample.y_vic_ids.clone(),
+                y11_mask=sample.y_vic_mask.clone(),
+                y12_ids=low_ids.clone(),
+                y12_mask=low_mask.clone(),
+                avg_lp_11=float(y_vic_lp),
+                avg_lp_12=float(low_lp),
+                prob_11=float(y_vic_prob),
+                prob_12=float(low_prob),
+            )
+    finally:
+        _restore_model_gradient_checkpointing(gc_states)
+        _restore_model_use_cache(use_cache_states)
+    return states
+
+
+def _build_pairs_and_next_states(
+    model,
+    sample_cache: List[Stage3SampleCacheItem],
+    current_states: Dict[int, PeriodState],
+    active_indices: List[int],
+    args,
+    image_token_id: Optional[int],
+    pad_token_id: int,
+) -> Tuple[List[PeriodTrainingItem], Dict[int, PeriodState], int, int, float, float]:
+    training_items: List[PeriodTrainingItem] = []
+    next_states: Dict[int, PeriodState] = {}
+    cold_start_count = 0
+    swap_count = 0
+    plus_lp_sum = 0.0
+    minus_lp_sum = 0.0
+    tau1 = float(args.tau1)
+    tau_delta = float(getattr(args, "tau_delta", 0.01))
+
+    model.eval()
+    use_cache_states = _set_model_use_cache(model, True)
+    gc_states = _set_model_gradient_checkpointing(model, False)
+    try:
+        for idx in tqdm(active_indices, desc="Stage3 Phase-A"):
+            state = current_states[idx]
+            sample = sample_cache[idx]
+
+            lp11, prob11, token11, mask11 = _score_sequence_no_grad(
+                model, sample, state.y11_ids, state.y11_mask, args
+            )
+            lp12, prob12, token12, mask12 = _score_sequence_no_grad(
+                model, sample, state.y12_ids, state.y12_mask, args
+            )
+            candidates = [
+                {
+                    "ids": state.y11_ids,
+                    "mask": state.y11_mask,
+                    "avg_lp": lp11,
+                    "prob": prob11,
+                    "old_token_lp": token11,
+                    "old_token_mask": mask11,
+                    "prev_prob": state.prob_11,
+                },
+                {
+                    "ids": state.y12_ids,
+                    "mask": state.y12_mask,
+                    "avg_lp": lp12,
+                    "prob": prob12,
+                    "old_token_lp": token12,
+                    "old_token_mask": mask12,
+                    "prev_prob": state.prob_12,
+                },
+            ]
+            candidates.sort(key=lambda x: x["prob"], reverse=True)
+            y11 = candidates[0]
+            y12 = candidates[1]
+            if y11["ids"].data_ptr() != state.y11_ids.data_ptr():
+                swap_count += 1
+
+            delta11 = float(y11["prob"] - y11["prev_prob"])
+            p_best = max(float(y11["prob"]), float(y12["prob"]))
+
+            if torch.equal(state.y11_ids, sample.y_vic_ids) and torch.equal(state.y11_mask, sample.y_vic_mask):
+                y_vic_lp, y_vic_prob, y_vic_token_lp, y_vic_token_mask = lp11, prob11, token11, mask11
+            elif torch.equal(state.y12_ids, sample.y_vic_ids) and torch.equal(state.y12_mask, sample.y_vic_mask):
+                y_vic_lp, y_vic_prob, y_vic_token_lp, y_vic_token_mask = lp12, prob12, token12, mask12
+            else:
+                y_vic_lp, y_vic_prob, y_vic_token_lp, y_vic_token_mask = _score_sequence_no_grad(
+                    model, sample, sample.y_vic_ids, sample.y_vic_mask, args
+                )
+
+            use_cold_start = (p_best < tau1) and (delta11 < tau_delta)
+            if use_cold_start:
+                y_plus_ids = sample.y_vic_ids
+                y_plus_mask = sample.y_vic_mask
+                old_lp_plus = y_vic_token_lp
+                old_mask_plus = y_vic_token_mask
+                y_plus_avg_lp = float(y_vic_lp)
+                cold_start_count += 1
+            else:
+                y_plus_ids = y11["ids"]
+                y_plus_mask = y11["mask"]
+                old_lp_plus = y11["old_token_lp"]
+                old_mask_plus = y11["old_token_mask"]
+                y_plus_avg_lp = float(y11["avg_lp"])
+            y_minus_avg_lp = float(y12["avg_lp"])
+            plus_lp_sum += y_plus_avg_lp
+            minus_lp_sum += y_minus_avg_lp
+
+            training_items.append(PeriodTrainingItem(
+                sample_idx=int(idx),
+                y_plus_ids=y_plus_ids.clone(),
+                y_plus_mask=y_plus_mask.clone(),
+                y_minus_ids=y12["ids"].clone(),
+                y_minus_mask=y12["mask"].clone(),
+                y_vic_ids=sample.y_vic_ids.clone(),
+                y_vic_mask=sample.y_vic_mask.clone(),
+                old_token_lp_plus=old_lp_plus.clone(),
+                old_token_mask_plus=old_mask_plus.clone(),
+                old_token_lp_minus=y12["old_token_lp"].clone(),
+                old_token_mask_minus=y12["old_token_mask"].clone(),
+                old_token_lp_vic=y_vic_token_lp.clone(),
+                old_token_mask_vic=y_vic_token_mask.clone(),
+            ))
+
+            # Step6: 新候选完全替换下一 period 的 y11/y12
+            next1_ids, next1_mask = _generate_candidate_single(model, sample, args, image_token_id, pad_token_id)
+            next2_ids, next2_mask = _generate_candidate_single(model, sample, args, image_token_id, pad_token_id)
+            next1_lp, next1_prob, _, _ = _score_sequence_no_grad(model, sample, next1_ids, next1_mask, args)
+            next2_lp, next2_prob, _, _ = _score_sequence_no_grad(model, sample, next2_ids, next2_mask, args)
+            next_sorted = [
+                (next1_ids, next1_mask, next1_lp, next1_prob),
+                (next2_ids, next2_mask, next2_lp, next2_prob),
+            ]
+            next_sorted.sort(key=lambda x: x[3], reverse=True)
+            high = next_sorted[0]
+            low = next_sorted[1]
+            next_states[idx] = PeriodState(
+                sample_idx=int(idx),
+                y11_ids=high[0].clone(),
+                y11_mask=high[1].clone(),
+                y12_ids=low[0].clone(),
+                y12_mask=low[1].clone(),
+                avg_lp_11=float(high[2]),
+                avg_lp_12=float(low[2]),
+                prob_11=float(high[3]),
+                prob_12=float(low[3]),
+            )
+    finally:
+        _restore_model_gradient_checkpointing(gc_states)
+        _restore_model_use_cache(use_cache_states)
+
+    return training_items, next_states, cold_start_count, swap_count, plus_lp_sum, minus_lp_sum
+
+
+def _run_one_period_train(
+    model,
+    optimizer,
+    loader,
+    args,
+    tb_writer,
+    global_step: int,
+    sub_stage_idx: int,
+    period_idx: int,
+) -> Tuple[float, float, float, int]:
+    model.train()
+    grad_accum = max(1, int(getattr(args, "stage3_grad_accum", 0) or getattr(args, "grad_accum", 1)))
+    grad_clip = float(getattr(args, "stage3_grad_clip", 1.0))
+    optimizer.zero_grad(set_to_none=True)
+
+    total_loss = 0.0
+    total_obj = 0.0
+    total_reg = 0.0
+    steps = 0
+
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return (values * mask).sum() / mask.sum().clamp(min=1.0)
+
+    for batch_idx, batch in enumerate(tqdm(loader, desc=f"Stage3 S{sub_stage_idx+1} P{period_idx+1}")):
+        if batch is None:
+            continue
+        global_step += 1
+        steps += 1
+
+        y_plus_ids = batch["y_plus_ids"].to(args.device)
+        y_plus_mask = batch["y_plus_mask"].to(args.device)
+        y_minus_ids = batch["y_minus_ids"].to(args.device)
+        y_minus_mask = batch["y_minus_mask"].to(args.device)
+        y_vic_ids = batch["y_vic_ids"].to(args.device)
+        y_vic_mask = batch["y_vic_mask"].to(args.device)
+        pixel_values = batch["pixel_values"].to(args.device)
+        image_sizes = sanitize_image_sizes(batch.get("image_sizes"), batch_size=y_plus_ids.size(0))
+        prompt_lens = batch["prompt_lens"].to(args.device)
+
+        old_lp_plus = batch["old_token_lp_plus"].to(args.device)
+        old_mask_plus = batch["old_token_mask_plus"].to(args.device)
+        old_lp_minus = batch["old_token_lp_minus"].to(args.device)
+        old_mask_minus = batch["old_token_mask_minus"].to(args.device)
+        old_lp_vic = batch["old_token_lp_vic"].to(args.device)
+        old_mask_vic = batch["old_token_mask_vic"].to(args.device)
+
+        cur_lp_plus, cur_mask_plus = _compute_token_log_probs(
+            model, y_plus_ids, y_plus_mask, pixel_values, image_sizes, prompt_lens
+        )
+        cur_lp_minus, cur_mask_minus = _compute_token_log_probs(
+            model, y_minus_ids, y_minus_mask, pixel_values, image_sizes, prompt_lens
+        )
+        cur_lp_vic, cur_mask_vic = _compute_token_log_probs(
+            model, y_vic_ids, y_vic_mask, pixel_values, image_sizes, prompt_lens
+        )
+
+        # collate 已对齐，这里额外防御
+        if cur_lp_plus.shape[1] != old_lp_plus.shape[1]:
+            target = min(cur_lp_plus.shape[1], old_lp_plus.shape[1])
+            cur_lp_plus, cur_mask_plus = cur_lp_plus[:, :target], cur_mask_plus[:, :target]
+            old_lp_plus, old_mask_plus = old_lp_plus[:, :target], old_mask_plus[:, :target]
+        if cur_lp_minus.shape[1] != old_lp_minus.shape[1]:
+            target = min(cur_lp_minus.shape[1], old_lp_minus.shape[1])
+            cur_lp_minus, cur_mask_minus = cur_lp_minus[:, :target], cur_mask_minus[:, :target]
+            old_lp_minus, old_mask_minus = old_lp_minus[:, :target], old_mask_minus[:, :target]
+        if cur_lp_vic.shape[1] != old_lp_vic.shape[1]:
+            target = min(cur_lp_vic.shape[1], old_lp_vic.shape[1])
+            cur_lp_vic, cur_mask_vic = cur_lp_vic[:, :target], cur_mask_vic[:, :target]
+            old_lp_vic, old_mask_vic = old_lp_vic[:, :target], old_mask_vic[:, :target]
+
+        mask_plus = (old_mask_plus * cur_mask_plus).float()
+        mask_minus = (old_mask_minus * cur_mask_minus).float()
+        mask_vic = (old_mask_vic * cur_mask_vic).float()
+
+        term1 = _masked_mean(log_clip(-old_lp_minus + cur_lp_minus), mask_minus)
+        term2 = _masked_mean(log_clip(old_lp_plus - cur_lp_plus), mask_plus)
+        term3 = _masked_mean(old_lp_vic - cur_lp_vic, mask_vic)
+        loss_obj = term1 + term2
+        loss_reg = term3
+        loss = loss_obj + loss_reg
+
+        (loss / grad_accum).backward()
+
+        if (batch_idx + 1) % grad_accum == 0 or batch_idx == len(loader) - 1:
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_norm=grad_clip,
+                )
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        loss_val = float(loss.item())
+        obj_val = float(loss_obj.item())
+        reg_val = float(loss_reg.item())
+        total_loss += loss_val
+        total_obj += obj_val
+        total_reg += reg_val
+
+        if global_step % args.log_step == 0:
+            print(
+                f"Step {global_step}, Total: {loss_val:.4f}, "
+                f"L_obj: {obj_val:.4f}, L_reg: {reg_val:.4f}"
+            )
+            tb_writer.add_scalar("stage3/total_loss", loss_val, global_step)
+            tb_writer.add_scalar("stage3/L_obj", obj_val, global_step)
+            tb_writer.add_scalar("stage3/L_reg", reg_val, global_step)
+
+    denom = max(1, steps)
+    return total_loss / denom, total_obj / denom, total_reg / denom, global_step
+
+
+def train_stage3_lord(model, train_dataset, args, tb_writer):
+    print("\n" + "=" * 50)
+    print("阶段 3: LoRD-II 多 Period 训练")
+    print("=" * 50)
+
+    image_token_id = _get_image_token_id(model)
+    pad_token_id = model.config.pad_token_id or model.config.eos_token_id or 0
+    tau1 = float(args.tau1)
+    tau_delta = float(getattr(args, "tau_delta", 0.01))
+    sub_stage_num = max(1, int(getattr(args, "sub_stage_num", 1)))
+    period_num = int(getattr(args, "period_num", 0))
+    if period_num <= 0:
+        period_num = max(1, int(args.epochs))
+    sub_set_num = int(getattr(args, "sub_set_num", 0))
+    stage3_lr = float(args.lr) * float(getattr(args, "stage3_lr_scale", 1.0))
+
+    print(
+        f"[Stage3] tau1={tau1}, tau_delta={tau_delta}, "
+        f"sub_stage_num={sub_stage_num}, period_num={period_num}, sub_set_num={sub_set_num}, "
+        f"lr={stage3_lr}, train_projector={int(bool(args.stage3_train_projector))}, "
+        f"resume_opt={int(bool(getattr(args, 'stage3_resume_save_optimizer', 1)))}, "
+        f"eval_max_samples={int(getattr(args, 'stage3_eval_max_samples', 0))}"
+    )
+
+    trainable_params = _set_stage3_trainable_params(model, args)
+    print(f"Stage3 可训练参数量: {sum(p.numel() for p in trainable_params):,}")
+    if not trainable_params:
+        raise RuntimeError("Stage3 没有可训练参数，请检查 LoRA 或 stage3_train_projector 配置")
+    optimizer = torch.optim.AdamW(trainable_params, lr=stage3_lr)
+
+    sample_cache = _build_stage3_sample_cache(train_dataset)
+    if not sample_cache:
+        raise RuntimeError("Stage3SampleCache 为空，无法开始 Stage3 训练")
+
+    tokenizer = None
+    answer_lookup: Dict[int, str] = {}
+    if hasattr(train_dataset, "processor"):
+        tokenizer = getattr(train_dataset.processor, "tokenizer", None)
+    raw_samples = getattr(train_dataset, "samples", None)
+    if isinstance(raw_samples, list):
+        for idx, sample in enumerate(raw_samples):
+            answer_letter = str(sample.get("answer_letter", "") or "").strip().upper()[:1]
+            if answer_letter in {"A", "B", "C", "D"}:
+                answer_lookup[int(idx)] = answer_letter
+
+    all_indices = list(range(len(sample_cache)))
     global_step = 0
-    start_epoch = 0
-    resume_batch_idx = 0
-    stage3_resume_dir = os.path.join(args.save_path, "stage3_resume")
-    stage3_state_path = os.path.join(stage3_resume_dir, "training_state.pt")
+    base_seed = int(getattr(args, "scienceqa_seed", 20240306))
+    period_counter = 0
+    resume_save_optimizer = bool(int(getattr(args, "stage3_resume_save_optimizer", 1)))
+    resume_save_interval = max(1, int(getattr(args, "stage3_resume_save_interval", 1)))
+    stage3_eval_max_samples = int(getattr(args, "stage3_eval_max_samples", 0))
+    stage3_eval_every_period = max(1, int(getattr(args, "stage3_eval_every_period", 1)))
+    resume_save_dir = str(getattr(args, "stage3_resume_save_path", "") or "").strip()
+    if not resume_save_dir:
+        resume_save_dir = os.path.join(args.save_path, "stage3_resume_latest")
 
-    def _save_stage3_resume_state(next_epoch: int, next_batch_idx: int):
-        os.makedirs(stage3_resume_dir, exist_ok=True)
-        resume_model_dir = os.path.join(stage3_resume_dir, "model")
-        save_stage3_checkpoint(model, resume_model_dir)
-        torch.save({
-            "epoch": next_epoch,
-            "next_batch_idx": next_batch_idx,
-            "global_step": global_step,
-            "optimizer_state_dict": optimizer.state_dict(),
-            "rng_state": _capture_rng_state(),
-        }, stage3_state_path)
-        print(
-            f"Stage3 续训状态已保存: epoch={next_epoch}, next_batch_idx={next_batch_idx}, "
-            f"global_step={global_step}"
-        )
-    
-    if os.path.exists(stage3_state_path):
-        print(f"检测到 Stage3 断点，正在恢复: {stage3_state_path}")
-        state = torch.load(stage3_state_path, map_location="cpu")
-        start_epoch = state["epoch"]
-        resume_batch_idx = int(state.get("next_batch_idx", 0))
-        global_step = state["global_step"]
-        
-        # 加载模型权重（需要在 optimizer 之前加载）
-        resume_model_dir = os.path.join(stage3_resume_dir, "model")
-        if os.path.exists(resume_model_dir):
-            model = load_stage3_checkpoint(model, resume_model_dir, args.device)
-        
-        # 加载 optimizer state（加载到与参数一致的设备上）
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        _restore_rng_state(state.get("rng_state"))
-        
-        # 如果已经训练完成，跳过
-        if start_epoch >= args.epochs:
-            print(f"训练已完成 (epoch={start_epoch}/{args.epochs})，无需继续")
+    resume_path = str(getattr(args, "stage3_resume_path", "") or "").strip()
+    resume_progress = None
+    if resume_path:
+        resume_progress = _load_stage3_resume_state(model, optimizer, resume_path, args.device)
+
+    resume_sub_stage_idx = 0
+    resume_period_idx = 0
+    resume_active_indices: Optional[List[int]] = None
+    resume_period_states: Optional[Dict[int, PeriodState]] = None
+    if resume_progress:
+        resume_sub_stage_idx = int(resume_progress.get("next_sub_stage_idx", 0))
+        resume_period_idx = int(resume_progress.get("next_period_idx", 0))
+        global_step = int(resume_progress.get("global_step", 0))
+        period_counter = int(resume_progress.get("period_counter", 0))
+        resume_active_indices_raw = resume_progress.get("active_indices")
+        if isinstance(resume_active_indices_raw, list):
+            resume_active_indices = [int(v) for v in resume_active_indices_raw]
+        resume_period_states = _deserialize_period_states(resume_progress.get("period_states"))
+        if bool(resume_progress.get("completed", False)):
+            print("[Stage3][Resume] 断点标记为 completed，跳过 Stage3 训练。")
             return model
-        
-        print(
-            f"已恢复: epoch={start_epoch}, next_batch_idx={resume_batch_idx}, "
-            f"global_step={global_step}"
+
+    if resume_sub_stage_idx >= sub_stage_num:
+        print("[Stage3][Resume] next_sub_stage_idx 超出配置，Stage3 无需继续训练。")
+        return model
+
+    for sub_stage_idx in range(resume_sub_stage_idx, sub_stage_num):
+        is_resume_sub_stage = bool(
+            resume_progress is not None and sub_stage_idx == resume_sub_stage_idx
         )
-    
-    # pad_token_id 统一获取，用于 mask 构建
-    _pad_id = model.config.pad_token_id
-    if _pad_id is None:
-        _pad_id = model.config.eos_token_id or 0
 
-    for epoch in range(start_epoch, args.epochs):
-        maybe_set_dataloader_epoch(dataloader, epoch)
-        epoch_loss = 0.0
-        epoch_obj_loss = 0.0
-        epoch_reg_loss = 0.0
-        epoch_vq_loss = 0.0
-        cold_start_count = 0
-        optimizer.zero_grad(set_to_none=True)
+        if is_resume_sub_stage and resume_active_indices is not None:
+            active_indices = list(resume_active_indices)
+        elif sub_set_num > 0 and sub_set_num < len(all_indices):
+            rng = random.Random(base_seed + sub_stage_idx)
+            active_indices = sorted(rng.sample(all_indices, sub_set_num))
+        else:
+            active_indices = list(all_indices)
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"LoRD Epoch {epoch+1}")):
-            if epoch == start_epoch and batch_idx < resume_batch_idx:
-                continue
-            if batch is None:
-                continue
-            global_step += 1
+        print(
+            f"[Stage3] sub_stage={sub_stage_idx+1}/{sub_stage_num}, "
+            f"active_samples={len(active_indices)}"
+        )
 
-            # 获取输入数据
-            input_ids = batch["input_ids"].to(args.device)  # prompt + y_vic
-            attention_mask = batch["attention_mask"].to(args.device)
-            pixel_values = batch["pixel_values"].to(args.device)
-            image_sizes = batch.get("image_sizes")
-            image_sizes = sanitize_image_sizes(image_sizes, batch_size=input_ids.size(0))
-            labels = batch["labels"].to(args.device)  # y_vic
+        if is_resume_sub_stage and resume_period_idx > 0 and resume_period_states is not None:
+            period_states = resume_period_states
+            print(
+                f"[Stage3][Resume] 继续 sub_stage={sub_stage_idx+1}, period={resume_period_idx+1}/{period_num}"
+            )
+        else:
+            period_states = _bootstrap_period_states(
+                model=model,
+                sample_cache=sample_cache,
+                active_indices=active_indices,
+                args=args,
+                image_token_id=image_token_id,
+                pad_token_id=pad_token_id,
+            )
+            resume_period_idx = 0
 
-            bs = input_ids.shape[0]
+        for period_idx in range(resume_period_idx, period_num):
+            print(f"[Stage3] 进入 period {period_idx+1}/{period_num}")
+            phase_a_start = time.perf_counter()
+            training_items, next_states, cold_start_count, swap_count, plus_lp_sum, minus_lp_sum = _build_pairs_and_next_states(
+                model=model,
+                sample_cache=sample_cache,
+                current_states=period_states,
+                active_indices=active_indices,
+                args=args,
+                image_token_id=image_token_id,
+                pad_token_id=pad_token_id,
+            )
+            phase_a_seconds = time.perf_counter() - phase_a_start
+            period_states = next_states
 
-            # ========== Step 1: 提取 prompt，双样本生成 ==========
-            # Stage3 在 bs>1 时，样本之间 prompt 长度可能不同。
-            # 若直接取一个全局 prompt_len，会截断某些样本的 image tokens，
-            # 进而触发 Llava-Next 的 "image features and image tokens do not match"。
-            prompt_lens = []
-            prompt_ids_list = []
-            prompt_mask_list = []
+            period_dataset = PeriodTrainingDataset(training_items, sample_cache)
+            period_loader = DataLoader(
+                period_dataset,
+                batch_size=max(1, int(args.batch_size)),
+                shuffle=True,
+                num_workers=0,
+                collate_fn=lambda b: _collate_period_training(b, pad_token_id),
+            )
+            avg_total, avg_obj, avg_reg, global_step = _run_one_period_train(
+                model=model,
+                optimizer=optimizer,
+                loader=period_loader,
+                args=args,
+                tb_writer=tb_writer,
+                global_step=global_step,
+                sub_stage_idx=sub_stage_idx,
+                period_idx=period_idx,
+            )
 
-            for i in range(bs):
-                cur_prompt_len = int((labels[i] == -100).sum().item())
-                cur_prompt_len = max(1, min(cur_prompt_len, input_ids.shape[1]))
-                cur_prompt_ids = input_ids[i:i+1, :cur_prompt_len]
-                cur_prompt_mask = attention_mask[i:i+1, :cur_prompt_len]
+            cold_ratio = float(cold_start_count) / max(1, len(active_indices))
+            swap_ratio = float(swap_count) / max(1, len(active_indices))
+            avg_lp_plus = float(plus_lp_sum) / max(1, len(training_items))
+            avg_lp_minus = float(minus_lp_sum) / max(1, len(training_items))
+            period_counter += 1
+            print(
+                f"[Stage3][S{sub_stage_idx+1}P{period_idx+1}] "
+                f"loss={avg_total:.4f}, L_obj={avg_obj:.4f}, L_reg={avg_reg:.4f}, "
+                f"cold_start_ratio={cold_ratio:.4f}, swap_ratio={swap_ratio:.4f}, "
+                f"avg_lp_plus={avg_lp_plus:.4f}, avg_lp_minus={avg_lp_minus:.4f}, "
+                f"phase_a_seconds={phase_a_seconds:.2f}"
+            )
+            tb_writer.add_scalar("stage3_epoch/total_loss", avg_total, period_counter)
+            tb_writer.add_scalar("stage3_epoch/L_obj", avg_obj, period_counter)
+            tb_writer.add_scalar("stage3_epoch/L_reg", avg_reg, period_counter)
+            tb_writer.add_scalar("stage3/cold_start_ratio", cold_ratio, period_counter)
+            tb_writer.add_scalar("stage3/swap_ratio", swap_ratio, period_counter)
+            tb_writer.add_scalar("stage3/avg_lp_plus", avg_lp_plus, period_counter)
+            tb_writer.add_scalar("stage3/avg_lp_minus", avg_lp_minus, period_counter)
+            tb_writer.add_scalar("stage3/phase_a_seconds", phase_a_seconds, period_counter)
+            tb_writer.add_scalar("stage3/period", period_idx + 1, period_counter)
+            tb_writer.add_scalar("stage3/sub_stage", sub_stage_idx + 1, period_counter)
 
-                if image_token_id is not None and not (cur_prompt_ids == image_token_id).any().item():
-                    cur_prompt_ids = input_ids[i:i+1]
-                    cur_prompt_mask = attention_mask[i:i+1]
-                    cur_prompt_len = input_ids.shape[1]
-
-                prompt_lens.append(cur_prompt_len)
-                prompt_ids_list.append(cur_prompt_ids)
-                prompt_mask_list.append(cur_prompt_mask)
-
-            prompt_lens = torch.tensor(prompt_lens, device=input_ids.device, dtype=torch.long)
-
-            # 防止生成 <image> token
-            bad_words_ids = [[int(image_token_id)]] if image_token_id is not None else None
-
-            model.eval()
-            with torch.no_grad():
-                gc_enabled = getattr(model, "is_gradient_checkpointing", False)
-                use_cache_states = _set_model_use_cache(model, True)
-                gc_states = _set_model_gradient_checkpointing(model, False) if gc_enabled else []
-                try:
-                    gen_output_1_list = []
-                    gen_output_2_list = []
-                    eos_or_pad = model.config.eos_token_id or _pad_id
-
-                    def _strip_extra_img_single(seq_ids, allowed_count):
-                        if image_token_id is None:
-                            return seq_ids
-                        seq_ids = seq_ids.clone()
-                        pos = (seq_ids[0] == image_token_id).nonzero(as_tuple=False).view(-1)
-                        if pos.numel() > allowed_count:
-                            seq_ids[0, pos[allowed_count:]] = eos_or_pad
-                        return seq_ids
-
-                    for i in range(bs):
-                        cur_prompt_ids = prompt_ids_list[i]
-                        cur_prompt_mask = prompt_mask_list[i]
-                        cur_pixel_values = pixel_values[i:i+1]
-                        cur_image_sizes = image_sizes[i:i+1] if image_sizes is not None else None
-
-                        _gen_kwargs = dict(
-                            input_ids=cur_prompt_ids,
-                            attention_mask=cur_prompt_mask,
-                            pixel_values=cur_pixel_values,
-                            image_sizes=cur_image_sizes,
-                            do_sample=True,
-                            max_new_tokens=max_new_tokens,
-                            temperature=args.temperature,
-                            bad_words_ids=bad_words_ids,
-                            pad_token_id=_pad_id,
-                        )
-                        cur_gen_output_1 = model.generate(**_gen_kwargs)
-                        cur_gen_output_2 = model.generate(**_gen_kwargs)
-
-                        allowed_img_count = int((cur_prompt_ids == image_token_id).sum().item()) if image_token_id is not None else 0
-                        cur_gen_output_1 = _strip_extra_img_single(cur_gen_output_1, allowed_img_count)
-                        cur_gen_output_2 = _strip_extra_img_single(cur_gen_output_2, allowed_img_count)
-                        gen_output_1_list.append(cur_gen_output_1)
-                        gen_output_2_list.append(cur_gen_output_2)
-
-                    gen_output_1 = torch.nn.utils.rnn.pad_sequence(
-                        [tensor.squeeze(0) for tensor in gen_output_1_list],
-                        batch_first=True,
-                        padding_value=_pad_id,
-                    )
-                    gen_output_2 = torch.nn.utils.rnn.pad_sequence(
-                        [tensor.squeeze(0) for tensor in gen_output_2_list],
-                        batch_first=True,
-                        padding_value=_pad_id,
-                    )
-                finally:
-                    if gc_enabled:
-                        _restore_model_gradient_checkpointing(gc_states)
-                    _restore_model_use_cache(use_cache_states)
-
-            model.train()
-
-            # ========== 对齐序列长度 ==========
-            max_len = max(gen_output_1.shape[1], gen_output_2.shape[1], input_ids.shape[1])
-
-            def pad_to_len(tensor, length, pad_val=_pad_id):
-                if tensor.shape[1] < length:
-                    p = torch.full((tensor.shape[0], length - tensor.shape[1]),
-                                   pad_val, dtype=tensor.dtype, device=tensor.device)
-                    return torch.cat([tensor, p], dim=1)
-                return tensor[:, :length]
-
-            s1_ids = pad_to_len(gen_output_1, max_len)
-            s2_ids = pad_to_len(gen_output_2, max_len)
-            y_vic_ids = pad_to_len(input_ids, max_len)
-
-            # 修复4: mask 使用 pad_token_id 而非硬编码 0
-            s1_mask = (s1_ids != _pad_id).long()
-            s2_mask = (s2_ids != _pad_id).long()
-            y_vic_mask = pad_to_len(attention_mask, max_len, pad_val=0)
-
-            # ========== Step 2+3: 无梯度排序 + 冷启动（复用同一批 forward） ==========
-            # 合并排序和损失计算，避免额外冗余 forward
-            # 只用 no_grad forward 做排序/冷启动判断，然后在 Step 4 中带梯度计算损失。
-            with torch.no_grad():
-                lp_s1 = _compute_generation_log_prob(
-                    model, s1_ids, s1_mask, pixel_values, image_sizes, prompt_lens
+            if (
+                stage3_eval_max_samples > 0
+                and tokenizer is not None
+                and answer_lookup
+                and (period_counter % stage3_eval_every_period == 0)
+            ):
+                eval_k = min(stage3_eval_max_samples, len(active_indices))
+                rng_eval = random.Random(base_seed + period_counter + 7919)
+                if eval_k < len(active_indices):
+                    eval_indices = sorted(rng_eval.sample(active_indices, eval_k))
+                else:
+                    eval_indices = list(active_indices)
+                val_acc, val_fmt, val_n = _evaluate_stage3_answer_metrics(
+                    model=model,
+                    sample_cache=sample_cache,
+                    eval_indices=eval_indices,
+                    args=args,
+                    image_token_id=image_token_id,
+                    pad_token_id=pad_token_id,
+                    tokenizer=tokenizer,
+                    answer_lookup=answer_lookup,
                 )
-                lp_s2 = _compute_generation_log_prob(
-                    model, s2_ids, s2_mask, pixel_values, image_sizes, prompt_lens
+                print(
+                    f"[Stage3][Eval][S{sub_stage_idx+1}P{period_idx+1}] "
+                    f"val_answer_acc={val_acc:.4f}, format_rate={val_fmt:.4f}, n={val_n}"
+                )
+                tb_writer.add_scalar("stage3/val_answer_acc", val_acc, period_counter)
+                tb_writer.add_scalar("stage3/format_rate", val_fmt, period_counter)
+
+            next_sub_stage_idx = sub_stage_idx
+            next_period_idx = period_idx + 1
+            next_period_states_to_save = period_states
+            next_active_indices = active_indices
+            if next_period_idx >= period_num:
+                next_sub_stage_idx = sub_stage_idx + 1
+                next_period_idx = 0
+                next_period_states_to_save = None
+                next_active_indices = None
+
+            resume_progress_payload = {
+                "version": 1,
+                "completed": bool(next_sub_stage_idx >= sub_stage_num),
+                "next_sub_stage_idx": int(next_sub_stage_idx),
+                "next_period_idx": int(next_period_idx),
+                "global_step": int(global_step),
+                "period_counter": int(period_counter),
+                "active_indices": next_active_indices,
+                "period_states": _serialize_period_states(next_period_states_to_save),
+                "sub_stage_num": int(sub_stage_num),
+                "period_num": int(period_num),
+                "sub_set_num": int(sub_set_num),
+                "base_seed": int(base_seed),
+            }
+            should_save_resume = bool(
+                resume_progress_payload["completed"]
+                or (period_counter % resume_save_interval == 0)
+            )
+            if should_save_resume:
+                _save_stage3_resume_state(
+                    model=model,
+                    optimizer=optimizer,
+                    resume_dir=resume_save_dir,
+                    progress=resume_progress_payload,
+                    include_optimizer_state=resume_save_optimizer,
                 )
 
-            # 局部性排序 + 冷启动
-            y_plus_ids = s1_ids.clone()
-            y_minus_ids = s2_ids.clone()
-            y_plus_mask = s1_mask.clone()
-            y_minus_mask = s2_mask.clone()
-            # 记录 y_minus 对应的 no_grad lp，供 step 4 L_reg 直接复用（省 1 次 forward）
-            lp_minus_detached = lp_s2.clone()  # 默认 s1=y+, s2=y-
+            if int(getattr(args, "save_each_epoch", 0)) == 1:
+                ckpt_dir = os.path.join(
+                    args.save_path,
+                    f"stage3_sub{sub_stage_idx+1}_period{period_idx+1}",
+                )
+                save_stage3_checkpoint(model, ckpt_dir)
 
-            for i in range(bs):
-                lp1 = lp_s1[i].item()
-                lp2 = lp_s2[i].item()
+        resume_period_idx = 0
+        resume_period_states = None
+        resume_active_indices = None
 
-                # 排序：log prob 更高的为 y+
-                if lp2 > lp1:
-                    y_plus_ids[i] = s2_ids[i]
-                    y_minus_ids[i] = s1_ids[i]
-                    y_plus_mask[i] = s2_mask[i]
-                    y_minus_mask[i] = s1_mask[i]
-                    lp_minus_detached[i] = lp_s1[i]  # y- 换成 s1
-                # else: 默认 s1=y+, s2=y-, lp_minus_detached[i] 已是 lp_s2[i]
-
-                # 冷启动策略：仅当 y⁺ 置信度极低（生成质量太差、无法作为有效正样本）时
-                # 用教师回答 y_vic 替代。tau1=0.01 → 仅 avg per-token prob < 1% 时触发。
-                # 去掉 delta 条件，避免 epochs>1 时因 delta 过小导致全部退化为 SFT。
-                p_best = torch.exp(torch.tensor(max(lp1, lp2))).item()
-                if p_best < tau1:
-                    y_plus_ids[i] = y_vic_ids[i]
-                    y_plus_mask[i] = y_vic_mask[i]
-                    cold_start_count += 1
-
-            del lp_s1, lp_s2, s1_ids, s2_ids, s1_mask, s2_mask
-            del gen_output_1, gen_output_2
-
-            # ========== Step 4: LoRD 损失（带梯度，分拆 backward 省显存） ==========
-            # (a) y- 的 detached log prob：直接复用排序阶段已算过的 lp_minus_detached
-            seq_lp_minus_d = lp_minus_detached.detach()
-
-            # (b) y+ forward + backward
-            seq_lp_plus = _compute_generation_log_prob(
-                model, y_plus_ids, y_plus_mask, pixel_values, image_sizes, prompt_lens
-            )
-            L_obj_plus = -torch.mean(seq_lp_plus)
-            (L_obj_plus / grad_accum).backward()
-            L_obj_plus_val = L_obj_plus.item()
-            del seq_lp_plus, L_obj_plus
-
-            # (c) y_vic forward + backward (L_reg)
-            seq_lp_vic = _compute_generation_log_prob(
-                model, y_vic_ids, y_vic_mask, pixel_values, image_sizes, prompt_lens
-            )
-            L_reg = -torch.mean(log_clip(seq_lp_vic - seq_lp_minus_d))
-            (L_reg / grad_accum).backward()
-            L_reg_val = L_reg.item()
-            del seq_lp_vic, L_reg
-
-            # (d) y- forward + backward (L_obj_minus + VQ loss)
-            seq_lp_minus = _compute_generation_log_prob(
-                model, y_minus_ids, y_minus_mask, pixel_values, image_sizes, prompt_lens
-            )
-            L_obj_minus = torch.mean(seq_lp_minus)
-
-            vq_loss = model._vq_loss_container.get("loss", None)
-            if vq_loss is None or not isinstance(vq_loss, torch.Tensor):
-                vq_loss = torch.tensor(0.0, device=args.device)
-
-            ((L_obj_minus + args.beta * vq_loss) / grad_accum).backward()
-            L_obj_minus_val = L_obj_minus.item()
-            vq_loss_val = vq_loss.item() if isinstance(vq_loss, torch.Tensor) else 0.0
-            del seq_lp_minus, L_obj_minus, vq_loss, seq_lp_minus_d
-
-            # (e) optimizer step
-            did_optimizer_step = False
-            if (batch_idx + 1) % grad_accum == 0 or batch_idx == len(dataloader) - 1:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                did_optimizer_step = True
-
-            # 日志
-            L_obj_val = L_obj_plus_val + L_obj_minus_val
-            total_loss_val = L_obj_val + L_reg_val + args.beta * vq_loss_val
-
-            epoch_loss += total_loss_val
-            epoch_obj_loss += L_obj_val
-            epoch_reg_loss += L_reg_val
-            epoch_vq_loss += vq_loss_val
-
-            if global_step % args.log_step == 0:
-                print(f"Step {global_step}, Total: {total_loss_val:.4f}, "
-                      f"L_obj: {L_obj_val:.4f}, L_reg: {L_reg_val:.4f}, "
-                      f"VQ: {vq_loss_val:.4f}, cold_start: {cold_start_count}")
-                tb_writer.add_scalar("stage3/total_loss", total_loss_val, global_step)
-                tb_writer.add_scalar("stage3/L_obj", L_obj_val, global_step)
-                tb_writer.add_scalar("stage3/L_reg", L_reg_val, global_step)
-                tb_writer.add_scalar("stage3/vq_loss", vq_loss_val, global_step)
-
-            # 修复5: 只在 step 末尾清理一次显存
-            del input_ids, attention_mask, pixel_values, image_sizes, labels
-            del y_plus_ids, y_minus_ids, y_plus_mask, y_minus_mask
-            del y_vic_ids, y_vic_mask, prompt_ids_list, prompt_mask_list, prompt_lens, batch
-            torch.cuda.empty_cache()
-
-            if did_optimizer_step and args.save_step > 0 and global_step % args.save_step == 0:
-                _save_stage3_resume_state(epoch, batch_idx + 1)
-        
-        # Epoch 统计
-        num_batches = len(dataloader)
-        print(f"Epoch {epoch+1} 平均损失: Total={epoch_loss/num_batches:.4f}, "
-              f"L_obj={epoch_obj_loss/num_batches:.4f}, L_reg={epoch_reg_loss/num_batches:.4f}, "
-              f"VQ={epoch_vq_loss/num_batches:.4f}")
-        
-        # ========== 每个 Epoch 结束保存断点 ==========
-        print(f"保存 Stage3 断点 (epoch={epoch+1}, step={global_step})...")
-        _save_stage3_resume_state(epoch + 1, 0)
-        
-        # 同时保存当前 epoch 的独立检查点
-        save_stage3_checkpoint(model, os.path.join(args.save_path, f"stage3_epoch{epoch+1}"))
-
-        resume_batch_idx = 0
-    
     return model
 
 
@@ -2209,11 +2920,53 @@ def load_vq_codebook(model, codebook_path: str):
     print(f"已加载 VQ codebook: {codebook_path}")
 
 
+def _is_projector_param_name(name: str) -> bool:
+    name_l = str(name).lower()
+    return ("projector" in name_l) or ("multi_modal_projector" in name_l)
+
+
+def _extract_projector_state(model) -> dict:
+    projector_state = {}
+    for name, tensor in model.state_dict().items():
+        if _is_projector_param_name(name):
+            projector_state[name] = tensor.detach().cpu()
+    return projector_state
+
+
+def _save_projector_state(model, projector_path: str) -> int:
+    projector_state = _extract_projector_state(model)
+    if not projector_state:
+        print(f"[Warn] 未找到 projector 参数，跳过保存: {projector_path}")
+        return 0
+    torch.save(projector_state, projector_path)
+    print(f"已保存 projector 权重: {projector_path} (params={len(projector_state)})")
+    return len(projector_state)
+
+
+def _load_projector_state(model, projector_path: str) -> Tuple[int, int]:
+    if not os.path.exists(projector_path):
+        print(f"[Warn] 未找到 projector 权重文件，跳过加载: {projector_path}")
+        return 0, 0
+
+    state = torch.load(projector_path, map_location="cpu")
+    model_keys = set(model.state_dict().keys())
+    loadable_state = {k: v for k, v in state.items() if k in model_keys}
+    loaded = len(loadable_state)
+    skipped = max(0, len(state) - loaded)
+    if loadable_state:
+        model.load_state_dict(loadable_state, strict=False)
+    print(f"已加载 projector 权重: {projector_path} (loaded={loaded}, skipped={skipped})")
+    return loaded, skipped
+
+
 def save_stage2_checkpoint(model, args, ckpt_path: str):
     """保存 Stage2 检查点（包括 VQ codebook 和 LoRA 权重）"""
     os.makedirs(ckpt_path, exist_ok=True)
     
     save_vq_codebook(model, os.path.join(ckpt_path, "vq_codebook.pt"))
+
+    projector_path = os.path.join(ckpt_path, "projector.pt")
+    projector_param_count = _save_projector_state(model, projector_path)
     
     # 保存 LoRA 适配器
     model.save_pretrained(ckpt_path, safe_serialization=False)
@@ -2230,6 +2983,8 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
         "stage2_train_lora": 1,
         "stage2_train_codebook": 0,
         "stage2_answer_format": "letter",
+        "projector_state_path": "projector.pt",
+        "projector_state_param_count": int(projector_param_count),
     }
     with open(os.path.join(ckpt_path, "stage2_config.json"), "w") as f:
         json.dump(config_info, f, indent=2)
@@ -2260,6 +3015,9 @@ def load_stage2_checkpoint(model, ckpt_path: str):
             # 直接覆盖现有 default adapter，避免额外 adapter name 干扰 Stage3 参数遍历。
             model.load_state_dict(state_dict, strict=False)
         print(f"已加载 LoRA 权重: {ckpt_path}")
+
+    projector_path = os.path.join(ckpt_path, "projector.pt")
+    _load_projector_state(model, projector_path)
     
     print(f"Stage2 检查点加载完成")
     return model
@@ -2495,9 +3253,7 @@ def main():
             save_checkpoint(model, args, "stage2_vision")
     
     if args.stage >= 3:
-        stage3_dataloader = build_train_dataloader(stage_id=3)
-        log_dataloader_batch_stats("stage3_loader", stage3_dataloader, tb_writer)
-        model = train_stage3_lord(model, stage3_dataloader, args, tb_writer)
+        model = train_stage3_lord(model, train_dataset, args, tb_writer)
         save_stage3_checkpoint(model, os.path.join(args.save_path, "stage3_lord_final"))
     
     print("\n" + "=" * 60)

@@ -330,6 +330,7 @@ def load_model_and_processor(
 def run_eval(
     model,
     processor,
+    scienceqa_path: str,
     split: str,
     max_samples: int,
     max_new_tokens: int,
@@ -337,7 +338,7 @@ def run_eval(
     answer_mode: str,
     run_config: Optional[dict] = None,
 ):
-    dataset = load_dataset("/root/autodl-tmp/datasets/ScienceQA", split=split)
+    dataset = load_dataset(scienceqa_path, split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
     if max_samples > 0 and len(dataset_with_images) > max_samples:
@@ -451,6 +452,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="ScienceQA 多模态验证脚本")
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
+    parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="validation", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")
     parser.add_argument("--max_new_tokens", type=int, default=64, help="生成长度")
@@ -486,6 +488,7 @@ def main():
         "adapter_path": args.adapter_path,
         "adapter_loaded": load_info.get("adapter_loaded", False),
         "adapter_fingerprint": load_info.get("adapter_fingerprint"),
+        "scienceqa_path": args.scienceqa_path,
         "split": args.split,
         "max_samples": args.max_samples,
         "max_new_tokens": args.max_new_tokens,
@@ -499,6 +502,7 @@ def main():
     run_eval(
         model=model,
         processor=processor,
+        scienceqa_path=args.scienceqa_path,
         split=args.split,
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
