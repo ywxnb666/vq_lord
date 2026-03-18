@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import random
 import re
+import threading
 import torch
 from typing import List, Dict, Optional, Tuple, Any
 from PIL import Image
@@ -28,6 +29,7 @@ from io import BytesIO
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import load_dataset
 
 
@@ -529,6 +531,7 @@ TEACHER_REQUIRED_FIELDS = (
     "reasoning",
     "answer",
 )
+_THREAD_LOCAL = threading.local()
 
 
 def _safe_name(text: str) -> str:
@@ -593,7 +596,102 @@ def _extract_json_payload(text: str) -> Optional[dict]:
     return None
 
 
-def _normalize_struct_payload(payload: Optional[dict], budget: dict) -> Optional[dict]:
+def _normalize_match_text(text: str) -> str:
+    text = str(text or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _build_canonical_context(sample: Optional[dict]) -> str:
+    if not isinstance(sample, dict):
+        return ""
+    question = _strip_image_tokens(sample.get("question", ""))
+    hint = _strip_image_tokens(sample.get("hint", ""))
+    choices = sample.get("choices", []) or []
+    parts = []
+    if question:
+        parts.append(f"Question: {question}")
+    if hint:
+        parts.append(f"Hint: {hint}")
+    if choices:
+        option_lines = []
+        for idx, choice in enumerate(choices):
+            option_lines.append(f"({chr(65 + idx)}) {str(choice).strip()}")
+        parts.append("Options:\n" + "\n".join(option_lines))
+    return "\n".join(parts).strip()
+
+
+def _normalize_choice_answer(answer: str, sample: Optional[dict], max_tokens: int) -> str:
+    answer = _truncate_text_by_budget_estimate(answer, max_tokens)
+    if not isinstance(sample, dict):
+        return answer
+
+    choices = sample.get("choices", []) or []
+    if not choices:
+        return answer
+
+    max_letter = chr(65 + min(len(choices), 26) - 1)
+    letter_match = re.search(
+        rf"(?:option\s*)?\(?\s*([A-{max_letter}])\s*\)?",
+        answer,
+        flags=re.IGNORECASE,
+    )
+    if letter_match:
+        letter = letter_match.group(1).upper()
+        idx = ord(letter) - ord("A")
+        if 0 <= idx < len(choices):
+            return f"({letter}) {str(choices[idx]).strip()}".strip()
+
+    norm_answer = _normalize_match_text(answer)
+    for idx, choice in enumerate(choices):
+        choice_text = str(choice).strip()
+        norm_choice = _normalize_match_text(choice_text)
+        if not norm_choice:
+            continue
+        if norm_answer == norm_choice or norm_answer in norm_choice or norm_choice in norm_answer:
+            letter = chr(65 + idx)
+            return f"({letter}) {choice_text}".strip()
+
+    return answer
+
+
+def _has_observed_leakage(text: str) -> bool:
+    text_l = str(text or "").lower()
+    banned_substrings = [
+        "therefore",
+        "thus",
+        "hence",
+        "best fit",
+        "best matches",
+        "aligns best",
+        "option ",
+        "the answer",
+        "this means",
+        "so the",
+        "corresponds to",
+    ]
+    return any(s in text_l for s in banned_substrings)
+
+
+def _semantic_issue_flags(annotation: Optional[dict], sample: Optional[dict]) -> List[str]:
+    if not isinstance(annotation, dict):
+        return ["invalid_json_or_missing_fields"]
+
+    issues: List[str] = []
+    observed = str(annotation.get("observed_facts_visual", "")).strip()
+    answer = str(annotation.get("answer", "")).strip()
+    if _has_observed_leakage(observed):
+        issues.append("observed_leakage")
+
+    if isinstance(sample, dict) and (sample.get("choices") or []):
+        choices = sample.get("choices") or []
+        max_letter = chr(65 + min(len(choices), 26) - 1)
+        if not re.match(rf"^\(?[A-{max_letter}]\)?(?:\s+.*)?$", answer):
+            issues.append("answer_not_choice_like")
+    return issues
+
+
+def _normalize_struct_payload(payload: Optional[dict], budget: dict, sample: Optional[dict] = None) -> Optional[dict]:
     if not isinstance(payload, dict):
         return None
 
@@ -604,6 +702,9 @@ def _normalize_struct_payload(payload: Optional[dict], budget: dict) -> Optional
         "reasoning": payload.get("reasoning", ""),
         "answer": payload.get("answer", ""),
     }
+    canonical_context = _build_canonical_context(sample)
+    if canonical_context:
+        normalized["context_textual"] = canonical_context
     normalized["observed_facts_visual"] = _truncate_text_by_budget_estimate(
         normalized["observed_facts_visual"], int(budget.get("teacher_observed_max_tokens", 0))
     )
@@ -613,8 +714,10 @@ def _normalize_struct_payload(payload: Optional[dict], budget: dict) -> Optional
     normalized["reasoning"] = _truncate_text_by_budget_estimate(
         normalized["reasoning"], int(budget.get("teacher_reasoning_max_tokens", 0))
     )
-    normalized["answer"] = _truncate_text_by_budget_estimate(
-        normalized["answer"], int(budget.get("teacher_answer_max_tokens", 0))
+    normalized["answer"] = _normalize_choice_answer(
+        normalized["answer"],
+        sample=sample,
+        max_tokens=int(budget.get("teacher_answer_max_tokens", 0)),
     )
 
     for field in TEACHER_REQUIRED_FIELDS:
@@ -624,33 +727,41 @@ def _normalize_struct_payload(payload: Optional[dict], budget: dict) -> Optional
     return normalized
 
 
-def _build_structured_teacher_prompt(instruction: str, lang: str) -> str:
+def _build_structured_teacher_prompt(instruction: str, lang: str, extra_strict: bool = False) -> str:
     instruction = _strip_image_tokens(instruction)
     if str(lang).lower() == "zh":
-        return (
+        base_prompt = (
             "你是严谨的视觉科学题解答助手。\n"
             "请仅输出严格 JSON，必须且只包含以下键：\n"
             "observed_facts_visual, context_textual, reasoning, answer。\n"
             "规则：\n"
-            "1) observed_facts_visual 只写图像可见证据（可含 OCR）。\n"
-            "2) context_textual 只写题干与选项文本条件。\n"
-            "3) reasoning 写基于前两者的推理。\n"
-            "4) answer 写最终简洁答案。\n"
+            "1) observed_facts_visual 只写图像可见证据（可含 OCR），不要写推理、不要写选项匹配、不要写 '对应某地区/某国家/某答案' 之类判断。\n"
+            "2) context_textual 必须完整重述题干、提示与选项文本条件。\n"
+            "3) reasoning 写基于前两者的推理，可以引用选项，但不要把推理写进 observed_facts_visual。\n"
+            "4) answer 输出最终选项，优先格式 '(A) option text'。\n"
             "不要输出 markdown，不要额外字段。\n\n"
-            f"{instruction}"
         )
-    return (
+        extra_prompt = (
+            "额外强调：如果 observed_facts_visual 中出现 therefore/option/对应/最佳匹配 这类推理或选项判断，视为错误。\n\n"
+            if extra_strict else ""
+        )
+        return base_prompt + extra_prompt + instruction
+    base_prompt = (
         "You are a rigorous visual science QA assistant.\n"
         "Return strict JSON only with exactly keys:\n"
         "observed_facts_visual, context_textual, reasoning, answer.\n"
         "Rules:\n"
-        "1) observed_facts_visual: only image-observable evidence (OCR allowed).\n"
-        "2) context_textual: only textual conditions from question/options.\n"
-        "3) reasoning: explicit reasoning from (1)+(2).\n"
-        "4) answer: concise final answer.\n"
+        "1) observed_facts_visual: only image-observable evidence (OCR allowed); no inference, no option matching, no 'corresponds to', no final identification beyond what is directly visible.\n"
+        "2) context_textual: restate the full textual conditions from question, hint, and options.\n"
+        "3) reasoning: explicit reasoning from (1)+(2); option comparison belongs here, not in observed_facts_visual.\n"
+        "4) answer: final selected option, preferably in the form '(A) option text'.\n"
         "No markdown, no extra fields.\n\n"
-        f"{instruction}"
     )
+    extra_prompt = (
+        "Extra reminder: if observed_facts_visual contains words like therefore, best fit, aligns best, option, corresponds to, the output is invalid.\n\n"
+        if extra_strict else ""
+    )
+    return base_prompt + extra_prompt + instruction
 
 
 def _sample_key(sample: dict) -> str:
@@ -662,6 +773,67 @@ def _sample_key(sample: dict) -> str:
         size = f"{image.size[0]}x{image.size[1]}"
     raw = f"{instruction}\n{response}\n{size}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _dump_struct_cache(
+    cache_path: str,
+    cache_data: Dict[str, dict],
+    args: argparse.Namespace,
+    budget: dict,
+) -> None:
+    payload = {
+        "format_version": TEACHER_SCHEMA_VERSION,
+        "victim_model": args.victim_model,
+        "scienceqa_split": args.scienceqa_split,
+        "train_num": int(args.train_num),
+        "scienceqa_seed": int(args.scienceqa_seed),
+        "budget": budget,
+        "samples": cache_data,
+    }
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _get_thread_collector(args: argparse.Namespace) -> GPT4VDataCollector:
+    collector = getattr(_THREAD_LOCAL, "collector", None)
+    if collector is None:
+        collector = GPT4VDataCollector(
+            api_key=(args.teacher_api_key if args.teacher_api_key else None),
+            base_url=(args.teacher_api_base if args.teacher_api_base else None),
+            model=args.victim_model,
+            save_dir=args.data_dir,
+            max_retries=int(args.max_retries),
+        )
+        _THREAD_LOCAL.collector = collector
+    return collector
+
+
+def _collect_one_scienceqa_struct(
+    idx: int,
+    key: str,
+    sample: dict,
+    args: argparse.Namespace,
+    budget: dict,
+) -> Tuple[int, str, Optional[dict], Optional[str], List[str]]:
+    collector = _get_thread_collector(args)
+    image = sample.get("image")
+    raw_response = None
+    prompt = _build_structured_teacher_prompt(
+        sample.get("instruction", ""),
+        args.teacher_lang,
+        extra_strict=False,
+    )
+    if image is not None:
+        raw_response = collector.query_gpt4v_image(
+            image=image,
+            prompt=prompt,
+            max_tokens=int(args.teacher_max_new_tokens_total),
+            image_format="PNG",
+        )
+    parsed = _extract_json_payload(raw_response or "")
+    ann = _normalize_struct_payload(parsed, budget, sample=sample)
+    issues = _semantic_issue_flags(ann, sample)
+    return idx, key, ann, raw_response, issues
 
 
 def _build_scienceqa_samples(scienceqa_path: str, split: str, train_num: int, seed: int) -> List[dict]:
@@ -686,10 +858,12 @@ def _build_scienceqa_samples(scienceqa_path: str, split: str, train_num: int, se
         answer_idx = int(item.get("answer", 0))
         answer = choices[answer_idx] if choices and answer_idx < len(choices) else ""
         answer_letter = chr(65 + answer_idx) if 0 <= answer_idx < 26 else "A"
+        hint = item.get("hint", "")
         lecture = item.get("lecture", "")
         solution = item.get("solution", "")
 
-        instruction = f"<image>\nQuestion: {question}\nOptions:\n{choices_text}Answer:"
+        hint_block = f"Hint: {hint}\n" if hint else ""
+        instruction = f"<image>\nQuestion: {question}\n{hint_block}Options:\n{choices_text}Answer:"
         if lecture:
             response = f"Explanation: {lecture}\nSolution: {solution}\nAnswer: {answer}"
         else:
@@ -701,6 +875,7 @@ def _build_scienceqa_samples(scienceqa_path: str, split: str, train_num: int, se
                 "source_index": dataset_idx,
                 "image": item.get("image"),
                 "question": question,
+                "hint": item.get("hint", ""),
                 "choices": choices,
                 "answer_idx": answer_idx,
                 "answer_letter": answer_letter,
@@ -761,8 +936,21 @@ def collect_scienceqa_struct_annotations(args: argparse.Namespace):
     ready_from_cache = 0
     for i, sample in enumerate(samples):
         key = _sample_key(sample)
-        ann = _normalize_struct_payload(cache_data.get(key), budget)
-        if ann is not None:
+        existing = cache_data.get(key)
+        ann = _normalize_struct_payload(existing, budget, sample=sample)
+        issues = _semantic_issue_flags(ann, sample)
+        if ann is not None and not issues:
+            existing_meta = existing.get("meta", {}) if isinstance(existing, dict) else {}
+            existing_raw = existing.get("raw_teacher_response", "") if isinstance(existing, dict) else ""
+            cache_data[key] = {
+                "format_version": TEACHER_SCHEMA_VERSION,
+                "observed_facts_visual": ann["observed_facts_visual"],
+                "context_textual": ann["context_textual"],
+                "reasoning": ann["reasoning"],
+                "answer": ann["answer"],
+                "raw_teacher_response": existing_raw,
+                "meta": existing_meta,
+            }
             ready_from_cache += 1
         else:
             need_collect.append((i, key))
@@ -788,76 +976,67 @@ def collect_scienceqa_struct_annotations(args: argparse.Namespace):
                 print(f"warning: {msg}")
                 failed = len(need_collect)
             else:
-                for rank, (idx, key) in enumerate(
-                    tqdm(need_collect, desc="collect scienceqa struct teacher"),
-                    start=1,
-                ):
-                    sample = samples[idx]
-                    prompt = _build_structured_teacher_prompt(sample.get("instruction", ""), args.teacher_lang)
-                    image = sample.get("image")
-                    raw_response = None
-                    if image is not None:
-                        raw_response = collector.query_gpt4v_image(
-                            image=image,
-                            prompt=prompt,
-                            max_tokens=int(args.teacher_max_new_tokens_total),
-                            image_format="PNG",
-                        )
-                    parsed = _extract_json_payload(raw_response or "")
-                    ann = _normalize_struct_payload(parsed, budget)
-                    if ann is None:
-                        failed += 1
-                    else:
-                        cache_data[key] = {
-                            "format_version": TEACHER_SCHEMA_VERSION,
-                            "observed_facts_visual": ann["observed_facts_visual"],
-                            "context_textual": ann["context_textual"],
-                            "reasoning": ann["reasoning"],
-                            "answer": ann["answer"],
-                            "raw_teacher_response": _strip_image_tokens(raw_response or ""),
-                            "meta": {
-                                "teacher_model": args.victim_model,
-                                "teacher_lang": args.teacher_lang,
-                                "budget": budget,
-                                "source_index": int(sample.get("source_index", -1)),
-                                "sample_id": int(sample.get("sample_id", -1)),
-                            },
-                        }
-                        collected += 1
+                num_workers = max(1, int(args.num_workers))
+                print(f"collect num_workers={num_workers}")
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    future_to_item = {
+                        executor.submit(
+                            _collect_one_scienceqa_struct,
+                            idx,
+                            key,
+                            samples[idx],
+                            args,
+                            budget,
+                        ): (idx, key)
+                        for idx, key in need_collect
+                    }
+                    for rank, future in enumerate(
+                        tqdm(as_completed(future_to_item), total=len(future_to_item), desc="collect scienceqa struct teacher"),
+                        start=1,
+                    ):
+                        idx, key = future_to_item[future]
+                        sample = samples[idx]
+                        try:
+                            _, _, ann, raw_response, last_issues = future.result()
+                        except Exception as exc:
+                            ann = None
+                            raw_response = None
+                            last_issues = [f"worker_exception:{exc}"]
 
-                    if int(args.save_every) > 0 and (rank % int(args.save_every) == 0 or rank == len(need_collect)):
-                        payload = {
-                            "format_version": TEACHER_SCHEMA_VERSION,
-                            "victim_model": args.victim_model,
-                            "scienceqa_split": args.scienceqa_split,
-                            "train_num": int(args.train_num),
-                            "scienceqa_seed": int(args.scienceqa_seed),
-                            "budget": budget,
-                            "samples": cache_data,
-                        }
-                        with open(cache_path, "w", encoding="utf-8") as f:
-                            json.dump(payload, f, ensure_ascii=False, indent=2)
-                    if float(args.sleep_sec) > 0:
-                        time.sleep(float(args.sleep_sec))
+                        if ann is None or last_issues:
+                            failed += 1
+                        else:
+                            cache_data[key] = {
+                                "format_version": TEACHER_SCHEMA_VERSION,
+                                "observed_facts_visual": ann["observed_facts_visual"],
+                                "context_textual": ann["context_textual"],
+                                "reasoning": ann["reasoning"],
+                                "answer": ann["answer"],
+                                "raw_teacher_response": _strip_image_tokens(raw_response or ""),
+                                "meta": {
+                                    "teacher_model": args.victim_model,
+                                    "teacher_lang": args.teacher_lang,
+                                    "budget": budget,
+                                    "source_index": int(sample.get("source_index", -1)),
+                                    "sample_id": int(sample.get("sample_id", -1)),
+                                },
+                            }
+                            collected += 1
+
+                        if int(args.save_every) > 0 and (rank % int(args.save_every) == 0 or rank == len(need_collect)):
+                            _dump_struct_cache(cache_path, cache_data, args, budget)
+                        if float(args.sleep_sec) > 0:
+                            time.sleep(float(args.sleep_sec))
 
     missing = 0
     for sample in samples:
         key = _sample_key(sample)
-        ann = _normalize_struct_payload(cache_data.get(key), budget)
-        if ann is None:
+        ann = _normalize_struct_payload(cache_data.get(key), budget, sample=sample)
+        issues = _semantic_issue_flags(ann, sample)
+        if ann is None or issues:
             missing += 1
 
-    payload = {
-        "format_version": TEACHER_SCHEMA_VERSION,
-        "victim_model": args.victim_model,
-        "scienceqa_split": args.scienceqa_split,
-        "train_num": int(args.train_num),
-        "scienceqa_seed": int(args.scienceqa_seed),
-        "budget": budget,
-        "samples": cache_data,
-    }
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _dump_struct_cache(cache_path, cache_data, args, budget)
 
     print(
         f"collect done: cache={cache_path}, ready_from_cache={ready_from_cache}, "
@@ -894,6 +1073,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher_max_new_tokens_total", type=int, default=768)
 
     parser.add_argument("--max_retries", type=int, default=3)
+    parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--sleep_sec", type=float, default=0.0)
     return parser.parse_args()
