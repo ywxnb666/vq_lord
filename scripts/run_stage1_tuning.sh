@@ -52,7 +52,7 @@ fi
 export python="${default_python}"
 
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
@@ -72,10 +72,10 @@ export preprocess_dir="${save_dir}/preprocess"
 
 # 模型路径
 export model_path="${default_model_path}"
-export victim_model="gpt-4o-mini"
+export victim_model="qwen3.5-flash-2026-02-23"
 
-export OPENAI_BASE_URL="https://sg.uiuiapi.com/v1"
-export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
+export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export OPENAI_API_KEY="sk-abc8c59df2d64b7ba22718eae4fe80c2"
 
 # ================== VQ-LoRD 参数配置 ==================
 
@@ -236,8 +236,8 @@ mkdir -p $data_dir
 mkdir -p $preprocess_dir
 
 # 校验训练入口是否存在
-if [ ! -f "${root_dir}vq_lord2/train_vq_lord2.py" ]; then
-    echo "错误: 未找到训练入口 ${root_dir}vq_lord2/train_vq_lord2.py"
+if [ ! -f "${root_dir}vq_lord3/train_vq_lord3.py" ]; then
+    echo "错误: 未找到训练入口 ${root_dir}vq_lord3/train_vq_lord3.py"
     echo "当前 root_dir=${root_dir}"
     exit 1
 fi
@@ -293,7 +293,7 @@ run_train_stage() {
     echo "开始 Stage${stage_id} 训练，epochs=${stage_epochs}"
     echo "======================================================"
 
-    $python ${root_dir}vq_lord2/train_vq_lord2.py \
+    $python ${root_dir}vq_lord3/train_vq_lord3.py \
         --model_path=$model_path \
         --victim_model=$victim_model \
         --vq_codebook_size=$vq_codebook_size \

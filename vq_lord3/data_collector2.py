@@ -19,9 +19,11 @@ import json
 import base64
 import argparse
 import hashlib
+import tempfile
 import random
 import re
-import threading
+import subprocess
+import sys
 import torch
 from typing import List, Dict, Optional, Tuple, Any
 from PIL import Image
@@ -29,7 +31,6 @@ from io import BytesIO
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import load_dataset
 
 
@@ -218,7 +219,7 @@ class GPT4VDataCollector:
                 except Exception as e:
                     print(f"API 调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
                     if attempt < self.max_retries - 1:
-                        time.sleep(2 ** attempt)  # 指数退避
+                        time.sleep(2)
             
             return None
 
@@ -280,7 +281,7 @@ class GPT4VDataCollector:
                 except Exception as e:
                     print(f"API 调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
                     if attempt < self.max_retries - 1:
-                        time.sleep(2 ** attempt)
+                        time.sleep(2)
 
             return None
         except Exception as e:
@@ -531,7 +532,6 @@ TEACHER_REQUIRED_FIELDS = (
     "reasoning",
     "answer",
 )
-_THREAD_LOCAL = threading.local()
 
 
 def _safe_name(text: str) -> str:
@@ -551,6 +551,14 @@ def _strip_image_tokens(text: str) -> str:
     text = text.replace("< image >", "")
     text = text.replace("<Image>", "")
     return text.strip()
+
+
+def _is_null_like_text(text: Any) -> bool:
+    if text is None:
+        return True
+    if not isinstance(text, str):
+        return False
+    return text.strip().lower() in {"none", "null", "n/a", "na"}
 
 
 def _truncate_text_by_budget_estimate(text: str, max_tokens: int) -> str:
@@ -722,7 +730,7 @@ def _normalize_struct_payload(payload: Optional[dict], budget: dict, sample: Opt
 
     for field in TEACHER_REQUIRED_FIELDS:
         value = normalized.get(field)
-        if not isinstance(value, str) or len(value.strip()) == 0:
+        if not isinstance(value, str) or len(value.strip()) == 0 or _is_null_like_text(value):
             return None
     return normalized
 
@@ -764,7 +772,7 @@ def _build_structured_teacher_prompt(instruction: str, lang: str, extra_strict: 
     return base_prompt + extra_prompt + instruction
 
 
-def _sample_key(sample: dict) -> str:
+def _legacy_sample_key(sample: dict) -> str:
     instruction = sample.get("instruction", "")
     response = sample.get("response", "")
     image = sample.get("image")
@@ -773,6 +781,14 @@ def _sample_key(sample: dict) -> str:
         size = f"{image.size[0]}x{image.size[1]}"
     raw = f"{instruction}\n{response}\n{size}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _sample_key(sample: dict, split: Optional[str] = None) -> str:
+    source_index = sample.get("source_index")
+    if source_index is not None:
+        split_name = str(split or sample.get("split") or "unknown")
+        return f"scienceqa::{split_name}::{int(source_index)}"
+    return _legacy_sample_key(sample)
 
 
 def _dump_struct_cache(
@@ -790,55 +806,91 @@ def _dump_struct_cache(
         "budget": budget,
         "samples": cache_data,
     }
-    with open(cache_path, "w", encoding="utf-8") as f:
+    cache_dir = os.path.dirname(cache_path) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=cache_dir, delete=False) as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        temp_path = f.name
+    os.replace(temp_path, cache_path)
 
 
-def _get_thread_collector(args: argparse.Namespace) -> GPT4VDataCollector:
-    collector = getattr(_THREAD_LOCAL, "collector", None)
-    if collector is None:
-        collector = GPT4VDataCollector(
-            api_key=(args.teacher_api_key if args.teacher_api_key else None),
-            base_url=(args.teacher_api_base if args.teacher_api_base else None),
-            model=args.victim_model,
-            save_dir=args.data_dir,
-            max_retries=int(args.max_retries),
-        )
-        _THREAD_LOCAL.collector = collector
-    return collector
+def _normalize_loaded_cache_keys(
+    cache_data: Dict[str, dict],
+    split: str,
+) -> Tuple[Dict[str, dict], Dict[str, int]]:
+    normalized: Dict[str, dict] = {}
+    normalized_priority: Dict[str, int] = {}
+    stats = {
+        "stable_kept": 0,
+        "legacy_migrated": 0,
+        "duplicate_collisions": 0,
+        "stable_preferred": 0,
+        "dropped_invalid": 0,
+    }
+    stable_prefix = f"scienceqa::{split}::"
+
+    for old_key, old_value in cache_data.items():
+        if not isinstance(old_value, dict):
+            stats["dropped_invalid"] += 1
+            continue
+
+        new_key = None
+        source_priority = 0
+        if isinstance(old_key, str) and old_key.startswith(stable_prefix):
+            new_key = old_key
+            source_priority = 2
+            stats["stable_kept"] += 1
+        else:
+            meta = old_value.get("meta", {}) if isinstance(old_value.get("meta", {}), dict) else {}
+            source_index = meta.get("source_index")
+            if source_index is None:
+                stats["dropped_invalid"] += 1
+                continue
+            new_key = f"scienceqa::{split}::{int(source_index)}"
+            source_priority = 1
+            stats["legacy_migrated"] += 1
+
+        if new_key in normalized:
+            stats["duplicate_collisions"] += 1
+            if source_priority > normalized_priority.get(new_key, 0):
+                normalized[new_key] = old_value
+                normalized_priority[new_key] = source_priority
+                stats["stable_preferred"] += 1
+            continue
+        normalized[new_key] = old_value
+        normalized_priority[new_key] = source_priority
+
+    return normalized, stats
 
 
-def _collect_one_scienceqa_struct(
-    idx: int,
-    key: str,
-    sample: dict,
-    args: argparse.Namespace,
-    budget: dict,
-) -> Tuple[int, str, Optional[dict], Optional[str], List[str]]:
-    collector = _get_thread_collector(args)
-    image = sample.get("image")
-    raw_response = None
-    prompt = _build_structured_teacher_prompt(
-        sample.get("instruction", ""),
-        args.teacher_lang,
-        extra_strict=False,
-    )
-    if image is not None:
-        raw_response = collector.query_gpt4v_image(
-            image=image,
-            prompt=prompt,
-            max_tokens=int(args.teacher_max_new_tokens_total),
-            image_format="PNG",
-        )
-    parsed = _extract_json_payload(raw_response or "")
-    ann = _normalize_struct_payload(parsed, budget, sample=sample)
-    issues = _semantic_issue_flags(ann, sample)
-    return idx, key, ann, raw_response, issues
+def _load_cache_as_stable_map(cache_path: str, split: str) -> Dict[str, dict]:
+    if not cache_path or not os.path.exists(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        samples = payload.get("samples", {}) if isinstance(payload, dict) else {}
+        stable_map, _ = _normalize_loaded_cache_keys(samples or {}, split)
+        return stable_map
+    except Exception as exc:
+        print(f"warning: failed to load cache {cache_path}: {exc}")
+        return {}
+
+
+def _shard_indices(total: int, num_shards: int, shard_id: int) -> List[int]:
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    if shard_id < 0 or shard_id >= num_shards:
+        raise ValueError("shard_id out of range")
+    return [idx for idx in range(total) if idx % num_shards == shard_id]
 
 
 def _build_scienceqa_samples(scienceqa_path: str, split: str, train_num: int, seed: int) -> List[dict]:
     dataset = load_dataset(scienceqa_path, split=split)
-    dataset_with_images = [item for item in dataset if item.get("image") is not None]
+    dataset_with_images = []
+    for raw_train_index, item in enumerate(dataset):
+        if item.get("image") is not None:
+            dataset_with_images.append((raw_train_index, item))
 
     all_indices = list(range(len(dataset_with_images)))
     random.seed(seed)
@@ -848,7 +900,7 @@ def _build_scienceqa_samples(scienceqa_path: str, split: str, train_num: int, se
 
     samples = []
     for sampled_pos, dataset_idx in enumerate(all_indices):
-        item = dataset_with_images[dataset_idx]
+        raw_train_index, item = dataset_with_images[dataset_idx]
         question = item.get("question", "")
         choices = item.get("choices", [])
         choices_text = ""
@@ -873,6 +925,9 @@ def _build_scienceqa_samples(scienceqa_path: str, split: str, train_num: int, se
             {
                 "sample_id": sampled_pos,
                 "source_index": dataset_idx,
+                "filtered_source_index": dataset_idx,
+                "raw_train_index": raw_train_index,
+                "split": split,
                 "image": item.get("image"),
                 "question": question,
                 "hint": item.get("hint", ""),
@@ -887,8 +942,8 @@ def _build_scienceqa_samples(scienceqa_path: str, split: str, train_num: int, se
     return samples
 
 
-def collect_scienceqa_struct_annotations(args: argparse.Namespace):
-    budget = {
+def _build_budget(args: argparse.Namespace) -> dict:
+    return {
         "teacher_observed_max_tokens": int(args.teacher_observed_max_tokens),
         "teacher_context_max_tokens": int(args.teacher_context_max_tokens),
         "teacher_reasoning_max_tokens": int(args.teacher_reasoning_max_tokens),
@@ -896,28 +951,121 @@ def collect_scienceqa_struct_annotations(args: argparse.Namespace):
         "teacher_max_new_tokens_total": int(args.teacher_max_new_tokens_total),
     }
 
+
+def _resolve_cache_path(args: argparse.Namespace) -> str:
     if args.teacher_cache_path:
-        cache_path = args.teacher_cache_path
-    else:
-        victim_tag = _safe_name(args.victim_model)
-        cache_path = os.path.join(
-            args.data_dir,
-            f"scienceqa_teacher_{victim_tag}_{args.scienceqa_split}_"
-            f"n{args.train_num}_seed{args.scienceqa_seed}_new.json",
+        return args.teacher_cache_path
+    victim_tag = _safe_name(args.victim_model)
+    return os.path.join(
+        args.data_dir,
+        f"scienceqa_teacher_{victim_tag}_{args.scienceqa_split}_"
+        f"n{args.train_num}_seed{args.scienceqa_seed}_new.json",
+    )
+
+
+def _resolve_shard_output_path(final_cache_path: str, shard_id: int) -> str:
+    return f"{final_cache_path}.shard{int(shard_id):02d}.json"
+
+
+def _resolve_shard_index_path(final_cache_path: str, shard_id: int) -> str:
+    return f"{final_cache_path}.missing_idx.shard{int(shard_id):02d}.json"
+
+
+def _dump_index_list(index_path: str, indices: List[int]) -> None:
+    index_dir = os.path.dirname(index_path) or "."
+    os.makedirs(index_dir, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=index_dir, delete=False) as f:
+        json.dump({"indices": indices}, f, ensure_ascii=False)
+        temp_path = f.name
+    os.replace(temp_path, index_path)
+
+
+def _load_index_list(index_path: str) -> List[int]:
+    if not index_path:
+        return []
+    with open(index_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    indices = payload.get("indices", []) if isinstance(payload, dict) else []
+    if not isinstance(indices, list):
+        return []
+    return [int(v) for v in indices]
+
+
+def _build_cache_item(
+    ann: dict,
+    raw_response: Optional[str],
+    sample: dict,
+    args: argparse.Namespace,
+    budget: dict,
+    existing_meta: Optional[dict] = None,
+) -> dict:
+    meta = dict(existing_meta or {})
+    meta.update(
+        {
+            "teacher_model": args.victim_model,
+            "teacher_lang": args.teacher_lang,
+            "budget": budget,
+            "source_index": int(sample.get("source_index", -1)),
+            "filtered_source_index": int(sample.get("filtered_source_index", sample.get("source_index", -1))),
+            "raw_train_index": int(sample.get("raw_train_index", -1)),
+            "sample_id": int(sample.get("sample_id", -1)),
+        }
+    )
+    return {
+        "format_version": TEACHER_SCHEMA_VERSION,
+        "observed_facts_visual": ann["observed_facts_visual"],
+        "context_textual": ann["context_textual"],
+        "reasoning": ann["reasoning"],
+        "answer": ann["answer"],
+        "raw_teacher_response": _strip_image_tokens(raw_response or ""),
+        "meta": meta,
+    }
+
+
+def _validate_existing_entry(existing: Optional[dict], budget: dict, sample: dict) -> Optional[dict]:
+    ann = _normalize_struct_payload(existing, budget, sample=sample)
+    if ann is None:
+        return None
+    if _semantic_issue_flags(ann, sample):
+        return None
+    return ann
+
+
+def _collect_teacher_annotation(
+    collector: GPT4VDataCollector,
+    sample: dict,
+    args: argparse.Namespace,
+    budget: dict,
+) -> Tuple[Optional[dict], Optional[str], List[str]]:
+    image = sample.get("image")
+    raw_response = None
+    prompt = _build_structured_teacher_prompt(
+        sample.get("instruction", ""),
+        args.teacher_lang,
+        extra_strict=False,
+    )
+    if image is not None:
+        raw_response = collector.query_gpt4v_image(
+            image=image,
+            prompt=prompt,
+            max_tokens=int(args.teacher_max_new_tokens_total),
+            image_format="PNG",
         )
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    parsed = _extract_json_payload(raw_response or "")
+    ann = _normalize_struct_payload(parsed, budget, sample=sample)
+    issues = _semantic_issue_flags(ann, sample)
+    return ann, raw_response, issues
 
-    cache_data: Dict[str, dict] = {}
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if isinstance(payload, dict):
-                cache_data = payload.get("samples", {}) or {}
-            print(f"loaded cache: {cache_path}, entries={len(cache_data)}")
-        except Exception as exc:
-            print(f"warning: failed to load existing cache {cache_path}: {exc}")
 
+def _run_scienceqa_struct_worker(args: argparse.Namespace) -> None:
+    budget = _build_budget(args)
+    shard_output_path = args.shard_output_path
+    if not shard_output_path:
+        raise ValueError("worker task requires --shard_output_path")
+
+    final_cache_path = _resolve_cache_path(args)
+    source_cache_path = args.source_cache_path or final_cache_path
+    source_cache = _load_cache_as_stable_map(source_cache_path, args.scienceqa_split)
     samples = _build_scienceqa_samples(
         scienceqa_path=args.scienceqa_path,
         split=args.scienceqa_split,
@@ -927,130 +1075,315 @@ def collect_scienceqa_struct_annotations(args: argparse.Namespace):
     if int(args.max_samples) > 0 and len(samples) > int(args.max_samples):
         samples = samples[: int(args.max_samples)]
 
-    print(f"scienceqa samples with images: {len(samples)}")
-    print(f"split={args.scienceqa_split}, train_num={args.train_num}, seed={args.scienceqa_seed}")
-    print(f"victim_model={args.victim_model}, lang={args.teacher_lang}")
-    print(f"output cache: {cache_path}")
-
-    need_collect: List[Tuple[int, str]] = []
+    if args.index_file_path:
+        shard_indices = _load_index_list(args.index_file_path)
+    else:
+        shard_indices = _shard_indices(len(samples), int(args.num_workers), int(args.shard_id))
+    shard_cache: Dict[str, dict] = {}
     ready_from_cache = 0
-    for i, sample in enumerate(samples):
-        key = _sample_key(sample)
-        existing = cache_data.get(key)
-        ann = _normalize_struct_payload(existing, budget, sample=sample)
-        issues = _semantic_issue_flags(ann, sample)
-        if ann is not None and not issues:
+    recollected = 0
+    new_collected = 0
+    failed = 0
+
+    collector = None
+    needs_api = int(args.collect_teacher_data) == 1 and len(shard_indices) > 0
+    if needs_api:
+        collector = GPT4VDataCollector(
+            api_key=(args.teacher_api_key if args.teacher_api_key else None),
+            base_url=(args.teacher_api_base if args.teacher_api_base else None),
+            model=args.victim_model,
+            save_dir=args.data_dir,
+            max_retries=int(args.max_retries),
+        )
+        if not collector.api_key:
+            raise RuntimeError("collect_teacher_data=1 but missing API key")
+
+    for rank, sample_idx in enumerate(
+        tqdm(shard_indices, desc=f"worker shard {args.shard_id}/{args.num_workers}"),
+        start=1,
+    ):
+        sample = samples[sample_idx]
+        key = _sample_key(sample, split=args.scienceqa_split)
+        existing = source_cache.get(key)
+        ann = _validate_existing_entry(existing, budget, sample)
+        if ann is not None:
             existing_meta = existing.get("meta", {}) if isinstance(existing, dict) else {}
             existing_raw = existing.get("raw_teacher_response", "") if isinstance(existing, dict) else ""
-            cache_data[key] = {
-                "format_version": TEACHER_SCHEMA_VERSION,
-                "observed_facts_visual": ann["observed_facts_visual"],
-                "context_textual": ann["context_textual"],
-                "reasoning": ann["reasoning"],
-                "answer": ann["answer"],
-                "raw_teacher_response": existing_raw,
-                "meta": existing_meta,
-            }
+            shard_cache[key] = _build_cache_item(
+                ann,
+                existing_raw,
+                sample,
+                args,
+                budget,
+                existing_meta=existing_meta,
+            )
             ready_from_cache += 1
         else:
-            need_collect.append((i, key))
-    print(f"ready_from_cache={ready_from_cache}, need_collect={len(need_collect)}")
-
-    collected = 0
-    failed = 0
-    if need_collect:
-        if int(args.collect_teacher_data) != 1:
-            failed = len(need_collect)
-        else:
-            collector = GPT4VDataCollector(
-                api_key=(args.teacher_api_key if args.teacher_api_key else None),
-                base_url=(args.teacher_api_base if args.teacher_api_base else None),
-                model=args.victim_model,
-                save_dir=args.data_dir,
-                max_retries=int(args.max_retries),
-            )
-            if not collector.api_key:
-                msg = "collect_teacher_data=1 but missing API key"
-                if int(args.strict_teacher_distill) == 1:
-                    raise RuntimeError(msg)
-                print(f"warning: {msg}")
-                failed = len(need_collect)
+            if collector is None:
+                failed += 1
             else:
-                num_workers = max(1, int(args.num_workers))
-                print(f"collect num_workers={num_workers}")
-                with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                    future_to_item = {
-                        executor.submit(
-                            _collect_one_scienceqa_struct,
-                            idx,
-                            key,
-                            samples[idx],
-                            args,
-                            budget,
-                        ): (idx, key)
-                        for idx, key in need_collect
-                    }
-                    for rank, future in enumerate(
-                        tqdm(as_completed(future_to_item), total=len(future_to_item), desc="collect scienceqa struct teacher"),
-                        start=1,
-                    ):
-                        idx, key = future_to_item[future]
-                        sample = samples[idx]
-                        try:
-                            _, _, ann, raw_response, last_issues = future.result()
-                        except Exception as exc:
-                            ann = None
-                            raw_response = None
-                            last_issues = [f"worker_exception:{exc}"]
+                ann, raw_response, issues = _collect_teacher_annotation(collector, sample, args, budget)
+                if ann is None or issues:
+                    failed += 1
+                else:
+                    shard_cache[key] = _build_cache_item(ann, raw_response, sample, args, budget)
+                    if existing is not None:
+                        recollected += 1
+                    else:
+                        new_collected += 1
 
-                        if ann is None or last_issues:
-                            failed += 1
-                        else:
-                            cache_data[key] = {
-                                "format_version": TEACHER_SCHEMA_VERSION,
-                                "observed_facts_visual": ann["observed_facts_visual"],
-                                "context_textual": ann["context_textual"],
-                                "reasoning": ann["reasoning"],
-                                "answer": ann["answer"],
-                                "raw_teacher_response": _strip_image_tokens(raw_response or ""),
-                                "meta": {
-                                    "teacher_model": args.victim_model,
-                                    "teacher_lang": args.teacher_lang,
-                                    "budget": budget,
-                                    "source_index": int(sample.get("source_index", -1)),
-                                    "sample_id": int(sample.get("sample_id", -1)),
-                                },
-                            }
-                            collected += 1
+        if int(args.save_every) > 0 and (rank % int(args.save_every) == 0 or rank == len(shard_indices)):
+            _dump_struct_cache(shard_output_path, shard_cache, args, budget)
+        if float(args.sleep_sec) > 0:
+            time.sleep(float(args.sleep_sec))
 
-                        if int(args.save_every) > 0 and (rank % int(args.save_every) == 0 or rank == len(need_collect)):
-                            _dump_struct_cache(cache_path, cache_data, args, budget)
-                        if float(args.sleep_sec) > 0:
-                            time.sleep(float(args.sleep_sec))
+    _dump_struct_cache(shard_output_path, shard_cache, args, budget)
+    print(
+        f"worker_done shard={args.shard_id} total={len(shard_indices)} "
+        f"ready_from_cache={ready_from_cache} recollected={recollected} "
+        f"new_collected={new_collected} failed={failed} output={shard_output_path}"
+    )
+
+
+def _merge_shard_outputs(
+    args: argparse.Namespace,
+    final_cache_path: str,
+    budget: dict,
+    shard_artifacts: List[Tuple[str, str]],
+) -> Dict[str, int]:
+    merged: Dict[str, dict] = _load_cache_as_stable_map(args.source_cache_path or final_cache_path, args.scienceqa_split)
+    duplicate_keys = 0
+    shard_paths = [artifact[0] for artifact in shard_artifacts]
+    index_paths = [artifact[1] for artifact in shard_artifacts]
+    for shard_path in shard_paths:
+        if not os.path.exists(shard_path):
+            raise RuntimeError(f"missing shard output: {shard_path}")
+        shard_samples = _load_cache_as_stable_map(shard_path, args.scienceqa_split)
+        for key, value in shard_samples.items():
+            if key in merged:
+                duplicate_keys += 1
+            merged[key] = value
+    _dump_struct_cache(final_cache_path, merged, args, budget)
+    if int(args.keep_shards) != 1:
+        for shard_path in shard_paths:
+            try:
+                os.remove(shard_path)
+            except FileNotFoundError:
+                pass
+        for index_path in index_paths:
+            try:
+                os.remove(index_path)
+            except FileNotFoundError:
+                pass
+    return {
+        "merged_entries": len(merged),
+        "duplicate_keys": duplicate_keys,
+        "shard_count": len(shard_paths),
+    }
+
+
+def _spawn_sharded_workers(
+    args: argparse.Namespace,
+    worker_task: str,
+    final_cache_path: str,
+    assigned_indices_per_shard: Optional[List[List[int]]] = None,
+) -> List[Tuple[str, str]]:
+    num_workers = max(1, int(args.num_workers))
+    source_cache_path = args.source_cache_path or final_cache_path
+    shard_paths = [_resolve_shard_output_path(final_cache_path, shard_id) for shard_id in range(num_workers)]
+    index_paths = [_resolve_shard_index_path(final_cache_path, shard_id) for shard_id in range(num_workers)]
+    if assigned_indices_per_shard is None:
+        assigned_indices_per_shard = [[] for _ in range(num_workers)]
+    if len(assigned_indices_per_shard) != num_workers:
+        raise ValueError("assigned_indices_per_shard length must match num_workers")
+    procs = []
+    for shard_id, shard_path in enumerate(shard_paths):
+        index_path = index_paths[shard_id]
+        _dump_index_list(index_path, assigned_indices_per_shard[shard_id])
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--task", worker_task,
+            "--scienceqa_path", args.scienceqa_path,
+            "--scienceqa_split", args.scienceqa_split,
+            "--train_num", str(args.train_num),
+            "--scienceqa_seed", str(args.scienceqa_seed),
+            "--max_samples", str(args.max_samples),
+            "--data_dir", args.data_dir,
+            "--teacher_cache_path", final_cache_path,
+            "--source_cache_path", source_cache_path,
+            "--victim_model", args.victim_model,
+            "--teacher_lang", args.teacher_lang,
+            "--teacher_api_base", args.teacher_api_base,
+            "--teacher_api_key", args.teacher_api_key,
+            "--collect_teacher_data", str(args.collect_teacher_data),
+            "--strict_teacher_distill", str(args.strict_teacher_distill),
+            "--teacher_observed_max_tokens", str(args.teacher_observed_max_tokens),
+            "--teacher_context_max_tokens", str(args.teacher_context_max_tokens),
+            "--teacher_reasoning_max_tokens", str(args.teacher_reasoning_max_tokens),
+            "--teacher_answer_max_tokens", str(args.teacher_answer_max_tokens),
+            "--teacher_max_new_tokens_total", str(args.teacher_max_new_tokens_total),
+            "--max_retries", str(args.max_retries),
+            "--num_workers", str(num_workers),
+            "--save_every", str(args.save_every),
+            "--sleep_sec", str(args.sleep_sec),
+            "--shard_id", str(shard_id),
+            "--shard_output_path", shard_path,
+            "--index_file_path", index_path,
+            "--keep_shards", str(args.keep_shards),
+        ]
+        procs.append((shard_id, shard_path, index_path, subprocess.Popen(cmd)))
+
+    failed = []
+    for shard_id, shard_path, index_path, proc in procs:
+        ret = proc.wait()
+        if ret != 0:
+            failed.append((shard_id, ret, shard_path))
+    if failed:
+        raise RuntimeError(f"worker shards failed: {failed}")
+    return [(shard_paths[i], index_paths[i]) for i in range(num_workers)]
+
+
+def _find_missing_sample_indices(
+    samples: List[dict],
+    cache_data: Dict[str, dict],
+    budget: dict,
+    split: str,
+) -> List[int]:
+    missing_indices: List[int] = []
+    for sample_idx, sample in enumerate(samples):
+        key = _sample_key(sample, split=split)
+        ann = _normalize_struct_payload(cache_data.get(key), budget, sample=sample)
+        issues = _semantic_issue_flags(ann, sample)
+        if ann is None or issues:
+            missing_indices.append(sample_idx)
+    return missing_indices
+
+
+def _split_missing_indices(missing_indices: List[int], num_workers: int) -> List[List[int]]:
+    shards: List[List[int]] = [[] for _ in range(num_workers)]
+    for rank, sample_idx in enumerate(missing_indices):
+        shards[rank % num_workers].append(sample_idx)
+    return shards
+
+
+def _finalize_and_validate(args: argparse.Namespace, final_cache_path: str, budget: dict) -> None:
+    cache_data = _load_cache_as_stable_map(final_cache_path, args.scienceqa_split)
+    samples = _build_scienceqa_samples(
+        scienceqa_path=args.scienceqa_path,
+        split=args.scienceqa_split,
+        train_num=int(args.train_num),
+        seed=int(args.scienceqa_seed),
+    )
+    if int(args.max_samples) > 0 and len(samples) > int(args.max_samples):
+        samples = samples[: int(args.max_samples)]
 
     missing = 0
     for sample in samples:
-        key = _sample_key(sample)
+        key = _sample_key(sample, split=args.scienceqa_split)
         ann = _normalize_struct_payload(cache_data.get(key), budget, sample=sample)
         issues = _semantic_issue_flags(ann, sample)
         if ann is None or issues:
             missing += 1
 
-    _dump_struct_cache(cache_path, cache_data, args, budget)
-
     print(
-        f"collect done: cache={cache_path}, ready_from_cache={ready_from_cache}, "
-        f"new_collected={collected}, failed={failed}, missing={missing}"
+        f"collect done: cache={final_cache_path}, final_entries={len(cache_data)}, "
+        f"expected_samples={len(samples)}, missing={missing}"
     )
     if int(args.strict_teacher_distill) == 1 and missing > 0:
-        raise RuntimeError(
-            f"strict mode enabled, but still missing {missing} structured annotations"
-        )
+        raise RuntimeError(f"strict mode enabled, but still missing {missing} structured annotations")
+
+
+def collect_scienceqa_struct_annotations(args: argparse.Namespace):
+    budget = _build_budget(args)
+    final_cache_path = _resolve_cache_path(args)
+    os.makedirs(os.path.dirname(final_cache_path) or ".", exist_ok=True)
+    source_cache_path = args.source_cache_path or final_cache_path
+    source_cache = _load_cache_as_stable_map(source_cache_path, args.scienceqa_split)
+    samples = _build_scienceqa_samples(
+        scienceqa_path=args.scienceqa_path,
+        split=args.scienceqa_split,
+        train_num=int(args.train_num),
+        seed=int(args.scienceqa_seed),
+    )
+    if int(args.max_samples) > 0 and len(samples) > int(args.max_samples):
+        samples = samples[: int(args.max_samples)]
+
+    missing_indices = _find_missing_sample_indices(samples, source_cache, budget, args.scienceqa_split)
+    num_workers = max(1, int(args.num_workers))
+    assigned_indices_per_shard = _split_missing_indices(missing_indices, num_workers)
+    print(
+        f"collect coordinator num_workers={num_workers} output={final_cache_path} "
+        f"source_cache_entries={len(source_cache)} missing_indices={len(missing_indices)}"
+    )
+    if len(missing_indices) == 0:
+        _dump_struct_cache(final_cache_path, source_cache, args, budget)
+        print("collect coordinator: no missing indices, skip worker spawn")
+        _finalize_and_validate(args, final_cache_path, budget)
+        return
+
+    shard_artifacts = _spawn_sharded_workers(
+        args,
+        "collect_scienceqa_struct_worker",
+        final_cache_path,
+        assigned_indices_per_shard=assigned_indices_per_shard,
+    )
+    merge_stats = _merge_shard_outputs(args, final_cache_path, budget, shard_artifacts)
+    print(f"merge_stats={merge_stats}")
+    _finalize_and_validate(args, final_cache_path, budget)
+
+
+def repair_scienceqa_struct_cache(args: argparse.Namespace):
+    budget = _build_budget(args)
+    final_cache_path = _resolve_cache_path(args)
+    if not os.path.exists(final_cache_path):
+        raise FileNotFoundError(f"repair cache not found: {final_cache_path}")
+    args.source_cache_path = final_cache_path
+    source_cache = _load_cache_as_stable_map(final_cache_path, args.scienceqa_split)
+    samples = _build_scienceqa_samples(
+        scienceqa_path=args.scienceqa_path,
+        split=args.scienceqa_split,
+        train_num=int(args.train_num),
+        seed=int(args.scienceqa_seed),
+    )
+    if int(args.max_samples) > 0 and len(samples) > int(args.max_samples):
+        samples = samples[: int(args.max_samples)]
+    missing_indices = _find_missing_sample_indices(samples, source_cache, budget, args.scienceqa_split)
+    num_workers = max(1, int(args.num_workers))
+    assigned_indices_per_shard = _split_missing_indices(missing_indices, num_workers)
+    print(
+        f"repair coordinator num_workers={num_workers} cache={final_cache_path} "
+        f"source_cache_entries={len(source_cache)} missing_indices={len(missing_indices)}"
+    )
+    if len(missing_indices) == 0:
+        _dump_struct_cache(final_cache_path, source_cache, args, budget)
+        print("repair coordinator: no missing indices, skip worker spawn")
+        _finalize_and_validate(args, final_cache_path, budget)
+        return
+    shard_artifacts = _spawn_sharded_workers(
+        args,
+        "repair_scienceqa_struct_worker",
+        final_cache_path,
+        assigned_indices_per_shard=assigned_indices_per_shard,
+    )
+    merge_stats = _merge_shard_outputs(args, final_cache_path, budget, shard_artifacts)
+    print(f"repair_merge_stats={merge_stats}")
+    _finalize_and_validate(args, final_cache_path, budget)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="VQ-LoRD data collector")
-    parser.add_argument("--task", type=str, default="collect_scienceqa_struct", choices=["collect_scienceqa_struct"])
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="collect_scienceqa_struct",
+        choices=[
+            "collect_scienceqa_struct",
+            "collect_scienceqa_struct_worker",
+            "repair_scienceqa_struct_cache",
+            "repair_scienceqa_struct_worker",
+        ],
+    )
     parser.add_argument("--scienceqa_path", type=str, required=True)
     parser.add_argument("--scienceqa_split", type=str, default="train")
     parser.add_argument("--train_num", type=int, default=0, help="0 means full split")
@@ -1059,6 +1392,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--data_dir", type=str, default="./vq_lord_data")
     parser.add_argument("--teacher_cache_path", type=str, default="")
+    parser.add_argument("--source_cache_path", type=str, default="")
     parser.add_argument("--victim_model", type=str, default="gpt-4o")
     parser.add_argument("--teacher_lang", type=str, default="en", choices=["zh", "en"])
     parser.add_argument("--teacher_api_base", type=str, default=os.environ.get("OPENAI_API_BASE", ""))
@@ -1074,6 +1408,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max_retries", type=int, default=3)
     parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--shard_id", type=int, default=0)
+    parser.add_argument("--shard_output_path", type=str, default="")
+    parser.add_argument("--index_file_path", type=str, default="")
+    parser.add_argument("--keep_shards", type=int, default=0)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--sleep_sec", type=float, default=0.0)
     return parser.parse_args()
@@ -1081,4 +1419,13 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    collect_scienceqa_struct_annotations(args)
+    if args.task == "collect_scienceqa_struct":
+        collect_scienceqa_struct_annotations(args)
+    elif args.task == "collect_scienceqa_struct_worker":
+        _run_scienceqa_struct_worker(args)
+    elif args.task == "repair_scienceqa_struct_cache":
+        repair_scienceqa_struct_cache(args)
+    elif args.task == "repair_scienceqa_struct_worker":
+        _run_scienceqa_struct_worker(args)
+    else:
+        raise ValueError(f"unsupported task: {args.task}")

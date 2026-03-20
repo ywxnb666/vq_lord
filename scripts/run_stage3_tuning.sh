@@ -53,8 +53,7 @@ export stage1_codebook_path="${STAGE1_CODEBOOK_PATH:-${stage2_base_dir}/stage1_v
 ts="$(date +%Y%m%d_%H%M%S)"
 export save_dir="${SAVE_DIR:-${default_stage3_root}/run_${ts}}"
 export stage3_resume_dir="${STAGE3_RESUME_DIR:-${save_dir}/stage3_resume_latest}"
-
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -134,7 +133,7 @@ export stage2_grad_accum="${STAGE2_GRAD_ACCUM:-4}"
 export log_step="${LOG_STEP:-50}"
 export save_step="${SAVE_STEP:-200}"
 export save_each_epoch="${SAVE_EACH_EPOCH:-1}"
-export victim_model="${VICTIM_MODEL:-gpt-4o-mini}"
+export victim_model="${VICTIM_MODEL:-qwen3.5-flash-2026-02-23}"
 
 # 评估配置（Stage3 后）
 export eval_max_samples="${EVAL_MAX_SAMPLES:-500}"
@@ -164,8 +163,8 @@ echo "======================================================"
 
 mkdir -p "${save_dir}"
 
-train_entry="${root_dir}vq_lord2/train_vq_lord2.py"
-eval_entry="${root_dir}vq_lord2/sciqa_process.py"
+train_entry="${root_dir}vq_lord3/train_vq_lord3.py"
+eval_entry="${root_dir}vq_lord3/sciqa_process.py"
 if [ ! -f "${train_entry}" ]; then
     echo "错误: 未找到训练入口 ${train_entry}"
     exit 1

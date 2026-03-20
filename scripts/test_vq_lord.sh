@@ -54,7 +54,7 @@ export python="${default_python}"
 #     echo "使用 GPU: $CUDA_VISIBLE_DEVICES"
 # fi
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=3
 
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
@@ -98,8 +98,8 @@ mkdir -p $save_dir
 mkdir -p $data_dir
 
 # 校验测试入口是否存在
-if [ ! -f "${root_dir}vq_lord/sciqa_process.py" ]; then
-    echo "错误: 未找到测试入口 ${root_dir}vq_lord/sciqa_process.py"
+if [ ! -f "${root_dir}vq_lord3/sciqa_process.py" ]; then
+    echo "错误: 未找到测试入口 ${root_dir}vq_lord3/sciqa_process.py"
     echo "当前 root_dir=${root_dir}"
     exit 1
 fi
@@ -114,7 +114,7 @@ echo "======================================================"
 echo "开始 ScienceQA 验证"
 echo "======================================================"
 
-$python ${root_dir}vq_lord/sciqa_process.py \
+$python ${root_dir}vq_lord3/sciqa_process.py \
     --model_path=$model_path \
     --adapter_path=$adapter_path \
     --split=$scienceqa_eval_split \

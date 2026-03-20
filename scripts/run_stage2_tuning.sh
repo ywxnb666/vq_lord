@@ -45,7 +45,7 @@ else
 fi
 export python="${default_python}"
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -63,10 +63,10 @@ export preprocess_dir="${base_ckpt_dir}/preprocess"
 
 # 模型路径
 export model_path="${default_model_path}"
-export victim_model="gpt-4o-mini"
+export victim_model="qwen3.5-flash-2026-02-23"
 
-export OPENAI_BASE_URL="https://sg.uiuiapi.com/v1"
-export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
+export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export OPENAI_API_KEY="sk-abc8c59df2d64b7ba22718eae4fe80c2"
 
 # ================== Stage2 调参参数（对齐上次全量 Stage2 计划） ==================
 
@@ -136,8 +136,8 @@ export preprocess_bucket_batch_size=4
 export scienceqa_preprocessed_path="${preprocess_dir}/scienceqa_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_${bucket_by}_bs${preprocess_bucket_batch_size}.json"
 
 # checkpoint 复用策略
-export stage1_codebook_path="${base_ckpt_dir}/stage1_vq_epoch40/vq_codebook.pt"
-export stage2_ckpt_path="${save_dir}/stage2_vision"
+export stage1_codebook_path="${base_ckpt_dir}/../vq_lord_ckpts_stage2_tune/round1_e3/stage2_vision_epoch15/vq_codebook.pt"
+export stage2_ckpt_path="${save_dir}/stage2_vision_epoch15"
 export reuse_vq_codebook=1
 export reuse_stage2=0
 
@@ -165,7 +165,7 @@ export stage3_smoke_save_dir="${save_dir}/stage3_smoke"
 
 # H200 专用 Stage2 推荐参数（仅在 USE_H200_PATHS=1 生效）
 if [ "${USE_H200_PATHS}" = "1" ]; then
-    export stage2_epochs=20
+    export stage2_epochs=15
     export batch_size=8
     export grad_accum=4
     export stage2_grad_accum=4
@@ -174,7 +174,7 @@ if [ "${USE_H200_PATHS}" = "1" ]; then
     export bucket_batch_size=8
     export stage3_bucket_batch_size=8
     export preprocess_bucket_batch_size=8
-    export log_step=50
+    export log_step=100
     export eval_max_samples=500
 fi
 
@@ -204,8 +204,8 @@ mkdir -p "$save_dir"
 mkdir -p "$data_dir"
 mkdir -p "$preprocess_dir"
 
-if [ ! -f "${root_dir}vq_lord2/train_vq_lord2.py" ]; then
-    echo "错误: 未找到训练入口 ${root_dir}vq_lord2/train_vq_lord2.py"
+if [ ! -f "${root_dir}vq_lord3/train_vq_lord3.py" ]; then
+    echo "错误: 未找到训练入口 ${root_dir}vq_lord3/train_vq_lord3.py"
     exit 1
 fi
 
@@ -214,8 +214,8 @@ if [ ! -f "${root_dir}data_preprocess/sciqa_preprocess.py" ]; then
     exit 1
 fi
 
-if [ ! -f "${root_dir}vq_lord2/sciqa_process.py" ]; then
-    echo "错误: 未找到评估脚本 ${root_dir}vq_lord2/sciqa_process.py"
+if [ ! -f "${root_dir}vq_lord3/sciqa_process.py" ]; then
+    echo "错误: 未找到评估脚本 ${root_dir}vq_lord3/sciqa_process.py"
     exit 1
 fi
 
@@ -252,67 +252,67 @@ if [ ! -f "$scienceqa_preprocessed_path" ]; then
     exit 1
 fi
 
-"$python" "${root_dir}vq_lord2/train_vq_lord2.py" \
-    --model_path="$model_path" \
-    --victim_model="$victim_model" \
-    --vq_codebook_size="$vq_codebook_size" \
-    --vq_commitment_cost="$vq_commitment_cost" \
-    --vq_dead_code_threshold="$vq_dead_code_threshold" \
-    --vq_usage_decay="$vq_usage_decay" \
-    --vq_dead_code_reset_interval="$vq_dead_code_reset_interval" \
-    --vq_legacy_loss="$vq_legacy_loss" \
-    --freeze_vision_tower="$freeze_vision_tower" \
-    --beta="$beta" \
-    --temperature="$temperature" \
-    --tau1="$tau1" \
-    --stage="$stage" \
-    --epochs="$stage2_epochs" \
-    --batch_size="$batch_size" \
-    --lr="$lr" \
-    --stage1_lr="$stage1_lr" \
-    --stage1_recon_weight="$stage1_recon_weight" \
-    --stage1_cosine_weight="$stage1_cosine_weight" \
-    --stage1_vq_weight="$stage1_vq_weight" \
-    --stage1_grad_clip="$stage1_grad_clip" \
-    --max_length="$max_length" \
-    --use_lora="$use_lora" \
-    --lora_rank="$lora_rank" \
-    --lora_alpha="$lora_alpha_val" \
-    --use_4bit="$use_4bit" \
-    --model_dtype="$model_dtype" \
-    --grad_accum="$grad_accum" \
-    --stage2_grad_accum="$stage2_grad_accum" \
-    --stage2_answer_weight="$stage2_answer_weight" \
-    --stage2_rationale_weight="$stage2_rationale_weight" \
-    --stage2_prepost_lr_scale="$stage2_prepost_lr_scale" \
-    --stage2_vision_lr_scale="$stage2_vision_lr_scale" \
-    --stage2_grad_clip="$stage2_grad_clip" \
-    --stage3_grad_accum="$stage3_grad_accum" \
-    --stage3_lr_scale="$stage3_lr_scale" \
-    --stage3_train_projector="$stage3_train_projector" \
-    --max_new_tokens="$max_new_tokens" \
-    --data_dir="$data_dir" \
-    --train_num="$train_num" \
-    --dataset_name="$dataset_name" \
-    --scienceqa_path="$scienceqa_path" \
-    --scienceqa_split="$scienceqa_split" \
-    --scienceqa_seed="$scienceqa_seed" \
-    --scienceqa_preprocessed_path="$scienceqa_preprocessed_path" \
-    --bucket_batch_size="$bucket_batch_size" \
-    --stage3_bucket_batch_size="$stage3_bucket_batch_size" \
-    --disable_bucket_for_stage3="$disable_bucket_for_stage3" \
-    --collect_teacher_data="$collect_teacher_data" \
-    --strict_teacher_distill="$strict_teacher_distill" \
-    --teacher_lang="$teacher_lang" \
-    --reuse_vq_codebook="$reuse_vq_codebook" \
-    --reuse_stage2="$reuse_stage2" \
-    --vq_codebook_path="$stage1_codebook_path" \
-    --stage2_ckpt_path="$stage2_ckpt_path" \
-    --save_path="$save_dir" \
-    --log_step="$log_step" \
-    --save_step="$save_step" \
-    --save_each_epoch="$save_each_epoch" \
-    --device="cuda"
+# "$python" "${root_dir}vq_lord3/train_vq_lord3.py" \
+#     --model_path="$model_path" \
+#     --victim_model="$victim_model" \
+#     --vq_codebook_size="$vq_codebook_size" \
+#     --vq_commitment_cost="$vq_commitment_cost" \
+#     --vq_dead_code_threshold="$vq_dead_code_threshold" \
+#     --vq_usage_decay="$vq_usage_decay" \
+#     --vq_dead_code_reset_interval="$vq_dead_code_reset_interval" \
+#     --vq_legacy_loss="$vq_legacy_loss" \
+#     --freeze_vision_tower="$freeze_vision_tower" \
+#     --beta="$beta" \
+#     --temperature="$temperature" \
+#     --tau1="$tau1" \
+#     --stage="$stage" \
+#     --epochs="$stage2_epochs" \
+#     --batch_size="$batch_size" \
+#     --lr="$lr" \
+#     --stage1_lr="$stage1_lr" \
+#     --stage1_recon_weight="$stage1_recon_weight" \
+#     --stage1_cosine_weight="$stage1_cosine_weight" \
+#     --stage1_vq_weight="$stage1_vq_weight" \
+#     --stage1_grad_clip="$stage1_grad_clip" \
+#     --max_length="$max_length" \
+#     --use_lora="$use_lora" \
+#     --lora_rank="$lora_rank" \
+#     --lora_alpha="$lora_alpha_val" \
+#     --use_4bit="$use_4bit" \
+#     --model_dtype="$model_dtype" \
+#     --grad_accum="$grad_accum" \
+#     --stage2_grad_accum="$stage2_grad_accum" \
+#     --stage2_answer_weight="$stage2_answer_weight" \
+#     --stage2_rationale_weight="$stage2_rationale_weight" \
+#     --stage2_prepost_lr_scale="$stage2_prepost_lr_scale" \
+#     --stage2_vision_lr_scale="$stage2_vision_lr_scale" \
+#     --stage2_grad_clip="$stage2_grad_clip" \
+#     --stage3_grad_accum="$stage3_grad_accum" \
+#     --stage3_lr_scale="$stage3_lr_scale" \
+#     --stage3_train_projector="$stage3_train_projector" \
+#     --max_new_tokens="$max_new_tokens" \
+#     --data_dir="$data_dir" \
+#     --train_num="$train_num" \
+#     --dataset_name="$dataset_name" \
+#     --scienceqa_path="$scienceqa_path" \
+#     --scienceqa_split="$scienceqa_split" \
+#     --scienceqa_seed="$scienceqa_seed" \
+#     --scienceqa_preprocessed_path="$scienceqa_preprocessed_path" \
+#     --bucket_batch_size="$bucket_batch_size" \
+#     --stage3_bucket_batch_size="$stage3_bucket_batch_size" \
+#     --disable_bucket_for_stage3="$disable_bucket_for_stage3" \
+#     --collect_teacher_data="$collect_teacher_data" \
+#     --strict_teacher_distill="$strict_teacher_distill" \
+#     --teacher_lang="$teacher_lang" \
+#     --reuse_vq_codebook="$reuse_vq_codebook" \
+#     --reuse_stage2="$reuse_stage2" \
+#     --vq_codebook_path="$stage1_codebook_path" \
+#     --stage2_ckpt_path="$stage2_ckpt_path" \
+#     --save_path="$save_dir" \
+#     --log_step="$log_step" \
+#     --save_step="$save_step" \
+#     --save_each_epoch="$save_each_epoch" \
+#     --device="cuda"
 
 echo "======================================================"
 echo "Stage2 训练完成，开始 Validation 评估"
@@ -324,7 +324,7 @@ if [ ! -f "$stage2_vq_codebook_path" ]; then
     exit 1
 fi
 
-"$python" "${root_dir}vq_lord2/sciqa_process.py" \
+"$python" "${root_dir}vq_lord3/sciqa_process.py" \
     --model_path="$model_path" \
     --adapter_path="$stage2_ckpt_path" \
     --scienceqa_path="$scienceqa_path" \
@@ -406,7 +406,7 @@ if [ "$decision" = "GO_STAGE3" ]; then
     if [ "${AUTO_STAGE3_SMOKE}" = "1" ]; then
         echo "[Stage3 Smoke] AUTO_STAGE3_SMOKE=1，开始小步验证..."
         mkdir -p "$stage3_smoke_save_dir"
-        "$python" "${root_dir}vq_lord2/train_vq_lord2.py" \
+        "$python" "${root_dir}vq_lord3/train_vq_lord3.py" \
             --model_path="$model_path" \
             --victim_model="$victim_model" \
             --vq_codebook_size="$vq_codebook_size" \
@@ -425,7 +425,7 @@ if [ "$decision" = "GO_STAGE3" ]; then
             --lr="$lr" \
             --stage1_lr="$stage1_lr" \
             --stage1_recon_weight="$stage1_recon_weight" \
-            --stage1_cosine_weight="$stage1_cosine_weight" \无jc ji
+            --stage1_cosine_weight="$stage1_cosine_weight" \
             --stage1_vq_weight="$stage1_vq_weight" \
             --stage1_grad_clip="$stage1_grad_clip" \
             --max_length="$max_length" \

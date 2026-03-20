@@ -114,10 +114,12 @@ def build_scienceqa_samples(
         answer_idx = int(item.get("answer", 0))
         answer = choices[answer_idx] if choices and answer_idx < len(choices) else ""
         answer_letter = chr(65 + answer_idx) if 0 <= answer_idx < 26 else "A"
+        hint = item.get("hint", "")
         lecture = item.get("lecture", "")
         solution = item.get("solution", "")
 
-        instruction = f"<image>\nQuestion: {question}\nOptions:\n{choices_text}Answer:"
+        hint_block = f"Hint: {hint}\n" if hint else ""
+        instruction = f"<image>\nQuestion: {question}\n{hint_block}Options:\n{choices_text}Answer:"
         if lecture:
             response = f"Explanation: {lecture}\nSolution: {solution}\nAnswer: {answer}"
         else:
@@ -126,8 +128,10 @@ def build_scienceqa_samples(
         samples.append({
             "sample_id": sampled_pos,
             "source_index": dataset_idx,
+            "split": split,
             "image": item.get("image"),
             "question": question,
+            "hint": hint,
             "choices": choices,
             "answer_idx": answer_idx,
             "answer_letter": answer_letter,
@@ -150,6 +154,11 @@ def _safe_name(text: str) -> str:
 
 
 def _sample_key(sample: dict) -> str:
+    source_index = sample.get("source_index")
+    if source_index is not None:
+        split_name = str(sample.get("split") or "unknown")
+        return f"scienceqa::{split_name}::{int(source_index)}"
+
     instruction = sample.get("instruction", "")
     response = sample.get("response", "")
     image = sample.get("image")
@@ -268,6 +277,37 @@ def _extract_json_payload(text: str) -> Optional[dict]:
     return None
 
 
+def _normalize_loaded_cache_keys(cache_data: dict, split: str) -> Dict[str, dict]:
+    if not isinstance(cache_data, dict):
+        return {}
+
+    normalized = {}
+    normalized_priority = {}
+    stable_prefix = f"scienceqa::{split}::"
+
+    for old_key, old_value in cache_data.items():
+        if not isinstance(old_value, dict):
+            continue
+
+        if isinstance(old_key, str) and old_key.startswith(stable_prefix):
+            new_key = old_key
+            source_priority = 2
+        else:
+            meta = old_value.get("meta", {}) if isinstance(old_value.get("meta", {}), dict) else {}
+            source_index = meta.get("source_index")
+            if source_index is None:
+                continue
+            new_key = f"scienceqa::{split}::{int(source_index)}"
+            source_priority = 1
+
+        if new_key in normalized and source_priority <= normalized_priority.get(new_key, 0):
+            continue
+        normalized[new_key] = old_value
+        normalized_priority[new_key] = source_priority
+
+    return normalized
+
+
 def _normalize_teacher_annotation(
     payload: Optional[dict],
     budget: dict,
@@ -343,7 +383,7 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
     说明：
     - 若缓存存在，优先读取缓存；
     - 若启用采集且存在 API key，则补齐缺失项；
-    - 若 strict_teacher_distill=1 且仍有缺失，将直接报错。
+    - vq_lord3 对 teacher_annotation 四字段实行强门禁，仍有缺失将直接报错。
     """
     os.makedirs(args.data_dir, exist_ok=True)
 
@@ -371,7 +411,8 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
             with open(cache_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             if isinstance(payload, dict):
-                cache_data = payload.get("samples", {}) or {}
+                raw_cache_data = payload.get("samples", {}) or {}
+                cache_data = _normalize_loaded_cache_keys(raw_cache_data, args.scienceqa_split)
                 if payload.get("format_version") not in (None, TEACHER_SCHEMA_VERSION):
                     print(
                         f"警告: 教师缓存 format_version={payload.get('format_version')}，"
@@ -405,13 +446,10 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
         )
 
         if not collector.api_key:
-            msg = (
+            raise RuntimeError(
                 "需要采集四字段教师标注，但未检测到 API Key。"
                 "可通过 --teacher_api_key 或 OPENAI_API_KEY 提供。"
             )
-            if int(args.strict_teacher_distill):
-                raise RuntimeError(msg)
-            print(f"警告: {msg}")
         else:
             print(f"开始采集四字段教师标注，待补齐样本数: {len(need_collect)}")
             for rank, (idx, key) in enumerate(tqdm(need_collect, desc="采集四字段教师标注"), start=1):
@@ -469,47 +507,25 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
                             indent=2,
                         )
 
-    # schema v2 门禁与兜底（非 strict 下允许用数据集答案构造弱标注）
-    fallback_count = 0
+    # schema v2 强门禁：vq_lord3 不再兼容旧 explanation+answer 字符串路径。
     missing = 0
     for sample in samples:
         ann = _normalize_teacher_annotation(sample.get("teacher_annotation"), budget)
         if ann is not None:
             sample["teacher_annotation"] = ann
             continue
-
-        if int(args.strict_teacher_distill):
-            missing += 1
-            continue
-
-        answer_letter = str(sample.get("answer_letter", "A") or "A").strip().upper()[:1]
-        answer_text = sample.get("answer_text", "")
-        instruction_text = _strip_image_tokens(sample.get("instruction", ""))
-        rationale = _extract_teacher_rationale(sample.get("response", ""))
-        weak_ann = _normalize_teacher_annotation(
-            {
-                "observed_facts_visual": "visual evidence not available in fallback mode",
-                "context_textual": instruction_text,
-                "reasoning": rationale if rationale else "fallback reasoning from dataset solution",
-                "answer": f"{answer_letter} {answer_text}".strip(),
-            },
-            budget,
-        )
-        if weak_ann is None:
-            missing += 1
-            continue
-        sample["teacher_annotation"] = weak_ann
-        sample["teacher_source"] = "fallback_dataset"
-        fallback_count += 1
+        missing += 1
 
     print(
         f"教师样本统计(v2): total={len(samples)}, "
-        f"from_{args.victim_model}={from_teacher}, fallback={fallback_count}, missing={missing}"
+        f"from_{args.victim_model}={from_teacher}, missing={missing}"
     )
 
     if missing > 0:
         raise RuntimeError(
-            "存在样本缺失四字段 teacher_annotation。请提供 *_new.json 缓存或开启采集。"
+            "存在样本缺失四字段 teacher_annotation。"
+            "vq_lord3 不再兼容旧 explanation+answer 缓存；"
+            "请提供完整 *_new.json 或开启采集补齐。"
         )
 
     return samples
@@ -533,6 +549,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
         teacher_reasoning_max_tokens: int = 256,
         teacher_answer_max_tokens: int = 64,
         stage3_vic_include_context: bool = False,
+        require_teacher_annotation: bool = False,
     ):
         self.processor = processor
         self.max_length = max_length
@@ -542,6 +559,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
         self.teacher_reasoning_max_tokens = int(teacher_reasoning_max_tokens)
         self.teacher_answer_max_tokens = int(teacher_answer_max_tokens)
         self.stage3_vic_include_context = bool(stage3_vic_include_context)
+        self.require_teacher_annotation = bool(require_teacher_annotation)
 
         if samples is None:
             samples = build_scienceqa_samples(
@@ -601,6 +619,12 @@ class ScienceQADataset(torch.utils.data.Dataset):
         answer_target = f"Answer: {answer_letter}"
         ann = item.get("teacher_annotation")
         if not isinstance(ann, dict):
+            if self.require_teacher_annotation:
+                sample_id = item.get("sample_id", "unknown")
+                raise RuntimeError(
+                    f"sample_id={sample_id} 缺失 teacher_annotation(v2)。"
+                    "Stage2/3 训练要求四字段教师标注全覆盖。"
+                )
             # Stage1 或未启用教师采集时，允许回退到旧 response（仅用于保持训练流程可跑）。
             fallback_response = _strip_image_tokens(item.get("response", ""))
             fallback_rationale = _extract_teacher_rationale(fallback_response)
@@ -637,7 +661,6 @@ class ScienceQADataset(torch.utils.data.Dataset):
 
         rationale_lines = [
             f"Observed Facts: {observed}",
-            f"Context: {context}",
             f"Reasoning: {reasoning}",
             answer_target,
         ]
@@ -1256,25 +1279,6 @@ def save_stage3_checkpoint(model, save_dir: str):
     print(f"Stage3 检查点已保存至 {save_dir}")
 
 
-def load_stage3_checkpoint(model, ckpt_dir: str, device: str):
-    if not os.path.exists(ckpt_dir):
-        raise FileNotFoundError(f"未找到 Stage3 checkpoint 目录: {ckpt_dir}")
-
-    trainable_state_path = os.path.join(ckpt_dir, "trainable_model_state.pt")
-    if os.path.exists(trainable_state_path):
-        parameter_state = torch.load(trainable_state_path, map_location="cpu")
-        _load_parameter_state(model, parameter_state, "Stage3 trainable_model_state")
-    else:
-        print(f"[Resume] 缺少 trainable_model_state.pt: {ckpt_dir}")
-
-    vq_resume_path = os.path.join(ckpt_dir, "vq_codebook.pt")
-    if os.path.exists(vq_resume_path):
-        load_vq_codebook(model, vq_resume_path)
-        print(f"[Resume] 已加载 Stage3 VQ stack: {vq_resume_path}")
-
-    return model
-
-
 def setup_args():
     """设置训练参数"""
     parser = argparse.ArgumentParser(description="VQ-LoRD 训练脚本")
@@ -1374,6 +1378,26 @@ def setup_args():
                        help="Stage3 每个 period 评估样本数；<=0 关闭 period 评估")
     parser.add_argument("--stage3_eval_every_period", type=int, default=1,
                        help="Stage3 每隔多少个 period 做一次评估")
+    parser.add_argument("--stage3_eval_scienceqa_split", type=str, default="validation",
+                       help="Stage3 独立评估使用的 ScienceQA split（默认 validation）")
+    parser.add_argument("--stage3_eval_scienceqa_path", type=str, default="",
+                       help="Stage3 独立评估使用的数据集路径（为空则复用 scienceqa_path）")
+    parser.add_argument("--stage3_eval_train_num", type=int, default=0,
+                       help="Stage3 独立评估样本数上限（0=该 split 全量）")
+    parser.add_argument("--stage3_field_weight_observed", type=float, default=1.0,
+                       help="Stage3 教师正则中 observed_facts_visual 的 token 权重")
+    parser.add_argument("--stage3_field_weight_context", type=float, default=1.0,
+                       help="Stage3 教师正则中 context_textual 的 token 权重")
+    parser.add_argument("--stage3_field_weight_reasoning", type=float, default=1.0,
+                       help="Stage3 教师正则中 reasoning 的 token 权重")
+    parser.add_argument("--stage3_field_weight_answer", type=float, default=1.0,
+                       help="Stage3 教师正则中 answer 的 token 权重")
+    parser.add_argument("--stage3_wrong_image_enable", type=int, default=0,
+                       help="Stage3 是否启用错图负样本约束，默认关闭")
+    parser.add_argument("--stage3_wrong_image_weight", type=float, default=0.2,
+                       help="Stage3 错图负样本损失权重")
+    parser.add_argument("--stage3_wrong_image_margin", type=float, default=0.0,
+                       help="Stage3 错图负样本对比边际（token-level log-prob）")
     
     # LoRA 参数
     parser.add_argument("--use_lora", type=int, default=1,
@@ -1409,7 +1433,7 @@ def setup_args():
     parser.add_argument("--collect_teacher_data", type=int, default=1,
                        help="是否自动采集缺失的教师四字段标注")
     parser.add_argument("--strict_teacher_distill", type=int, default=1,
-                       help="严格蒸馏模式：若缺失四字段教师标注则报错")
+                       help="兼容旧脚本参数（已废弃，无实际作用；vq_lord3 固定强门禁）")
     parser.add_argument("--teacher_lang", type=str, default="zh", choices=["zh", "en"],
                        help="教师回答统一语言：zh 或 en")
     parser.add_argument("--teacher_observed_max_tokens", type=int, default=256,
@@ -2134,6 +2158,11 @@ class Stage3SampleCacheItem:
     context_ids: Optional[torch.Tensor] = None
     reasoning_ids: Optional[torch.Tensor] = None
     answer_ids: Optional[torch.Tensor] = None
+    vic_observed_mask: Optional[torch.Tensor] = None
+    vic_context_mask: Optional[torch.Tensor] = None
+    vic_reasoning_mask: Optional[torch.Tensor] = None
+    vic_answer_mask: Optional[torch.Tensor] = None
+    vic_other_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -2164,6 +2193,7 @@ class PeriodTrainingItem:
     old_token_mask_minus: torch.Tensor
     old_token_lp_vic: torch.Tensor
     old_token_mask_vic: torch.Tensor
+    wrong_sample_idx: int
 
 
 def _serialize_period_states(period_states: Optional[Dict[int, PeriodState]]) -> Optional[dict]:
@@ -2271,6 +2301,7 @@ class PeriodTrainingDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         pair = self.items[idx]
         sample = self.sample_cache[pair.sample_idx]
+        wrong_sample = self.sample_cache[pair.wrong_sample_idx]
         return {
             "y_plus_ids": pair.y_plus_ids,
             "y_plus_mask": pair.y_plus_mask,
@@ -2286,6 +2317,13 @@ class PeriodTrainingDataset(torch.utils.data.Dataset):
             "old_token_mask_vic": pair.old_token_mask_vic,
             "pixel_values": sample.pixel_values,
             "image_sizes": sample.image_sizes,
+            "wrong_pixel_values": wrong_sample.pixel_values,
+            "wrong_image_sizes": wrong_sample.image_sizes,
+            "vic_observed_mask": sample.vic_observed_mask,
+            "vic_context_mask": sample.vic_context_mask,
+            "vic_reasoning_mask": sample.vic_reasoning_mask,
+            "vic_answer_mask": sample.vic_answer_mask,
+            "vic_other_mask": sample.vic_other_mask,
             "prompt_len": int(sample.prompt_len),
         }
 
@@ -2347,34 +2385,55 @@ def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
     minus_ids, minus_mask, old_lp_minus, old_mask_minus = _collate_stream("y_minus")
     vic_ids, vic_mask, old_lp_vic, old_mask_vic = _collate_stream("y_vic")
 
-    pv_list = []
-    for item in batch:
-        pv = item["pixel_values"]
-        if pv.dim() == 3:
-            pv = pv.unsqueeze(0)
-        pv_list.append(pv)
+    def _stack_pixel_values(key: str) -> torch.Tensor:
+        pv_list = []
+        for item in batch:
+            pv = item[key]
+            if pv.dim() == 3:
+                pv = pv.unsqueeze(0)
+            pv_list.append(pv)
 
-    pv_shapes = [tuple(pv.shape) for pv in pv_list]
-    if len(set(pv_shapes)) > 1:
-        max_patches = max(shape[0] for shape in pv_shapes)
-        for i, pv in enumerate(pv_list):
-            if pv.shape[0] < max_patches:
-                pad = torch.zeros(
-                    (max_patches - pv.shape[0],) + pv.shape[1:],
-                    dtype=pv.dtype,
-                    device=pv.device,
-                )
-                pv_list[i] = torch.cat([pv, pad], dim=0)
-    pixel_values = torch.stack(pv_list, dim=0)
+        pv_shapes = [tuple(pv.shape) for pv in pv_list]
+        if len(set(pv_shapes)) > 1:
+            max_patches = max(shape[0] for shape in pv_shapes)
+            for i, pv in enumerate(pv_list):
+                if pv.shape[0] < max_patches:
+                    pad = torch.zeros(
+                        (max_patches - pv.shape[0],) + pv.shape[1:],
+                        dtype=pv.dtype,
+                        device=pv.device,
+                    )
+                    pv_list[i] = torch.cat([pv, pad], dim=0)
+        return torch.stack(pv_list, dim=0)
 
-    image_sizes_list = [item.get("image_sizes") for item in batch]
-    if any(size is not None for size in image_sizes_list):
-        image_sizes = torch.stack([
+    def _stack_image_sizes(key: str) -> Optional[torch.Tensor]:
+        image_sizes_list = [item.get(key) for item in batch]
+        if not any(size is not None for size in image_sizes_list):
+            return None
+        return torch.stack([
             size if isinstance(size, torch.Tensor) else torch.tensor(size, dtype=torch.long)
             for size in image_sizes_list
         ], dim=0)
-    else:
-        image_sizes = None
+
+    def _collate_vic_field_mask(key: str) -> torch.Tensor:
+        target_old_len = old_lp_vic.shape[1]
+        masks = []
+        for item in batch:
+            field_mask = item.get(key)
+            if field_mask is None:
+                field_mask = torch.zeros((target_old_len,), dtype=torch.float32)
+            masks.append(_pad_1d_tensor(field_mask.float(), target_old_len, 0.0))
+        return torch.stack(masks, dim=0)
+
+    pixel_values = _stack_pixel_values("pixel_values")
+    wrong_pixel_values = _stack_pixel_values("wrong_pixel_values")
+    image_sizes = _stack_image_sizes("image_sizes")
+    wrong_image_sizes = _stack_image_sizes("wrong_image_sizes")
+    vic_observed_mask = _collate_vic_field_mask("vic_observed_mask")
+    vic_context_mask = _collate_vic_field_mask("vic_context_mask")
+    vic_reasoning_mask = _collate_vic_field_mask("vic_reasoning_mask")
+    vic_answer_mask = _collate_vic_field_mask("vic_answer_mask")
+    vic_other_mask = _collate_vic_field_mask("vic_other_mask")
 
     prompt_lens = torch.tensor([int(item["prompt_len"]) for item in batch], dtype=torch.long)
 
@@ -2393,8 +2452,79 @@ def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
         "old_token_mask_vic": old_mask_vic,
         "pixel_values": pixel_values,
         "image_sizes": image_sizes,
+        "wrong_pixel_values": wrong_pixel_values,
+        "wrong_image_sizes": wrong_image_sizes,
+        "vic_observed_mask": vic_observed_mask,
+        "vic_context_mask": vic_context_mask,
+        "vic_reasoning_mask": vic_reasoning_mask,
+        "vic_answer_mask": vic_answer_mask,
+        "vic_other_mask": vic_other_mask,
         "prompt_lens": prompt_lens,
     }
+
+
+def _find_token_subsequence(haystack: List[int], needle: List[int], start_pos: int) -> int:
+    if not needle:
+        return -1
+    max_start = len(haystack) - len(needle)
+    for pos in range(max(0, start_pos), max_start + 1):
+        if haystack[pos:pos + len(needle)] == needle:
+            return pos
+    return -1
+
+
+def _build_vic_field_masks(
+    y_vic_ids: torch.Tensor,
+    prompt_len: int,
+    tokenizer,
+    vic_target: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    old_len = max(0, int(y_vic_ids.shape[0]) - 1)
+    observed_mask = torch.zeros((old_len,), dtype=torch.float32)
+    context_mask = torch.zeros((old_len,), dtype=torch.float32)
+    reasoning_mask = torch.zeros((old_len,), dtype=torch.float32)
+    answer_mask = torch.zeros((old_len,), dtype=torch.float32)
+
+    if tokenizer is None or not vic_target or old_len == 0:
+        other_mask = torch.ones((old_len,), dtype=torch.float32)
+        return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
+
+    generated_ids = y_vic_ids[int(prompt_len):].tolist()
+    if not generated_ids:
+        other_mask = torch.ones((old_len,), dtype=torch.float32)
+        return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
+
+    field_to_mask = {
+        "Observed Facts:": observed_mask,
+        "Context:": context_mask,
+        "Reasoning:": reasoning_mask,
+        "Answer:": answer_mask,
+    }
+    cursor = 0
+    for raw_line in str(vic_target).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        prefix = next((p for p in field_to_mask if line.startswith(p)), None)
+        if prefix is None:
+            continue
+        line_tokens = tokenizer.encode(line, add_special_tokens=False)
+        start = _find_token_subsequence(generated_ids, line_tokens, cursor)
+        if start < 0:
+            continue
+        base = max(0, int(prompt_len) - 1 + start)
+        end = min(old_len, base + len(line_tokens))
+        if end > base:
+            field_to_mask[prefix][base:end] = 1.0
+        cursor = start + len(line_tokens)
+
+    union_mask = torch.clamp(
+        observed_mask + context_mask + reasoning_mask + answer_mask,
+        min=0.0,
+        max=1.0,
+    )
+    other_mask = torch.clamp(torch.ones((old_len,), dtype=torch.float32) - union_mask, min=0.0, max=1.0)
+    return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
 
 
 def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
@@ -2417,22 +2547,25 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
         prompt_mask = sample.get("prompt_attention_mask")
         y_vic_ids = sample.get("vic_input_ids")
         y_vic_mask = sample.get("vic_attention_mask")
+        vic_target = None
 
         if prompt_ids is None:
             prompt_ids = sample["input_ids"]
         if prompt_mask is None:
             prompt_mask = sample.get("attention_mask", torch.ones_like(prompt_ids))
 
+        if isinstance(raw_item, dict) and hasattr(train_dataset, "_build_targets"):
+            instruction = raw_item.get("instruction", "")
+            instruction_text = _strip_image_tokens(instruction)
+            _, _, vic_target, _ = train_dataset._build_targets(raw_item, instruction_text)
+
         # Stage3 y_vic 默认走结构化组合（facts+reasoning+answer，context 可由开关控制）。
         if (
             y_vic_ids is None
             and processor is not None
             and isinstance(raw_item, dict)
-            and hasattr(train_dataset, "_build_targets")
+            and vic_target is not None
         ):
-            instruction = raw_item.get("instruction", "")
-            instruction_text = _strip_image_tokens(instruction)
-            _, _, vic_target, _ = train_dataset._build_targets(raw_item, instruction_text)
             image = raw_item.get("image")
             if image is not None:
                 if hasattr(processor, "apply_chat_template"):
@@ -2490,6 +2623,11 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
         context_ids = None
         reasoning_ids = None
         answer_ids = None
+        vic_observed_mask = None
+        vic_context_mask = None
+        vic_reasoning_mask = None
+        vic_answer_mask = None
+        vic_other_mask = torch.ones((max(0, int(y_vic_ids.shape[0]) - 1),), dtype=torch.float32)
         if tokenizer is not None and isinstance(raw_item, dict):
             ann = raw_item.get("teacher_annotation")
             if isinstance(ann, dict):
@@ -2517,6 +2655,19 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
                         tokenizer.encode(answer, add_special_tokens=False),
                         dtype=torch.long,
                     )
+            if vic_target is not None:
+                (
+                    vic_observed_mask,
+                    vic_context_mask,
+                    vic_reasoning_mask,
+                    vic_answer_mask,
+                    vic_other_mask,
+                ) = _build_vic_field_masks(
+                    y_vic_ids=y_vic_ids.detach().cpu().long(),
+                    prompt_len=prompt_len,
+                    tokenizer=tokenizer,
+                    vic_target=vic_target,
+                )
 
         cache.append(Stage3SampleCacheItem(
             sample_idx=int(idx),
@@ -2531,6 +2682,11 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
             context_ids=context_ids,
             reasoning_ids=reasoning_ids,
             answer_ids=answer_ids,
+            vic_observed_mask=vic_observed_mask,
+            vic_context_mask=vic_context_mask,
+            vic_reasoning_mask=vic_reasoning_mask,
+            vic_answer_mask=vic_answer_mask,
+            vic_other_mask=vic_other_mask,
         ))
     return cache
 
@@ -2541,7 +2697,7 @@ def _set_stage3_trainable_params(model, args) -> List[torch.nn.Parameter]:
             param.requires_grad = False
             continue
         name_l = name.lower()
-        is_lora = "lora_" in name_l
+        is_lora = "lora_" in name_l or "modules_to_save" in name_l
         is_projector = (
             ("projector" in name_l or "multi_modal_projector" in name_l)
             and bool(args.stage3_train_projector)
@@ -2752,6 +2908,7 @@ def _build_pairs_and_next_states(
     args,
     image_token_id: Optional[int],
     pad_token_id: int,
+    force_vic_positive: bool = False,
 ) -> Tuple[List[PeriodTrainingItem], Dict[int, PeriodState], int, int, float, float]:
     training_items: List[PeriodTrainingItem] = []
     next_states: Dict[int, PeriodState] = {}
@@ -2766,7 +2923,8 @@ def _build_pairs_and_next_states(
     use_cache_states = _set_model_use_cache(model, True)
     gc_states = _set_model_gradient_checkpointing(model, False)
     try:
-        for idx in tqdm(active_indices, desc="Stage3 Phase-A"):
+        num_active = len(active_indices)
+        for rank, idx in enumerate(tqdm(active_indices, desc="Stage3 Phase-A")):
             state = current_states[idx]
             sample = sample_cache[idx]
 
@@ -2815,12 +2973,28 @@ def _build_pairs_and_next_states(
                 )
 
             use_cold_start = (p_best < tau1) and (delta11 < tau_delta)
-            if use_cold_start:
+            if force_vic_positive:
                 y_plus_ids = sample.y_vic_ids
                 y_plus_mask = sample.y_vic_mask
                 old_lp_plus = y_vic_token_lp
                 old_mask_plus = y_vic_token_mask
                 y_plus_avg_lp = float(y_vic_lp)
+                y_minus_ids = state.y12_ids
+                y_minus_mask = state.y12_mask
+                old_lp_minus = token12
+                old_mask_minus = mask12
+                y_minus_avg_lp = float(lp12)
+            elif use_cold_start:
+                y_plus_ids = sample.y_vic_ids
+                y_plus_mask = sample.y_vic_mask
+                old_lp_plus = y_vic_token_lp
+                old_mask_plus = y_vic_token_mask
+                y_plus_avg_lp = float(y_vic_lp)
+                y_minus_ids = y12["ids"]
+                y_minus_mask = y12["mask"]
+                old_lp_minus = y12["old_token_lp"]
+                old_mask_minus = y12["old_token_mask"]
+                y_minus_avg_lp = float(y12["avg_lp"])
                 cold_start_count += 1
             else:
                 y_plus_ids = y11["ids"]
@@ -2828,7 +3002,11 @@ def _build_pairs_and_next_states(
                 old_lp_plus = y11["old_token_lp"]
                 old_mask_plus = y11["old_token_mask"]
                 y_plus_avg_lp = float(y11["avg_lp"])
-            y_minus_avg_lp = float(y12["avg_lp"])
+                y_minus_ids = y12["ids"]
+                y_minus_mask = y12["mask"]
+                old_lp_minus = y12["old_token_lp"]
+                old_mask_minus = y12["old_token_mask"]
+                y_minus_avg_lp = float(y12["avg_lp"])
             plus_lp_sum += y_plus_avg_lp
             minus_lp_sum += y_minus_avg_lp
 
@@ -2836,16 +3014,17 @@ def _build_pairs_and_next_states(
                 sample_idx=int(idx),
                 y_plus_ids=y_plus_ids.clone(),
                 y_plus_mask=y_plus_mask.clone(),
-                y_minus_ids=y12["ids"].clone(),
-                y_minus_mask=y12["mask"].clone(),
+                y_minus_ids=y_minus_ids.clone(),
+                y_minus_mask=y_minus_mask.clone(),
                 y_vic_ids=sample.y_vic_ids.clone(),
                 y_vic_mask=sample.y_vic_mask.clone(),
                 old_token_lp_plus=old_lp_plus.clone(),
                 old_token_mask_plus=old_mask_plus.clone(),
-                old_token_lp_minus=y12["old_token_lp"].clone(),
-                old_token_mask_minus=y12["old_token_mask"].clone(),
+                old_token_lp_minus=old_lp_minus.clone(),
+                old_token_mask_minus=old_mask_minus.clone(),
                 old_token_lp_vic=y_vic_token_lp.clone(),
                 old_token_mask_vic=y_vic_token_mask.clone(),
+                wrong_sample_idx=int(active_indices[(rank + 1) % num_active]) if num_active > 1 else int(idx),
             ))
 
             # Step6: 新候选完全替换下一 period 的 y11/y12
@@ -2887,19 +3066,40 @@ def _run_one_period_train(
     global_step: int,
     sub_stage_idx: int,
     period_idx: int,
-) -> Tuple[float, float, float, int]:
+) -> Tuple[float, float, float, float, Dict[str, float], int]:
     model.train()
     grad_accum = max(1, int(getattr(args, "stage3_grad_accum", 0) or getattr(args, "grad_accum", 1)))
     grad_clip = float(getattr(args, "stage3_grad_clip", 1.0))
+    wrong_image_enable = bool(int(getattr(args, "stage3_wrong_image_enable", 0)))
+    wrong_image_weight = float(getattr(args, "stage3_wrong_image_weight", 0.2))
+    wrong_image_margin = float(getattr(args, "stage3_wrong_image_margin", 0.0))
+    field_weights = {
+        "observed": float(getattr(args, "stage3_field_weight_observed", 1.0)),
+        "context": float(getattr(args, "stage3_field_weight_context", 1.0)),
+        "reasoning": float(getattr(args, "stage3_field_weight_reasoning", 1.0)),
+        "answer": float(getattr(args, "stage3_field_weight_answer", 1.0)),
+    }
     optimizer.zero_grad(set_to_none=True)
 
     total_loss = 0.0
     total_obj = 0.0
     total_reg = 0.0
+    total_wrong = 0.0
+    total_field = {
+        "observed": 0.0,
+        "context": 0.0,
+        "reasoning": 0.0,
+        "answer": 0.0,
+    }
     steps = 0
 
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return (values * mask).sum() / mask.sum().clamp(min=1.0)
+
+    def _masked_mean_or_zero(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if float(mask.sum().item()) <= 0.0:
+            return torch.zeros((), device=values.device, dtype=values.dtype)
+        return _masked_mean(values, mask)
 
     for batch_idx, batch in enumerate(tqdm(loader, desc=f"Stage3 S{sub_stage_idx+1} P{period_idx+1}")):
         if batch is None:
@@ -2915,6 +3115,11 @@ def _run_one_period_train(
         y_vic_mask = batch["y_vic_mask"].to(args.device)
         pixel_values = batch["pixel_values"].to(args.device)
         image_sizes = sanitize_image_sizes(batch.get("image_sizes"), batch_size=y_plus_ids.size(0))
+        wrong_pixel_values = batch["wrong_pixel_values"].to(args.device)
+        wrong_image_sizes = sanitize_image_sizes(
+            batch.get("wrong_image_sizes"),
+            batch_size=y_plus_ids.size(0),
+        )
         prompt_lens = batch["prompt_lens"].to(args.device)
 
         old_lp_plus = batch["old_token_lp_plus"].to(args.device)
@@ -2923,6 +3128,11 @@ def _run_one_period_train(
         old_mask_minus = batch["old_token_mask_minus"].to(args.device)
         old_lp_vic = batch["old_token_lp_vic"].to(args.device)
         old_mask_vic = batch["old_token_mask_vic"].to(args.device)
+        vic_observed_mask = batch["vic_observed_mask"].to(args.device)
+        vic_context_mask = batch["vic_context_mask"].to(args.device)
+        vic_reasoning_mask = batch["vic_reasoning_mask"].to(args.device)
+        vic_answer_mask = batch["vic_answer_mask"].to(args.device)
+        vic_other_mask = batch["vic_other_mask"].to(args.device)
 
         cur_lp_plus, cur_mask_plus = _compute_token_log_probs(
             model, y_plus_ids, y_plus_mask, pixel_values, image_sizes, prompt_lens
@@ -2933,6 +3143,12 @@ def _run_one_period_train(
         cur_lp_vic, cur_mask_vic = _compute_token_log_probs(
             model, y_vic_ids, y_vic_mask, pixel_values, image_sizes, prompt_lens
         )
+        cur_lp_wrong_vic = None
+        cur_mask_wrong_vic = None
+        if wrong_image_enable:
+            cur_lp_wrong_vic, cur_mask_wrong_vic = _compute_token_log_probs(
+                model, y_vic_ids, y_vic_mask, wrong_pixel_values, wrong_image_sizes, prompt_lens
+            )
 
         # collate 已对齐，这里额外防御
         if cur_lp_plus.shape[1] != old_lp_plus.shape[1]:
@@ -2947,17 +3163,51 @@ def _run_one_period_train(
             target = min(cur_lp_vic.shape[1], old_lp_vic.shape[1])
             cur_lp_vic, cur_mask_vic = cur_lp_vic[:, :target], cur_mask_vic[:, :target]
             old_lp_vic, old_mask_vic = old_lp_vic[:, :target], old_mask_vic[:, :target]
+            vic_observed_mask = vic_observed_mask[:, :target]
+            vic_context_mask = vic_context_mask[:, :target]
+            vic_reasoning_mask = vic_reasoning_mask[:, :target]
+            vic_answer_mask = vic_answer_mask[:, :target]
+            vic_other_mask = vic_other_mask[:, :target]
+            if cur_lp_wrong_vic is not None and cur_mask_wrong_vic is not None:
+                cur_lp_wrong_vic = cur_lp_wrong_vic[:, :target]
+                cur_mask_wrong_vic = cur_mask_wrong_vic[:, :target]
 
         mask_plus = (old_mask_plus * cur_mask_plus).float()
         mask_minus = (old_mask_minus * cur_mask_minus).float()
         mask_vic = (old_mask_vic * cur_mask_vic).float()
+        delta_vic = old_lp_vic - cur_lp_vic
+
+        field_masks = {
+            "observed": mask_vic * vic_observed_mask,
+            "context": mask_vic * vic_context_mask,
+            "reasoning": mask_vic * vic_reasoning_mask,
+            "answer": mask_vic * vic_answer_mask,
+        }
+        weighted_mask_vic = (
+            field_weights["observed"] * field_masks["observed"]
+            + field_weights["context"] * field_masks["context"]
+            + field_weights["reasoning"] * field_masks["reasoning"]
+            + field_weights["answer"] * field_masks["answer"]
+            + mask_vic * vic_other_mask
+        )
 
         term1 = _masked_mean(log_clip(-old_lp_minus + cur_lp_minus), mask_minus)
         term2 = _masked_mean(log_clip(old_lp_plus - cur_lp_plus), mask_plus)
-        term3 = _masked_mean(old_lp_vic - cur_lp_vic, mask_vic)
+        term3 = _masked_mean_or_zero(delta_vic, weighted_mask_vic)
         loss_obj = term1 + term2
         loss_reg = term3
-        loss = loss_obj + loss_reg
+        loss_wrong = torch.zeros((), device=args.device, dtype=loss_reg.dtype)
+        if cur_lp_wrong_vic is not None and cur_mask_wrong_vic is not None:
+            wrong_mask = (mask_vic * cur_mask_wrong_vic).float()
+            wrong_delta = F.relu(cur_lp_wrong_vic - cur_lp_vic + wrong_image_margin)
+            loss_wrong = _masked_mean_or_zero(wrong_delta, wrong_mask)
+        loss = loss_obj + loss_reg + wrong_image_weight * loss_wrong
+
+        field_loss_vals = {}
+        for name, field_mask in field_masks.items():
+            field_loss = _masked_mean_or_zero(delta_vic, field_mask)
+            field_loss_vals[name] = float(field_loss.item())
+            total_field[name] += field_loss_vals[name]
 
         (loss / grad_accum).backward()
 
@@ -2973,21 +3223,36 @@ def _run_one_period_train(
         loss_val = float(loss.item())
         obj_val = float(loss_obj.item())
         reg_val = float(loss_reg.item())
+        wrong_val = float(loss_wrong.item())
         total_loss += loss_val
         total_obj += obj_val
         total_reg += reg_val
+        total_wrong += wrong_val
 
         if global_step % args.log_step == 0:
             print(
                 f"Step {global_step}, Total: {loss_val:.4f}, "
-                f"L_obj: {obj_val:.4f}, L_reg: {reg_val:.4f}"
+                f"L_obj: {obj_val:.4f}, L_reg: {reg_val:.4f}, L_wrong: {wrong_val:.4f}"
             )
             tb_writer.add_scalar("stage3/total_loss", loss_val, global_step)
             tb_writer.add_scalar("stage3/L_obj", obj_val, global_step)
             tb_writer.add_scalar("stage3/L_reg", reg_val, global_step)
+            tb_writer.add_scalar("stage3/L_wrong_image", wrong_val, global_step)
+            tb_writer.add_scalar("stage3/L_reg_observed", field_loss_vals["observed"], global_step)
+            tb_writer.add_scalar("stage3/L_reg_context", field_loss_vals["context"], global_step)
+            tb_writer.add_scalar("stage3/L_reg_reasoning", field_loss_vals["reasoning"], global_step)
+            tb_writer.add_scalar("stage3/L_reg_answer", field_loss_vals["answer"], global_step)
 
     denom = max(1, steps)
-    return total_loss / denom, total_obj / denom, total_reg / denom, global_step
+    avg_field = {name: value / denom for name, value in total_field.items()}
+    return (
+        total_loss / denom,
+        total_obj / denom,
+        total_reg / denom,
+        total_wrong / denom,
+        avg_field,
+        global_step,
+    )
 
 
 def train_stage3_lord(model, train_dataset, args, tb_writer):
@@ -3011,7 +3276,12 @@ def train_stage3_lord(model, train_dataset, args, tb_writer):
         f"sub_stage_num={sub_stage_num}, period_num={period_num}, sub_set_num={sub_set_num}, "
         f"lr={stage3_lr}, train_projector={int(bool(args.stage3_train_projector))}, "
         f"resume_opt={int(bool(getattr(args, 'stage3_resume_save_optimizer', 1)))}, "
-        f"eval_max_samples={int(getattr(args, 'stage3_eval_max_samples', 0))}"
+        f"eval_max_samples={int(getattr(args, 'stage3_eval_max_samples', 0))}, "
+        f"field_w=({float(getattr(args, 'stage3_field_weight_observed', 1.0)):.2f},"
+        f"{float(getattr(args, 'stage3_field_weight_context', 1.0)):.2f},"
+        f"{float(getattr(args, 'stage3_field_weight_reasoning', 1.0)):.2f},"
+        f"{float(getattr(args, 'stage3_field_weight_answer', 1.0)):.2f}), "
+        f"wrong_image={int(bool(getattr(args, 'stage3_wrong_image_enable', 0)))}"
     )
 
     trainable_params = _set_stage3_trainable_params(model, args)
@@ -3035,13 +3305,78 @@ def train_stage3_lord(model, train_dataset, args, tb_writer):
             if answer_letter in {"A", "B", "C", "D"}:
                 answer_lookup[int(idx)] = answer_letter
 
+    stage3_eval_max_samples = int(getattr(args, "stage3_eval_max_samples", 0))
+    eval_sample_cache: Optional[List[Stage3SampleCacheItem]] = None
+    eval_answer_lookup: Dict[int, str] = {}
+    eval_pool_indices: Optional[List[int]] = None
+    stage3_eval_split = str(
+        getattr(args, "stage3_eval_scienceqa_split", "validation") or ""
+    ).strip()
+    stage3_eval_path = str(
+        getattr(args, "stage3_eval_scienceqa_path", "") or getattr(args, "scienceqa_path", "")
+    ).strip()
+    stage3_eval_train_num = int(getattr(args, "stage3_eval_train_num", 0))
+    if (
+        stage3_eval_max_samples > 0
+        and tokenizer is not None
+        and stage3_eval_split
+        and stage3_eval_path
+        and hasattr(train_dataset, "processor")
+    ):
+        same_eval_and_train = (
+            stage3_eval_split == str(getattr(args, "scienceqa_split", "")).strip()
+            and stage3_eval_path == str(getattr(args, "scienceqa_path", "")).strip()
+        )
+        if same_eval_and_train:
+            print(
+                "[Stage3][Warn] stage3_eval_scienceqa_split 与训练 split 相同，"
+                "当前评估将与训练集重合。建议使用 validation。"
+            )
+        try:
+            eval_samples = build_scienceqa_samples(
+                scienceqa_path=stage3_eval_path,
+                split=stage3_eval_split,
+                train_num=stage3_eval_train_num,
+                seed=int(getattr(args, "scienceqa_seed", 20240306)),
+            )
+            eval_dataset = ScienceQADataset(
+                processor=train_dataset.processor,
+                scienceqa_path=stage3_eval_path,
+                split=stage3_eval_split,
+                train_num=stage3_eval_train_num,
+                max_length=args.max_length,
+                samples=eval_samples,
+                seed=int(getattr(args, "scienceqa_seed", 20240306)),
+                teacher_lang=args.teacher_lang,
+                teacher_observed_max_tokens=args.teacher_observed_max_tokens,
+                teacher_context_max_tokens=args.teacher_context_max_tokens,
+                teacher_reasoning_max_tokens=args.teacher_reasoning_max_tokens,
+                teacher_answer_max_tokens=args.teacher_answer_max_tokens,
+                stage3_vic_include_context=bool(int(args.stage3_vic_include_context)),
+                require_teacher_annotation=False,
+            )
+            eval_sample_cache = _build_stage3_sample_cache(eval_dataset)
+            eval_pool_indices = list(range(len(eval_sample_cache)))
+            for idx, sample in enumerate(eval_samples):
+                answer_letter = str(sample.get("answer_letter", "") or "").strip().upper()[:1]
+                if answer_letter in {"A", "B", "C", "D"}:
+                    eval_answer_lookup[int(idx)] = answer_letter
+            print(
+                f"[Stage3][Eval] 使用独立评估集: split={stage3_eval_split}, "
+                f"path={stage3_eval_path}, samples={len(eval_sample_cache)}"
+            )
+        except Exception as exc:
+            print(f"[Stage3][Warn] 构建独立评估集失败，将回退训练集评估: {exc}")
+            eval_sample_cache = None
+            eval_answer_lookup = {}
+            eval_pool_indices = None
+
     all_indices = list(range(len(sample_cache)))
     global_step = 0
     base_seed = int(getattr(args, "scienceqa_seed", 20240306))
     period_counter = 0
     resume_save_optimizer = bool(int(getattr(args, "stage3_resume_save_optimizer", 1)))
     resume_save_interval = max(1, int(getattr(args, "stage3_resume_save_interval", 1)))
-    stage3_eval_max_samples = int(getattr(args, "stage3_eval_max_samples", 0))
     stage3_eval_every_period = max(1, int(getattr(args, "stage3_eval_every_period", 1)))
     resume_save_dir = str(getattr(args, "stage3_resume_save_path", "") or "").strip()
     if not resume_save_dir:
@@ -3118,6 +3453,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer):
                 args=args,
                 image_token_id=image_token_id,
                 pad_token_id=pad_token_id,
+                force_vic_positive=bool(period_idx == 0),
             )
             phase_a_seconds = time.perf_counter() - phase_a_start
             period_states = next_states
@@ -3130,7 +3466,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer):
                 num_workers=0,
                 collate_fn=lambda b: _collate_period_training(b, pad_token_id),
             )
-            avg_total, avg_obj, avg_reg, global_step = _run_one_period_train(
+            avg_total, avg_obj, avg_reg, avg_wrong, avg_field_losses, global_step = _run_one_period_train(
                 model=model,
                 optimizer=optimizer,
                 loader=period_loader,
@@ -3149,6 +3485,11 @@ def train_stage3_lord(model, train_dataset, args, tb_writer):
             print(
                 f"[Stage3][S{sub_stage_idx+1}P{period_idx+1}] "
                 f"loss={avg_total:.4f}, L_obj={avg_obj:.4f}, L_reg={avg_reg:.4f}, "
+                f"L_wrong={avg_wrong:.4f}, "
+                f"L_obs={avg_field_losses['observed']:.4f}, "
+                f"L_ctx={avg_field_losses['context']:.4f}, "
+                f"L_reason={avg_field_losses['reasoning']:.4f}, "
+                f"L_ans={avg_field_losses['answer']:.4f}, "
                 f"cold_start_ratio={cold_ratio:.4f}, swap_ratio={swap_ratio:.4f}, "
                 f"avg_lp_plus={avg_lp_plus:.4f}, avg_lp_minus={avg_lp_minus:.4f}, "
                 f"phase_a_seconds={phase_a_seconds:.2f}"
@@ -3156,6 +3497,11 @@ def train_stage3_lord(model, train_dataset, args, tb_writer):
             tb_writer.add_scalar("stage3_epoch/total_loss", avg_total, period_counter)
             tb_writer.add_scalar("stage3_epoch/L_obj", avg_obj, period_counter)
             tb_writer.add_scalar("stage3_epoch/L_reg", avg_reg, period_counter)
+            tb_writer.add_scalar("stage3_epoch/L_wrong_image", avg_wrong, period_counter)
+            tb_writer.add_scalar("stage3_epoch/L_reg_observed", avg_field_losses["observed"], period_counter)
+            tb_writer.add_scalar("stage3_epoch/L_reg_context", avg_field_losses["context"], period_counter)
+            tb_writer.add_scalar("stage3_epoch/L_reg_reasoning", avg_field_losses["reasoning"], period_counter)
+            tb_writer.add_scalar("stage3_epoch/L_reg_answer", avg_field_losses["answer"], period_counter)
             tb_writer.add_scalar("stage3/cold_start_ratio", cold_ratio, period_counter)
             tb_writer.add_scalar("stage3/swap_ratio", swap_ratio, period_counter)
             tb_writer.add_scalar("stage3/avg_lp_plus", avg_lp_plus, period_counter)
@@ -3167,24 +3513,38 @@ def train_stage3_lord(model, train_dataset, args, tb_writer):
             if (
                 stage3_eval_max_samples > 0
                 and tokenizer is not None
-                and answer_lookup
+                and (answer_lookup or eval_answer_lookup)
                 and (period_counter % stage3_eval_every_period == 0)
             ):
-                eval_k = min(stage3_eval_max_samples, len(active_indices))
-                rng_eval = random.Random(base_seed + period_counter + 7919)
-                if eval_k < len(active_indices):
-                    eval_indices = sorted(rng_eval.sample(active_indices, eval_k))
+                use_eval_cache = (
+                    eval_sample_cache is not None
+                    and eval_pool_indices is not None
+                    and bool(eval_answer_lookup)
+                )
+                if use_eval_cache:
+                    metrics_sample_cache = eval_sample_cache
+                    metrics_indices_pool = eval_pool_indices
+                    metrics_answer_lookup = eval_answer_lookup
                 else:
-                    eval_indices = list(active_indices)
+                    metrics_sample_cache = sample_cache
+                    metrics_indices_pool = active_indices
+                    metrics_answer_lookup = answer_lookup
+
+                eval_k = min(stage3_eval_max_samples, len(metrics_indices_pool))
+                rng_eval = random.Random(base_seed + period_counter + 7919)
+                if eval_k < len(metrics_indices_pool):
+                    eval_indices = sorted(rng_eval.sample(metrics_indices_pool, eval_k))
+                else:
+                    eval_indices = list(metrics_indices_pool)
                 val_acc, val_fmt, val_n = _evaluate_stage3_answer_metrics(
                     model=model,
-                    sample_cache=sample_cache,
+                    sample_cache=metrics_sample_cache,
                     eval_indices=eval_indices,
                     args=args,
                     image_token_id=image_token_id,
                     pad_token_id=pad_token_id,
                     tokenizer=tokenizer,
-                    answer_lookup=answer_lookup,
+                    answer_lookup=metrics_answer_lookup,
                 )
                 print(
                     f"[Stage3][Eval][S{sub_stage_idx+1}P{period_idx+1}] "
@@ -3372,16 +3732,52 @@ def load_stage2_checkpoint(model, ckpt_path: str):
                 state_dict = torch.load(adapter_weights_bin, map_location="cpu")
             else:
                 state_dict = None
-        if state_dict is not None:
-            # 直接覆盖现有 default adapter，避免额外 adapter name 干扰 Stage3 参数遍历。
-            model.load_state_dict(state_dict, strict=False)
+        if state_dict is None:
+            raise RuntimeError(
+                f"检测到 adapter_config.json，但缺少 adapter 权重文件: {ckpt_path}"
+            )
+        # 直接覆盖现有 default adapter，避免额外 adapter name 干扰 Stage3 参数遍历。
+        model.load_state_dict(state_dict, strict=False)
         print(f"已加载 LoRA 权重: {ckpt_path}")
 
     projector_path = os.path.join(ckpt_path, "projector.pt")
     _load_projector_state(model, projector_path)
+
+    config_path = os.path.join(ckpt_path, "stage2_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            stage2_cfg = json.load(f)
+        print(
+            f"已读取 Stage2 配置: stage={stage2_cfg.get('stage')}, "
+            f"answer_w={stage2_cfg.get('stage2_answer_weight')}, "
+            f"rationale_w={stage2_cfg.get('stage2_rationale_weight')}"
+        )
+    else:
+        print(f"[Warn] 未找到 stage2_config.json: {ckpt_path}")
     
     print(f"Stage2 检查点加载完成")
     return model
+
+
+def _stage2_contract_missing_files(ckpt_path: str) -> List[str]:
+    required_files = [
+        "vq_codebook.pt",
+        "projector.pt",
+        "stage2_config.json",
+        "adapter_config.json",
+    ]
+    missing = []
+    for rel in required_files:
+        if not os.path.exists(os.path.join(ckpt_path, rel)):
+            missing.append(rel)
+
+    has_adapter_weights = (
+        os.path.exists(os.path.join(ckpt_path, "adapter_model.safetensors"))
+        or os.path.exists(os.path.join(ckpt_path, "adapter_model.bin"))
+    )
+    if not has_adapter_weights:
+        missing.append("adapter_model.safetensors|adapter_model.bin")
+    return missing
 
 
 def main():
@@ -3454,6 +3850,7 @@ def main():
             teacher_reasoning_max_tokens=args.teacher_reasoning_max_tokens,
             teacher_answer_max_tokens=args.teacher_answer_max_tokens,
             stage3_vic_include_context=bool(int(args.stage3_vic_include_context)),
+            require_teacher_annotation=bool(int(args.stage) >= 2),
         )
     else:
         collector = GPT4VDataCollector(save_dir=args.data_dir)
@@ -3627,6 +4024,16 @@ def main():
             save_checkpoint(model, args, "stage2_vision")
     
     if args.stage >= 3:
+        if not args.stage2_ckpt_path:
+            args.stage2_ckpt_path = os.path.join(args.save_path, "stage2_vision")
+        if not os.path.isdir(args.stage2_ckpt_path):
+            raise RuntimeError(f"Stage3 需要可用的 Stage2 checkpoint 目录: {args.stage2_ckpt_path}")
+        missing_stage2_files = _stage2_contract_missing_files(args.stage2_ckpt_path)
+        if missing_stage2_files:
+            raise RuntimeError(
+                "Stage3 启动前 Stage2 工件不完整，缺失: "
+                + ", ".join(missing_stage2_files)
+            )
         model = train_stage3_lord(model, train_dataset, args, tb_writer)
         save_stage3_checkpoint(model, os.path.join(args.save_path, "stage3_lord_final"))
     

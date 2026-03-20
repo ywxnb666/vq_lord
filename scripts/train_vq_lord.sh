@@ -52,7 +52,7 @@ fi
 export python="${default_python}"
 
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=3
 
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
@@ -223,8 +223,8 @@ mkdir -p $data_dir
 mkdir -p $preprocess_dir
 
 # 校验训练入口是否存在
-if [ ! -f "${root_dir}vq_lord2/train_vq_lord2.py" ]; then
-    echo "错误: 未找到训练入口 ${root_dir}vq_lord2/train_vq_lord2.py"
+if [ ! -f "${root_dir}vq_lord3/train_vq_lord3.py" ]; then
+    echo "错误: 未找到训练入口 ${root_dir}vq_lord3/train_vq_lord3.py"
     echo "当前 root_dir=${root_dir}"
     exit 1
 fi
@@ -280,7 +280,7 @@ run_train_stage() {
     echo "开始 Stage${stage_id} 训练，epochs=${stage_epochs}"
     echo "======================================================"
 
-    $python ${root_dir}vq_lord2/train_vq_lord2.py \
+    $python ${root_dir}vq_lord3/train_vq_lord3.py \
         --model_path=$model_path \
         --victim_model=$victim_model \
         --teacher_api_base=$teacher_api_base \

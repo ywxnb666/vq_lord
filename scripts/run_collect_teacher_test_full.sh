@@ -32,10 +32,10 @@ export scienceqa_split="${SCIENCEQA_SPLIT:-train}"
 export train_num="${TRAIN_NUM:-0}"                     # 0 = full split
 export scienceqa_seed="${SCIENCEQA_SEED:-20240306}"
 
-export victim_model="gpt-4o-mini"
+export victim_model="qwen3.5-plus"
 export teacher_lang="en"
-export OPENAI_BASE_URL="https://sg.uiuiapi.com/v1"
-export OPENAI_API_KEY="sk-7F7uBRbIJhbziKqHoyCqH0dDl3qT3r1WEN0ne9bebujDZLzr"
+export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export OPENAI_API_KEY="sk-abc8c59df2d64b7ba22718eae4fe80c2"
 export teacher_api_base="${TEACHER_API_BASE:-${OPENAI_API_BASE:-${OPENAI_BASE_URL:-}}}"
 export teacher_api_key="${TEACHER_API_KEY:-${OPENAI_API_KEY:-}}"
 
@@ -48,10 +48,11 @@ export teacher_context_max_tokens="${TEACHER_CONTEXT_MAX_TOKENS:-192}"
 export teacher_reasoning_max_tokens="${TEACHER_REASONING_MAX_TOKENS:-256}"
 export teacher_answer_max_tokens="${TEACHER_ANSWER_MAX_TOKENS:-64}"
 export teacher_max_new_tokens_total="${TEACHER_MAX_NEW_TOKENS_TOTAL:-768}"
+export num_workers="${NUM_WORKERS:-4}"
 
 if [ -z "${teacher_cache_path}" ]; then
     victim_tag="$(echo "${victim_model}" | sed 's/[^a-zA-Z0-9._-]/_/g')"
-    teacher_cache_path="${data_dir}/scienceqa_teacher_${victim_tag}_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_new.json"
+    teacher_cache_path="${data_dir}scienceqa_teacher_${victim_tag}_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_new.json"
 fi
 
 mkdir -p "${data_dir}"
@@ -77,6 +78,7 @@ echo "split/train_num/seed: ${scienceqa_split}/${train_num}/${scienceqa_seed}"
 echo "victim_model/lang: ${victim_model}/${teacher_lang}"
 echo "collect/strict: ${collect_teacher_data}/${strict_teacher_distill}"
 echo "cache_path: ${teacher_cache_path}"
+echo "num_workers: ${num_workers}"
 echo "budget(obs/ctx/reason/ans/total): ${teacher_observed_max_tokens}/${teacher_context_max_tokens}/${teacher_reasoning_max_tokens}/${teacher_answer_max_tokens}/${teacher_max_new_tokens_total}"
 echo "======================================================"
 
@@ -100,8 +102,8 @@ echo "======================================================"
     --teacher_reasoning_max_tokens="${teacher_reasoning_max_tokens}" \
     --teacher_answer_max_tokens="${teacher_answer_max_tokens}" \
     --teacher_max_new_tokens_total="${teacher_max_new_tokens_total}" \
-    --max_retries=3 \
-    --num_workers=4 \
+    --max_retries=10 \
+    --num_workers="${num_workers}" \
     --save_every=10 \
     --sleep_sec=0
 
