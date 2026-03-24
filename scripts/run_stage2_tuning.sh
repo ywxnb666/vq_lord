@@ -45,7 +45,7 @@ else
 fi
 export python="${default_python}"
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=2
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -137,7 +137,7 @@ export scienceqa_preprocessed_path="${preprocess_dir}/scienceqa_${scienceqa_spli
 
 # checkpoint 复用策略
 export stage1_codebook_path="${base_ckpt_dir}/../vq_lord_ckpts_stage2_tune/round1_e3/stage2_vision_epoch15/vq_codebook.pt"
-export stage2_ckpt_path="${save_dir}/stage2_vision_epoch15"
+export stage2_ckpt_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260322_015409/stage3_sub1_period1"
 export reuse_vq_codebook=1
 export reuse_stage2=0
 

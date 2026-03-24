@@ -1,12 +1,12 @@
 """
 ======================================================================
-SCIQA_PROCESS ---
+SCIQA_PROCESS2 ---
 
-ScienceQA 多模态验证脚本
+ScienceQA 多模态验证脚本（旧 Stage3 prompt 口径）
 
 功能:
 1. 加载 LLaVA/LLaVA-Next 学生模型（可选 LoRA 适配器）
-2. 使用 ScienceQA 的图像+文本样本进行推理
+2. 使用旧 Stage3/ScienceQADataset prompt 模板进行推理
 3. 解析模型输出并计算选择题准确率
 
 Author: VQ-LoRD Project
@@ -65,17 +65,28 @@ def probe_adapter_fingerprint(adapter_path: str) -> dict:
     return info
 
 
-def build_prompt(question: str, choices: List[str]) -> str:
+def build_legacy_instruction(question: str, choices: List[str], hint: str = "") -> str:
     choices_text = ""
     for idx, choice in enumerate(choices):
         choices_text += f"({chr(65 + idx)}) {choice}\n"
-    return (
-        f"<image>\n"
-        f"Question: {question}\n"
-        f"Options:\n{choices_text}"
-        "Answer with only one option letter (A, B, C, ...).\n"
-        "Answer:"
-    )
+    hint_block = f"Hint: {hint}\n" if hint else ""
+    return f"Question: {question}\n{hint_block}Options:\n{choices_text}Answer:"
+
+
+def build_prompt(processor, question: str, choices: List[str], hint: str = "") -> str:
+    instruction_text = build_legacy_instruction(question, choices, hint)
+    if hasattr(processor, "apply_chat_template"):
+        prompt_conv = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction_text},
+                    {"type": "image"},
+                ],
+            }
+        ]
+        return processor.apply_chat_template(prompt_conv, add_generation_prompt=True)
+    return f"<image>\n{instruction_text}"
 
 
 def normalize_text(text: str) -> str:
@@ -352,9 +363,10 @@ def run_eval(
         question = item.get("question", "")
         choices = item.get("choices", [])
         answer_idx = item.get("answer", 0)
+        hint = item.get("hint", "")
         image = item.get("image")
 
-        prompt = build_prompt(question, choices)
+        prompt = build_prompt(processor, question, choices, hint)
         inputs = processor(
             text=prompt,
             images=image,
@@ -449,7 +461,7 @@ def run_eval(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ScienceQA 多模态验证脚本")
+    parser = argparse.ArgumentParser(description="ScienceQA 多模态验证脚本（旧 Stage3 prompt 口径）")
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
@@ -498,6 +510,7 @@ def main():
         "vq_codebook_path": args.vq_codebook_path,
         "vq_codebook_loaded": load_info.get("vq_codebook_loaded", False),
         "answer_mode": args.answer_mode,
+        "prompt_style": "stage3_legacy",
     }
     run_eval(
         model=model,

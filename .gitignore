@@ -1,6 +1,7 @@
 /GLUE_ckpts/
 data_vq_lord_ckpts
 *.log*
+.sii/
 /3d_res.pkkl
 /CiQA_infers_tracking_process_stable/
 /POD_SAVE_CKPTs/
@@ -29,6 +30,7 @@ doc/
 maybe_backend
 vq_lord_ckpts_stage2_tune/
 vq_lord_ckpts_stage2_before/
+vq_lord_ckpts_stage3_tune/
 
 /LoRA-LoRD-ckptsvaryTrainNum___41allenai/
 /vArY_TrAiN_num_LoRA-LoRD-ckpts/

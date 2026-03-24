@@ -29,6 +29,7 @@ if [ "${USE_H200_PATHS}" = "1" ]; then
     default_root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
     default_model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
     default_scienceqa_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
+    default_base_ckpt_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts"
     default_stage2_base="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage2_tune/round1_e3"
     default_stage3_root="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune"
 else
@@ -37,6 +38,7 @@ else
     default_root_dir="/root/workspace/align_vq/"
     default_model_path="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
     default_scienceqa_path="/root/autodl-tmp/datasets/ScienceQA"
+    default_base_ckpt_dir="/root/autodl-tmp/vq_lord_ckpts"
     default_stage2_base="/root/autodl-tmp/vq_lord_ckpts_stage2_tune/round1_e3"
     default_stage3_root="/root/autodl-tmp/vq_lord_ckpts_stage3_tune"
 fi
@@ -45,14 +47,19 @@ export python="${PYTHON_BIN:-$default_python}"
 export root_dir="${ROOT_DIR:-$default_root_dir}"
 export model_path="${MODEL_PATH:-$default_model_path}"
 export scienceqa_path="${SCIENCEQA_PATH:-$default_scienceqa_path}"
+export base_ckpt_dir="${BASE_CKPT_DIR:-$default_base_ckpt_dir}"
+export preprocess_dir="${PREPROCESS_DIR:-${base_ckpt_dir}/preprocess}"
+export victim_model="${VICTIM_MODEL:-qwen3.5-flash-2026-02-23}"
 
 export stage2_base_dir="${STAGE2_BASE_DIR:-$default_stage2_base}"
-export stage2_ckpt_path="${STAGE2_CKPT_PATH:-${stage2_base_dir}/stage2_vision}"
-export stage1_codebook_path="${STAGE1_CODEBOOK_PATH:-${stage2_base_dir}/stage1_vq/vq_codebook.pt}"
+export stage2_ckpt_path="${STAGE2_CKPT_PATH:-${stage2_base_dir}/stage2_vision_epoch15}"
+export stage1_codebook_path="${STAGE1_CODEBOOK_PATH:-${stage2_ckpt_path}/vq_codebook.pt}"
 
+legacy_run_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152"
 ts="$(date +%Y%m%d_%H%M%S)"
-export save_dir="${SAVE_DIR:-${default_stage3_root}/run_${ts}}"
+export save_dir="${SAVE_DIR:-${legacy_run_dir}}"
 export stage3_resume_dir="${STAGE3_RESUME_DIR:-${save_dir}/stage3_resume_latest}"
+
 export CUDA_VISIBLE_DEVICES=3
 export PYTHONIOENCODING=utf-8
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
@@ -60,32 +67,49 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 # ---------------------- Stage3 参数 ----------------------
 export stage=3
-export stage3_epochs="${STAGE3_EPOCHS:-10}"   # period_num<=0 时回退
-export sub_stage_num="${SUB_STAGE_NUM:-2}"
-export period_num="${PERIOD_NUM:-3}"
-export sub_set_num="${SUB_SET_NUM:-2000}"
+export stage3_epochs=50  # period_num<=0 时回退
+export sub_stage_num=1
+export period_num=50
+export sub_set_num=0
 
-export train_num="${TRAIN_NUM:-0}"           # 0=全量 train
-export batch_size="${BATCH_SIZE:-8}"
-export grad_accum="${GRAD_ACCUM:-4}"
-export stage3_grad_accum="${STAGE3_GRAD_ACCUM:-4}"
+export train_num=0        # 0=全量 train
+export batch_size=2     # phaseB
+export grad_accum=4
+export stage3_grad_accum=4
 
 export lr="${LR:-3e-5}"
 export stage3_lr_scale="${STAGE3_LR_SCALE:-0.2}"
 export stage3_grad_clip="${STAGE3_GRAD_CLIP:-1.0}"
 export stage3_train_projector="${STAGE3_TRAIN_PROJECTOR:-0}"
 
-export tau1="${TAU1:-0.01}"
-export tau_delta="${TAU_DELTA:-0.01}"
-export temperature="${TEMPERATURE:-1.5}"
+export tau1="${TAU1:-0.001}"
+export tau_delta="${TAU_DELTA:-0.005}"
+export temperature="${TEMPERATURE:-1.2}"
 export max_new_tokens="${MAX_NEW_TOKENS:-128}"
 export max_length="${MAX_LENGTH:-1024}"
 
-export stage3_eval_max_samples="${STAGE3_EVAL_MAX_SAMPLES:-200}"
-export stage3_eval_every_period="${STAGE3_EVAL_EVERY_PERIOD:-1}"
+export stage3_eval_max_samples=0
+export stage3_eval_every_period=1
+export stage3_eval_scienceqa_split="${STAGE3_EVAL_SCIENCEQA_SPLIT:-validation}"
+export stage3_eval_scienceqa_path="${STAGE3_EVAL_SCIENCEQA_PATH:-}"
+export stage3_eval_train_num="${STAGE3_EVAL_TRAIN_NUM:-0}"
+export stage3_eval_answer_mode="${STAGE3_EVAL_ANSWER_MODE:-logits}"
+export stage3_field_weight_observed="${STAGE3_FIELD_WEIGHT_OBSERVED:-1.15}"
+export stage3_field_weight_context="${STAGE3_FIELD_WEIGHT_CONTEXT:-0.30}"
+export stage3_field_weight_reasoning="${STAGE3_FIELD_WEIGHT_REASONING:-1.35}"
+export stage3_field_weight_answer="${STAGE3_FIELD_WEIGHT_ANSWER:-1.50}"
+export stage3_mc_weight="${STAGE3_MC_WEIGHT:-1.00}"
+export stage3_obj_weight="${STAGE3_OBJ_WEIGHT:-0.05}"
+export stage3_reg_weight="${STAGE3_REG_WEIGHT:-0.30}"
+export stage3_answer_anchor_weight="${STAGE3_ANSWER_ANCHOR_WEIGHT:-1.00}"
+export stage3_pair_use_answer_correctness="${STAGE3_PAIR_USE_ANSWER_CORRECTNESS:-1}"
+export stage3_wrong_image_enable="${STAGE3_WRONG_IMAGE_ENABLE:-0}"
+export stage3_wrong_image_weight="${STAGE3_WRONG_IMAGE_WEIGHT:-0.2}"
+export stage3_wrong_image_margin="${STAGE3_WRONG_IMAGE_MARGIN:-0.0}"
+export stage3_force_cold_start_period0=0
 export stage3_resume_save_optimizer="${STAGE3_RESUME_SAVE_OPTIMIZER:-1}"
 export stage3_resume_save_interval="${STAGE3_RESUME_SAVE_INTERVAL:-1}"
-export stage3_resume_path="${STAGE3_RESUME_PATH:-}"
+export stage3_resume_path="${STAGE3_RESUME_PATH:-${stage3_resume_dir}}"
 
 # 与 Stage2 保持一致
 export vq_codebook_size="${VQ_CODEBOOK_SIZE:-1024}"
@@ -97,10 +121,10 @@ export vq_legacy_loss="${VQ_LEGACY_LOSS:-0}"
 export freeze_vision_tower="${FREEZE_VISION_TOWER:-0}"
 export beta="${BETA:-0.05}"
 
-export use_lora="${USE_LORA:-1}"
-export lora_rank="${LORA_RANK:-64}"
+export use_lora=1
+export lora_rank=64
 export lora_alpha_val="${LORA_ALPHA:-128}"
-export use_4bit="${USE_4BIT:-0}"
+export use_4bit=0
 export model_dtype="${MODEL_DTYPE:-bfloat16}"
 
 export dataset_name="scienceqa"
@@ -109,10 +133,18 @@ export scienceqa_seed="${SCIENCEQA_SEED:-20240306}"
 export teacher_lang="${TEACHER_LANG:-en}"
 export collect_teacher_data="${COLLECT_TEACHER_DATA:-0}"
 export strict_teacher_distill="${STRICT_TEACHER_DISTILL:-0}"
-export scienceqa_preprocessed_path=""
-export bucket_batch_size=0
-export stage3_bucket_batch_size=0
-export disable_bucket_for_stage3=1
+export teacher_cache_path="${TEACHER_CACHE_PATH:-}"
+export teacher_observed_max_tokens="${TEACHER_OBSERVED_MAX_TOKENS:-256}"
+export teacher_context_max_tokens="${TEACHER_CONTEXT_MAX_TOKENS:-192}"
+export teacher_reasoning_max_tokens="${TEACHER_REASONING_MAX_TOKENS:-256}"
+export teacher_answer_max_tokens="${TEACHER_ANSWER_MAX_TOKENS:-64}"
+export teacher_max_new_tokens_total="${TEACHER_MAX_NEW_TOKENS_TOTAL:-768}"
+export stage3_vic_include_context="${STAGE3_VIC_INCLUDE_CONTEXT:-0}"
+export scienceqa_preprocessed_path="${SCIENCEQA_PREPROCESSED_PATH:-${preprocess_dir}/scienceqa_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_patches_bs8.json}"
+export bucket_batch_size=8
+export stage3_bucket_batch_size=16      # phaseA
+export disable_bucket_for_stage3="${DISABLE_BUCKET_FOR_STAGE3:-0}"
+export stage3_sample_cache_path="${STAGE3_SAMPLE_CACHE_PATH:-${stage2_base_dir}/stage3_sample_cache_${victim_model}_${scienceqa_split}_n${train_num}_seed${scienceqa_seed}_ml${max_length}_ctx${stage3_vic_include_context}_obs${teacher_observed_max_tokens}_txt${teacher_context_max_tokens}_rsn${teacher_reasoning_max_tokens}_ans${teacher_answer_max_tokens}.pt}"
 
 export reuse_vq_codebook=1
 export reuse_stage2=1
@@ -130,15 +162,14 @@ export stage2_vision_lr_scale="${STAGE2_VISION_LR_SCALE:-0.2}"
 export stage2_grad_clip="${STAGE2_GRAD_CLIP:-1.0}"
 export stage2_grad_accum="${STAGE2_GRAD_ACCUM:-4}"
 
-export log_step="${LOG_STEP:-50}"
-export save_step="${SAVE_STEP:-200}"
-export save_each_epoch="${SAVE_EACH_EPOCH:-1}"
-export victim_model="${VICTIM_MODEL:-qwen3.5-flash-2026-02-23}"
+export log_step="${LOG_STEP:-100}"
+export save_step=0
+export save_each_epoch=1
 
 # 评估配置（Stage3 后）
-export eval_max_samples="${EVAL_MAX_SAMPLES:-500}"
+export eval_max_samples=2097
 export eval_max_new_tokens="${EVAL_MAX_NEW_TOKENS:-64}"
-export eval_answer_mode="${EVAL_ANSWER_MODE:-hybrid}"
+export eval_answer_mode="${EVAL_ANSWER_MODE:-logit}"
 export eval_use_vq=1
 export eval_val_save_path="${save_dir}/stage3_eval_validation_${eval_answer_mode}.json"
 export eval_test_save_path="${save_dir}/stage3_eval_test_${eval_answer_mode}.json"
@@ -155,10 +186,21 @@ echo "stage2_ckpt_path: ${stage2_ckpt_path}"
 echo "save_dir: ${save_dir}"
 echo "stage3_resume_path: ${stage3_resume_path:-<empty>}"
 echo "stage3_resume_dir: ${stage3_resume_dir}"
+echo "stage3_sample_cache_path: ${stage3_sample_cache_path}"
+echo "scienceqa_preprocessed_path: ${scienceqa_preprocessed_path}"
+echo "stage3_bucket_batch_size/disable_bucket_for_stage3: ${stage3_bucket_batch_size}/${disable_bucket_for_stage3}"
+echo "teacher_cache_path: ${teacher_cache_path:-<auto *_new.json>}"
 echo "sub_stage/period/subset: ${sub_stage_num}/${period_num}/${sub_set_num}"
 echo "batch_size/grad_accum/stage3_grad_accum: ${batch_size}/${grad_accum}/${stage3_grad_accum}"
 echo "tau1/tau_delta/max_new_tokens: ${tau1}/${tau_delta}/${max_new_tokens}"
 echo "stage3_eval_max_samples/every_period: ${stage3_eval_max_samples}/${stage3_eval_every_period}"
+echo "stage3_eval_split/path/train_num: ${stage3_eval_scienceqa_split}/${stage3_eval_scienceqa_path:-<reuse scienceqa_path>}/${stage3_eval_train_num}"
+echo "stage3_eval_answer_mode: ${stage3_eval_answer_mode}"
+echo "stage3_field_weight(obs/ctx/reason/ans): ${stage3_field_weight_observed}/${stage3_field_weight_context}/${stage3_field_weight_reasoning}/${stage3_field_weight_answer}"
+echo "stage3_mc/obj/reg/ans_anchor: ${stage3_mc_weight}/${stage3_obj_weight}/${stage3_reg_weight}/${stage3_answer_anchor_weight}"
+echo "stage3_pair_by_answer: ${stage3_pair_use_answer_correctness}"
+echo "stage3_wrong_image(enable/weight/margin): ${stage3_wrong_image_enable}/${stage3_wrong_image_weight}/${stage3_wrong_image_margin}"
+echo "stage3_force_cold_start_period0: ${stage3_force_cold_start_period0}"
 echo "======================================================"
 
 mkdir -p "${save_dir}"
@@ -237,6 +279,23 @@ fi
     --stage3_train_projector="${stage3_train_projector}" \
     --stage3_eval_max_samples="${stage3_eval_max_samples}" \
     --stage3_eval_every_period="${stage3_eval_every_period}" \
+    --stage3_eval_scienceqa_split="${stage3_eval_scienceqa_split}" \
+    --stage3_eval_scienceqa_path="${stage3_eval_scienceqa_path}" \
+    --stage3_eval_train_num="${stage3_eval_train_num}" \
+    --stage3_eval_answer_mode="${stage3_eval_answer_mode}" \
+    --stage3_field_weight_observed="${stage3_field_weight_observed}" \
+    --stage3_field_weight_context="${stage3_field_weight_context}" \
+    --stage3_field_weight_reasoning="${stage3_field_weight_reasoning}" \
+    --stage3_field_weight_answer="${stage3_field_weight_answer}" \
+    --stage3_mc_weight="${stage3_mc_weight}" \
+    --stage3_obj_weight="${stage3_obj_weight}" \
+    --stage3_reg_weight="${stage3_reg_weight}" \
+    --stage3_answer_anchor_weight="${stage3_answer_anchor_weight}" \
+    --stage3_pair_use_answer_correctness="${stage3_pair_use_answer_correctness}" \
+    --stage3_wrong_image_enable="${stage3_wrong_image_enable}" \
+    --stage3_wrong_image_weight="${stage3_wrong_image_weight}" \
+    --stage3_wrong_image_margin="${stage3_wrong_image_margin}" \
+    --stage3_force_cold_start_period0="${stage3_force_cold_start_period0}" \
     --sub_stage_num="${sub_stage_num}" \
     --period_num="${period_num}" \
     --sub_set_num="${sub_set_num}" \
@@ -254,6 +313,13 @@ fi
     --collect_teacher_data="${collect_teacher_data}" \
     --strict_teacher_distill="${strict_teacher_distill}" \
     --teacher_lang="${teacher_lang}" \
+    --teacher_cache_path="${teacher_cache_path}" \
+    --teacher_observed_max_tokens="${teacher_observed_max_tokens}" \
+    --teacher_context_max_tokens="${teacher_context_max_tokens}" \
+    --teacher_reasoning_max_tokens="${teacher_reasoning_max_tokens}" \
+    --teacher_answer_max_tokens="${teacher_answer_max_tokens}" \
+    --teacher_max_new_tokens_total="${teacher_max_new_tokens_total}" \
+    --stage3_vic_include_context="${stage3_vic_include_context}" \
     --reuse_vq_codebook="${reuse_vq_codebook}" \
     --reuse_stage2="${reuse_stage2}" \
     --vq_codebook_path="${stage1_codebook_path}" \
@@ -266,6 +332,7 @@ fi
     --stage3_resume_save_path="${stage3_resume_dir}" \
     --stage3_resume_save_optimizer="${stage3_resume_save_optimizer}" \
     --stage3_resume_save_interval="${stage3_resume_save_interval}" \
+    --stage3_sample_cache_path="${stage3_sample_cache_path}" \
     --device="cuda"
 
 stage3_final_adapter="${save_dir}/stage3_lord_final"
@@ -358,4 +425,3 @@ echo "Validation: acc=${val_acc}, format_rate=${val_fmt}, n=${val_n}"
 echo "Test:       acc=${test_acc}, format_rate=${test_fmt}, n=${test_n}"
 echo "保存目录: ${save_dir}"
 echo "======================================================"
-
