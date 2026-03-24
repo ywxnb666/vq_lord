@@ -34,6 +34,21 @@ import time
 from datasets import load_dataset
 
 
+def _parse_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value}")
+
+
 @dataclass
 class VisualQAItem:
     """视觉问答数据项"""
@@ -74,6 +89,7 @@ class GPT4VDataCollector:
         save_dir: str = "./vq_lord_data",
         max_retries: int = 3,
         http_timeout: float = 120.0,
+        enable_thinking: Optional[bool] = None,
     ):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
@@ -81,6 +97,7 @@ class GPT4VDataCollector:
         self.save_dir = save_dir
         self.max_retries = max_retries
         self.http_timeout = http_timeout
+        self.enable_thinking = enable_thinking
         self._client = None
         self._http_client = None
         
@@ -141,6 +158,11 @@ class GPT4VDataCollector:
                 self._http_client.close()
             except Exception:
                 pass
+
+    def _build_model_extra_body(self) -> Optional[dict]:
+        if self.enable_thinking is None:
+            return None
+        return {"enable_thinking": self.enable_thinking}
     
     def encode_image_base64(self, image_path: str) -> str:
         """将图片编码为 base64"""
@@ -192,9 +214,9 @@ class GPT4VDataCollector:
             
             for attempt in range(self.max_retries):
                 try:
-                    response = client.chat.completions.create(
-                        model=self.model,
-                        messages=[
+                    request_kwargs = {
+                        "model": self.model,
+                        "messages": [
                             {
                                 "role": "user",
                                 "content": [
@@ -212,14 +234,20 @@ class GPT4VDataCollector:
                                 ],
                             }
                         ],
-                        max_tokens=max_tokens,
+                        "max_tokens": max_tokens,
+                    }
+                    extra_body = self._build_model_extra_body()
+                    if extra_body is not None:
+                        request_kwargs["extra_body"] = extra_body
+                    response = client.chat.completions.create(
+                        **request_kwargs,
                     )
                     return response.choices[0].message.content
                     
                 except Exception as e:
                     print(f"API 调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
                     if attempt < self.max_retries - 1:
-                        time.sleep(2)
+                        time.sleep(2 * attempt)  
             
             return None
 
@@ -255,9 +283,9 @@ class GPT4VDataCollector:
 
             for attempt in range(self.max_retries):
                 try:
-                    response = client.chat.completions.create(
-                        model=self.model,
-                        messages=[
+                    request_kwargs = {
+                        "model": self.model,
+                        "messages": [
                             {
                                 "role": "user",
                                 "content": [
@@ -275,19 +303,25 @@ class GPT4VDataCollector:
                                 ],
                             }
                         ],
-                        max_tokens=max_tokens,
+                        "max_tokens": max_tokens,
+                    }
+                    extra_body = self._build_model_extra_body()
+                    if extra_body is not None:
+                        request_kwargs["extra_body"] = extra_body
+                    response = client.chat.completions.create(
+                        **request_kwargs,
                     )
                     return response.choices[0].message.content
                 except Exception as e:
                     print(f"API 调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
                     if attempt < self.max_retries - 1:
-                        time.sleep(2)
+                        time.sleep(2 * attempt)
 
             return None
         except Exception as e:
             print(f"教师模型查询失败: {e}")
             return None
-    
+
     def collect_visual_qa_data(
         self,
         image_paths: List[str],
@@ -600,14 +634,74 @@ def _extract_json_payload(text: str) -> Optional[dict]:
             if isinstance(data, dict):
                 return data
         except Exception:
-            return None
+            pass
+
+    field_names = list(TEACHER_REQUIRED_FIELDS)
+    escaped_names = "|".join(re.escape(name) for name in field_names)
+    kv_pattern = re.compile(
+        rf"(?ms)^\s*({escaped_names})\s*:\s*(.*?)\s*(?=^\s*(?:{escaped_names})\s*:|\Z)"
+    )
+    matches = kv_pattern.findall(cleaned)
+    if matches:
+        payload = {}
+        for key, value in matches:
+            payload[str(key).strip()] = str(value).strip()
+        if all(payload.get(field, "").strip() for field in TEACHER_REQUIRED_FIELDS):
+            return payload
     return None
+
+
+def _extract_partial_struct_payload(text: str) -> Optional[dict]:
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    payload = {}
+    patterns = {
+        "answer": r'"answer"\s*:\s*"((?:\\.|[^"\\])*)"',
+        "observed_facts_visual": r'"observed_facts_visual"\s*:\s*"((?:\\.|[^"\\])*)"',
+        "context_textual": r'"context_textual"\s*:\s*"((?:\\.|[^"\\])*)"',
+        "reasoning": r'"reasoning"\s*:\s*"((?:\\.|[^"\\])*)"',
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, cleaned, flags=re.DOTALL)
+        if match:
+            try:
+                payload[key] = json.loads(f'"{match.group(1)}"')
+            except Exception:
+                payload[key] = match.group(1)
+
+    if not all(payload.get(field, "").strip() for field in TEACHER_REQUIRED_FIELDS):
+        return None
+    return payload
 
 
 def _normalize_match_text(text: str) -> str:
     text = str(text or "").strip().lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _coerce_struct_field_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            text = _coerce_struct_field_to_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True).strip()
+        except Exception:
+            return str(value).strip()
+    return str(value).strip()
 
 
 def _build_canonical_context(sample: Optional[dict]) -> str:
@@ -665,20 +759,18 @@ def _normalize_choice_answer(answer: str, sample: Optional[dict], max_tokens: in
 
 def _has_observed_leakage(text: str) -> bool:
     text_l = str(text or "").lower()
-    banned_substrings = [
-        "therefore",
-        "thus",
-        "hence",
-        "best fit",
-        "best matches",
-        "aligns best",
-        "option ",
-        "the answer",
-        "this means",
-        "so the",
-        "corresponds to",
+    banned_patterns = [
+        r"\bbest fit\b",
+        r"\bbest matches\b",
+        r"\baligns best\b",
+        r"\boption\s*[a-z]\b",
+        r"\bthe answer\b",
+        r"\bcorrect answer\b",
+        r"\bthis means\b.{0,40}\b(option|answer|correct|repel|attract|true|false)\b",
+        r"\bso the\b.{0,40}\b(option|answer|correct|repel|attract|true|false)\b",
+        r"\b(corresponds to|therefore|thus|hence)\b.{0,60}\b(option|answer|correct|repel|attract|true|false)\b",
     ]
-    return any(s in text_l for s in banned_substrings)
+    return any(re.search(pattern, text_l) for pattern in banned_patterns)
 
 
 def _semantic_issue_flags(annotation: Optional[dict], sample: Optional[dict]) -> List[str]:
@@ -705,10 +797,12 @@ def _normalize_struct_payload(payload: Optional[dict], budget: dict, sample: Opt
 
     normalized = {
         "format_version": TEACHER_SCHEMA_VERSION,
-        "observed_facts_visual": payload.get("observed_facts_visual", payload.get("observed_facts", "")),
-        "context_textual": payload.get("context_textual", payload.get("context", "")),
-        "reasoning": payload.get("reasoning", ""),
-        "answer": payload.get("answer", ""),
+        "observed_facts_visual": _coerce_struct_field_to_text(
+            payload.get("observed_facts_visual", payload.get("observed_facts", ""))
+        ),
+        "context_textual": _coerce_struct_field_to_text(payload.get("context_textual", payload.get("context", ""))),
+        "reasoning": _coerce_struct_field_to_text(payload.get("reasoning", "")),
+        "answer": _coerce_struct_field_to_text(payload.get("answer", "")),
     }
     canonical_context = _build_canonical_context(sample)
     if canonical_context:
@@ -740,13 +834,17 @@ def _build_structured_teacher_prompt(instruction: str, lang: str, extra_strict: 
     if str(lang).lower() == "zh":
         base_prompt = (
             "你是严谨的视觉科学题解答助手。\n"
-            "请仅输出严格 JSON，必须且只包含以下键：\n"
-            "observed_facts_visual, context_textual, reasoning, answer。\n"
+            "请仅输出严格 JSON，必须且只包含以下键，并按这个顺序输出：\n"
+            "answer, observed_facts_visual, context_textual, reasoning。\n"
             "规则：\n"
+            "0) 四个字段的值都必须是字符串，不要输出数组、列表或对象。\n"
+            "0.1) 输出必须是一个合法 JSON object，不要写成 'field: value' 纯文本格式。\n"
+            "0.2) 如果对题目犹豫或不确定，也必须从给定选项中选择你认为概率最大的那个选项。\n"
+            "0.3) 一旦犹豫，请直接把最可能的选项写进 answer，不要继续讨论不确定性。\n"
+            "0.4) answer 必须最先输出，优先格式 '(A) option text'。\n"
             "1) observed_facts_visual 只写图像可见证据（可含 OCR），不要写推理、不要写选项匹配、不要写 '对应某地区/某国家/某答案' 之类判断。\n"
             "2) context_textual 必须完整重述题干、提示与选项文本条件。\n"
-            "3) reasoning 写基于前两者的推理，可以引用选项，但不要把推理写进 observed_facts_visual。\n"
-            "4) answer 输出最终选项，优先格式 '(A) option text'。\n"
+            "3) reasoning 写基于前两者的简短推理，只允许 1 句，可以引用选项，但不要把推理写进 observed_facts_visual。\n"
             "不要输出 markdown，不要额外字段。\n\n"
         )
         extra_prompt = (
@@ -756,13 +854,17 @@ def _build_structured_teacher_prompt(instruction: str, lang: str, extra_strict: 
         return base_prompt + extra_prompt + instruction
     base_prompt = (
         "You are a rigorous visual science QA assistant.\n"
-        "Return strict JSON only with exactly keys:\n"
-        "observed_facts_visual, context_textual, reasoning, answer.\n"
+        "Return strict JSON only with exactly keys in this order:\n"
+        "answer, observed_facts_visual, context_textual, reasoning.\n"
         "Rules:\n"
+        "0) Every field value must be a plain string. Do not output arrays, lists, or objects.\n"
+        "0.1) The output must be a valid JSON object, not plain 'field: value' text.\n"
+        "0.2) If you are uncertain, you must still choose the option that is most likely to be correct from the provided choices.\n"
+        "0.3) Once uncertain, write the most likely option in the answer field immediately and do not continue debating the uncertainty.\n"
+        "0.4) The answer field must appear first, preferably as '(A) option text'.\n"
         "1) observed_facts_visual: only image-observable evidence (OCR allowed); no inference, no option matching, no 'corresponds to', no final identification beyond what is directly visible.\n"
         "2) context_textual: restate the full textual conditions from question, hint, and options.\n"
-        "3) reasoning: explicit reasoning from (1)+(2); option comparison belongs here, not in observed_facts_visual.\n"
-        "4) answer: final selected option, preferably in the form '(A) option text'.\n"
+        "3) reasoning: one short sentence only; option comparison belongs here, not in observed_facts_visual.\n"
         "No markdown, no extra fields.\n\n"
     )
     extra_prompt = (
@@ -1039,21 +1141,29 @@ def _collect_teacher_annotation(
 ) -> Tuple[Optional[dict], Optional[str], List[str]]:
     image = sample.get("image")
     raw_response = None
-    prompt = _build_structured_teacher_prompt(
-        sample.get("instruction", ""),
-        args.teacher_lang,
-        extra_strict=False,
-    )
-    if image is not None:
-        raw_response = collector.query_gpt4v_image(
-            image=image,
-            prompt=prompt,
-            max_tokens=int(args.teacher_max_new_tokens_total),
-            image_format="PNG",
+    ann = None
+    issues: List[str] = ["invalid_json_or_missing_fields"]
+    attempts = max(1, int(getattr(args, "max_retries", 1)))
+    for generation_attempt in range(attempts):
+        prompt = _build_structured_teacher_prompt(
+            sample.get("instruction", ""),
+            args.teacher_lang,
+            extra_strict=(generation_attempt > 0),
         )
-    parsed = _extract_json_payload(raw_response or "")
-    ann = _normalize_struct_payload(parsed, budget, sample=sample)
-    issues = _semantic_issue_flags(ann, sample)
+        if image is not None:
+            raw_response = collector.query_gpt4v_image(
+                image=image,
+                prompt=prompt,
+                max_tokens=int(args.teacher_max_new_tokens_total),
+                image_format="PNG",
+            )
+        parsed = _extract_json_payload(raw_response or "")
+        if parsed is None:
+            parsed = _extract_partial_struct_payload(raw_response or "")
+        ann = _normalize_struct_payload(parsed, budget, sample=sample)
+        issues = _semantic_issue_flags(ann, sample)
+        if ann is not None and not issues:
+            break
     return ann, raw_response, issues
 
 
@@ -1094,6 +1204,7 @@ def _run_scienceqa_struct_worker(args: argparse.Namespace) -> None:
             model=args.victim_model,
             save_dir=args.data_dir,
             max_retries=int(args.max_retries),
+            enable_thinking=_parse_optional_bool(args.teacher_enable_thinking),
         )
         if not collector.api_key:
             raise RuntimeError("collect_teacher_data=1 but missing API key")
@@ -1216,6 +1327,7 @@ def _spawn_sharded_workers(
             "--teacher_lang", args.teacher_lang,
             "--teacher_api_base", args.teacher_api_base,
             "--teacher_api_key", args.teacher_api_key,
+            "--teacher_enable_thinking", str(args.teacher_enable_thinking),
             "--collect_teacher_data", str(args.collect_teacher_data),
             "--strict_teacher_distill", str(args.strict_teacher_distill),
             "--teacher_observed_max_tokens", str(args.teacher_observed_max_tokens),
@@ -1397,6 +1509,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher_lang", type=str, default="en", choices=["zh", "en"])
     parser.add_argument("--teacher_api_base", type=str, default=os.environ.get("OPENAI_API_BASE", ""))
     parser.add_argument("--teacher_api_key", type=str, default=os.environ.get("OPENAI_API_KEY", ""))
+    parser.add_argument("--teacher_enable_thinking", type=str, default=os.environ.get("TEACHER_ENABLE_THINKING", ""))
     parser.add_argument("--collect_teacher_data", type=int, default=1)
     parser.add_argument("--strict_teacher_distill", type=int, default=1)
 
