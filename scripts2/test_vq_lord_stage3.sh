@@ -1,9 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align}"
-SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
+SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_SOURCE_DIR}/common.sh"
 
 align_vq_init_paths
@@ -11,21 +10,21 @@ align_vq_setup_env
 align_vq_ensure_runtime_dirs
 align_vq_setup_logging "test_vq_lord_stage3"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Evaluation
+EVAL_SPLIT="test"
+EVAL_MAX_SAMPLES=0      # 0 表示全量
+EVAL_MAX_NEW_TOKENS=128
+EVAL_ANSWER_MODE=logits     # logits, generate, hybrid
+USE_4BIT=0
+USE_VQ=1
+VQ_CODEBOOK_SIZE=1024
+FREEZE_VISION_TOWER=0
 
 # Paths
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process.py"
-STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3_lord_final}"
-RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage3_test_logits.json}"
-
-# Evaluation
-EVAL_SPLIT="${EVAL_SPLIT:-test}"
-EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
-EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-64}"
-EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-logits}"
-USE_4BIT="${USE_4BIT:-0}"
-VQ_CODEBOOK_SIZE="${VQ_CODEBOOK_SIZE:-1024}"
-FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-0}"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2.py"
+STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3_sub1_period7}"
+# STAGE3_FINAL_ADAPTER_PATH="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7"
+RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}.json}"
 
 align_vq_print_header "Stage3 产物评测"
 echo "ROOT_DIR: ${ROOT_DIR}"
@@ -50,7 +49,7 @@ mkdir -p "$(dirname "${RESULT_PATH}")"
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
     --use_4bit="${USE_4BIT}" \
-    --use_vq=1 \
+    --use_vq="${USE_VQ}" \
     --vq_codebook_size="${VQ_CODEBOOK_SIZE}" \
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --vq_codebook_path="${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" \

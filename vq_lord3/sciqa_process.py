@@ -19,7 +19,7 @@ import hashlib
 import json
 import os
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from datasets import load_dataset
@@ -255,6 +255,56 @@ def load_vq_codebook_for_inference(model, vq_codebook_path: str):
     return True
 
 
+def _load_torch_state(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _load_parameter_state_for_inference(model, parameter_state: dict, state_name: str) -> Tuple[int, int]:
+    if not parameter_state:
+        print(f"[Warn] {state_name} 为空，跳过加载")
+        return 0, 0
+
+    model_state = model.state_dict()
+    loaded = 0
+    skipped = 0
+    with torch.no_grad():
+        for name, tensor in parameter_state.items():
+            target = model_state.get(name)
+            if target is None or target.shape != tensor.shape:
+                skipped += 1
+                continue
+            target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            loaded += 1
+
+    print(f"[Info] 已加载 {state_name}: loaded={loaded}, skipped={skipped}")
+    return loaded, skipped
+
+
+def load_projector_state_for_inference(model, adapter_path: str) -> Tuple[bool, int, int]:
+    if not adapter_path:
+        return False, 0, 0
+    projector_path = os.path.join(adapter_path, "projector.pt")
+    if not os.path.exists(projector_path):
+        return False, 0, 0
+    state = _load_torch_state(projector_path)
+    loaded, skipped = _load_parameter_state_for_inference(model, state, "projector_state")
+    return True, loaded, skipped
+
+
+def load_trainable_state_for_inference(model, adapter_path: str) -> Tuple[bool, int, int]:
+    if not adapter_path:
+        return False, 0, 0
+    state_path = os.path.join(adapter_path, "trainable_model_state.pt")
+    if not os.path.exists(state_path):
+        return False, 0, 0
+    state = _load_torch_state(state_path)
+    loaded, skipped = _load_parameter_state_for_inference(model, state, "trainable_model_state")
+    return True, loaded, skipped
+
+
 def load_model_and_processor(
     model_path: str,
     adapter_path: str,
@@ -273,6 +323,12 @@ def load_model_and_processor(
         "vq_codebook_size": int(vq_codebook_size),
         "vq_codebook_path": vq_codebook_path,
         "vq_codebook_loaded": False,
+        "projector_state_found": False,
+        "projector_state_loaded": 0,
+        "projector_state_skipped": 0,
+        "trainable_state_found": False,
+        "trainable_state_loaded": 0,
+        "trainable_state_skipped": 0,
     }
 
     if use_4bit:
@@ -305,18 +361,38 @@ def load_model_and_processor(
                 f"adapter_path does not exist, refusing to fallback to base model: {adapter_path}"
             )
 
+    if adapter_path:
+        found, loaded, skipped = load_projector_state_for_inference(model, adapter_path)
+        load_info["projector_state_found"] = bool(found)
+        load_info["projector_state_loaded"] = int(loaded)
+        load_info["projector_state_skipped"] = int(skipped)
+
     if use_vq:
+        resolved_vq_codebook_path = vq_codebook_path
+        if not resolved_vq_codebook_path and adapter_path:
+            fallback_vq_path = os.path.join(adapter_path, "vq_codebook.pt")
+            if os.path.exists(fallback_vq_path):
+                resolved_vq_codebook_path = fallback_vq_path
+                print(f"[Info] 未显式提供 vq_codebook_path，回退到 adapter 目录: {resolved_vq_codebook_path}")
+        load_info["vq_codebook_path"] = resolved_vq_codebook_path
+
         model = add_vq_inference_hook(
             model,
             vq_codebook_size=vq_codebook_size,
             freeze_vision_tower=freeze_vision_tower,
         )
-        loaded = load_vq_codebook_for_inference(model, vq_codebook_path)
+        loaded = load_vq_codebook_for_inference(model, resolved_vq_codebook_path)
         load_info["vq_codebook_loaded"] = bool(loaded)
         if loaded:
-            print(f"[Info] VQ enabled with codebook: {vq_codebook_path}")
+            print(f"[Info] VQ enabled with codebook: {resolved_vq_codebook_path}")
         else:
             print("[Warning] VQ enabled but codebook not loaded, behavior may mismatch training")
+
+    if adapter_path:
+        found, loaded, skipped = load_trainable_state_for_inference(model, adapter_path)
+        load_info["trainable_state_found"] = bool(found)
+        load_info["trainable_state_loaded"] = int(loaded)
+        load_info["trainable_state_skipped"] = int(skipped)
 
     model.eval()
 
@@ -497,6 +573,12 @@ def main():
         "vq_codebook_size": int(args.vq_codebook_size),
         "vq_codebook_path": args.vq_codebook_path,
         "vq_codebook_loaded": load_info.get("vq_codebook_loaded", False),
+        "projector_state_found": load_info.get("projector_state_found", False),
+        "projector_state_loaded": load_info.get("projector_state_loaded", 0),
+        "projector_state_skipped": load_info.get("projector_state_skipped", 0),
+        "trainable_state_found": load_info.get("trainable_state_found", False),
+        "trainable_state_loaded": load_info.get("trainable_state_loaded", 0),
+        "trainable_state_skipped": load_info.get("trainable_state_skipped", 0),
         "answer_mode": args.answer_mode,
     }
     run_eval(

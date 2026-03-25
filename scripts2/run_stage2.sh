@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align}"
+# ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align}"
 SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_SOURCE_DIR}/common.sh"
@@ -10,8 +10,6 @@ align_vq_init_paths
 align_vq_setup_env
 align_vq_ensure_runtime_dirs
 align_vq_setup_logging "run_stage2"
-
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 # Paths
 TRAIN_ENTRY="${ROOT_DIR}/vq_lord3/train_vq_lord3.py"
@@ -55,9 +53,6 @@ MAX_LENGTH="${MAX_LENGTH:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 
 # VQ / model
-VICTIM_MODEL="${VICTIM_MODEL:-qwen3.5-flash-2026-02-23}"
-TEACHER_API_BASE="${TEACHER_API_BASE:-${OPENAI_BASE_URL:-}}"
-TEACHER_API_KEY="${TEACHER_API_KEY:-${OPENAI_API_KEY:-}}"
 VQ_CODEBOOK_SIZE="${VQ_CODEBOOK_SIZE:-1024}"
 VQ_COMMITMENT_COST="${VQ_COMMITMENT_COST:-0.25}"
 VQ_DEAD_CODE_THRESHOLD="${VQ_DEAD_CODE_THRESHOLD:-1.0}"

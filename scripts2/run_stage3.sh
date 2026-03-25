@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align}"
+# ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align}"
 SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_SOURCE_DIR}/common.sh"
@@ -11,11 +11,9 @@ align_vq_setup_env
 align_vq_ensure_runtime_dirs
 align_vq_setup_logging "run_stage3"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-
 # Paths
 TRAIN_ENTRY="${ROOT_DIR}/vq_lord3/train_vq_lord3.py"
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2.py"
 SAVE_PATH="${CKPT_DIR}"
 STAGE1_CODEBOOK_PATH="${STAGE1_CODEBOOK_PATH:-${CKPT_DIR}/stage1_vq/vq_codebook.pt}"
 STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2_vision}"
@@ -77,7 +75,6 @@ STAGE3_WRONG_IMAGE_MARGIN="${STAGE3_WRONG_IMAGE_MARGIN:-0.0}"
 STAGE3_FORCE_COLD_START_PERIOD0="${STAGE3_FORCE_COLD_START_PERIOD0:-0}"
 
 # VQ / model
-VICTIM_MODEL="${VICTIM_MODEL:-qwen3.5-flash-2026-02-23}"
 VQ_CODEBOOK_SIZE="${VQ_CODEBOOK_SIZE:-1024}"
 VQ_COMMITMENT_COST="${VQ_COMMITMENT_COST:-0.25}"
 VQ_DEAD_CODE_THRESHOLD="${VQ_DEAD_CODE_THRESHOLD:-1.0}"

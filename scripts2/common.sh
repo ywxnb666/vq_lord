@@ -1,18 +1,23 @@
 #!/bin/bash
 
-ALIGN_VQ_H200_ROOT_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align"
-ALIGN_VQ_H200_PYTHON_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
-ALIGN_VQ_H200_MODEL_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
-ALIGN_VQ_H200_SCIENCEQA_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
+# ROOT_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align"
+# PYTHON_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
+# MODEL_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
+# SCIENCEQA_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
+
+ROOT_DEFAULT="/root/workspace/vq_lord"
+PYTHON_DEFAULT="/root/autodl-tmp/conda/envs/align_vq/bin/python"
+MODEL_DEFAULT="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+SCIENCEQA_DEFAULT="/root/autodl-tmp/datasets/ScienceQA"
 
 align_vq_init_paths() {
-    ROOT_DIR="${ROOT_DIR:-$ALIGN_VQ_H200_ROOT_DEFAULT}"
+    ROOT_DIR="${ROOT_DIR:-$ROOT_DEFAULT}"
     ROOT_DIR="${ROOT_DIR%/}"
 
     SCRIPT_DIR="${ROOT_DIR}/scripts"
-    PYTHON_BIN="${PYTHON_BIN:-$ALIGN_VQ_H200_PYTHON_DEFAULT}"
-    MODEL_PATH="${MODEL_PATH:-$ALIGN_VQ_H200_MODEL_DEFAULT}"
-    SCIENCEQA_PATH="${SCIENCEQA_PATH:-$ALIGN_VQ_H200_SCIENCEQA_DEFAULT}"
+    PYTHON_BIN="${PYTHON_BIN:-$PYTHON_DEFAULT}"
+    MODEL_PATH="${MODEL_PATH:-$MODEL_DEFAULT}"
+    SCIENCEQA_PATH="${SCIENCEQA_PATH:-$SCIENCEQA_DEFAULT}"
 
     CKPT_DIR="${ROOT_DIR}/vq_lord_ckpts"
     DATA_DIR="${ROOT_DIR}/vq_lord_data"
@@ -25,6 +30,10 @@ align_vq_init_paths() {
 }
 
 align_vq_setup_env() {
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+    export VICTIM_MODEL="${VICTIM_MODEL:-qwen3.5-flash-2026-02-23}"
+    export TEACHER_API_BASE="${TEACHER_API_BASE:-${OPENAI_BASE_URL:-${OPENAI_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}}}"
+    export TEACHER_API_KEY="${TEACHER_API_KEY:-${OPENAI_API_KEY:-}}"
     export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12}"
     export PATH="${CUDA_HOME}/bin:${PATH}"
     export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"

@@ -1,3 +1,5 @@
+# synced 2026-03-25: script audit completed against data_preprocess/ and vq_lord3/
+# audited entrypoints: sciqa_preprocess.py, data_collector2.py, train_vq_lord3.py, sciqa_process.py, sciqa_process2.py
 bert-score==0.3.13
 bitsandbytes==0.42.0
 datasets==2.17.0

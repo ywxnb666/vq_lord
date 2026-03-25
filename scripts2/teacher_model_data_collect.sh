@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align}"
+# ROOT_DIR="${ROOT_DIR:-/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align}"
 SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_SOURCE_DIR}/common.sh"
@@ -21,10 +21,7 @@ SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 
 # Teacher
-VICTIM_MODEL="${VICTIM_MODEL:-qwen3.5-flash-2026-02-23}"
 TEACHER_LANG="${TEACHER_LANG:-en}"
-TEACHER_API_BASE="${TEACHER_API_BASE:-${OPENAI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}}"
-TEACHER_API_KEY="${TEACHER_API_KEY:-${OPENAI_API_KEY:-}}"
 TEACHER_ENABLE_THINKING="${TEACHER_ENABLE_THINKING:-0}"
 COLLECT_TEACHER_DATA="${COLLECT_TEACHER_DATA:-1}"
 STRICT_TEACHER_DISTILL="${STRICT_TEACHER_DISTILL:-1}"
