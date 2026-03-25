@@ -80,7 +80,7 @@ export OPENAI_API_KEY="sk-abc8c59df2d64b7ba22718eae4fe80c2"
 # ================== VQ-LoRD 参数配置 ==================
 
 # VQ 参数
-export vq_codebook_size=1024    # 回调到 512（按你的要求）
+export vq_codebook_size=1024
 export vq_commitment_cost=0.25  # 与 taming 的 VQ commitment 一致
 export vq_dead_code_threshold=1.0  # dead code EMA 阈值（用于重置低使用 code）
 export vq_usage_decay=0.99       # code 使用率 EMA 衰减

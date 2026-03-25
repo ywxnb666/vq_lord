@@ -25,7 +25,7 @@ if [ "${USE_H200_PATHS}" = "1" ]; then
     export SERVER_NAME="H200"
     default_python="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/.align_vq/bin/python"
     default_root_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/"
-    default_run_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage2_tune/round1_e3"
+    default_run_dir="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152"
     default_model_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
     default_scienceqa_path="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
 else
@@ -56,7 +56,7 @@ export use_vq="${USE_VQ:-1}"
 export vq_codebook_size="${VQ_CODEBOOK_SIZE:-1024}"
 export freeze_vision_tower="${FREEZE_VISION_TOWER:-0}"
 export eval_answer_mode="${EVAL_ANSWER_MODE:-logits}"
-export periods=5
+export periods=7
 
 echo "======================================================"
 echo "VQ-LoRD2 测试开始"
@@ -81,7 +81,7 @@ fi
 mkdir -p "$run_dir"
 
 for period in $periods; do
-    adapter_path="${ADAPTER_PATH_OVERRIDE:-${run_dir}/stage2_vision_epoch15}"
+    adapter_path="${ADAPTER_PATH_OVERRIDE:-${run_dir}/stage3_sub1_period${period}}"
     vq_codebook_path="${VQ_CODEBOOK_PATH_OVERRIDE:-${adapter_path}/vq_codebook.pt}"
     save_path="${SAVE_PATH_OVERRIDE:-${run_dir}/test_eval_period${period}_${eval_answer_mode}_legacy.json}"
 
