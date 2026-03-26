@@ -1,0 +1,385 @@
+{
+  "benchmark_summary": {
+    "overall_correct": 6,
+    "overall_total": 8,
+    "overall_accuracy": 0.75
+  },
+  "control_summary": {
+    "baseline_accuracy": 0.75,
+    "control_summary": {
+      "baseline": {
+        "accuracy": 0.75,
+        "delta_vs_baseline": 0.0
+      },
+      "text_only_blank": {
+        "accuracy": 0.5,
+        "delta_vs_baseline": -0.25
+      },
+      "hint_ablation": {
+        "accuracy": 0.75,
+        "delta_vs_baseline": 0.0
+      },
+      "option_shuffle": {
+        "accuracy": 0.75,
+        "delta_vs_baseline": 0.0
+      },
+      "random_image_swap": {
+        "accuracy": 0.5,
+        "delta_vs_baseline": -0.25
+      },
+      "image_blur": {
+        "accuracy": 0.75,
+        "delta_vs_baseline": 0.0
+      },
+      "image_downsample": {
+        "accuracy": 0.5,
+        "delta_vs_baseline": -0.25
+      }
+    }
+  },
+  "benchmark_runs": [
+    {
+      "benchmark_name": "ai2d",
+      "metrics": {
+        "correct": 4,
+        "total": 4,
+        "accuracy": 1.0
+      },
+      "failure_cases": []
+    },
+    {
+      "benchmark_name": "chartqa",
+      "metrics": {
+        "correct": 2,
+        "total": 4,
+        "accuracy": 0.5
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_0",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "How many food item is shown in the bar graph?",
+          "answers": [
+            "14"
+          ],
+          "output": "13\n\n</\np\nr\ne\ns\nl\ni\nt\n>\n1\n2\n3\n4\n5",
+          "correct": false,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        },
+        {
+          "sample_id": "test_1",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "What is the difference in value between Lamb and Corn?",
+          "answers": [
+            "0.57"
+          ],
+          "output": "85.45",
+          "correct": false,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        }
+      ]
+    }
+  ],
+  "control_runs": [
+    {
+      "control_name": "baseline",
+      "metrics": {
+        "correct": 3,
+        "total": 4,
+        "accuracy": 0.75
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_9",
+          "question": "What is the expected ratio of offspring with a woolly fleece to offspring with a hairy fleece? Choose the most likely ratio.",
+          "choices": [
+            "0:4",
+            "4:0",
+            "2:2",
+            "1:3",
+            "3:1"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 2,
+          "output": "C\n\n\n\n\n\n\n\n\nB\n\n\n\nA\nM\n\nS\n: 4:0 | 2:2",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade8",
+            "topic": "biology",
+            "lecture": "Offspring phenotypes: dominant or recessive?\nHow do you determine an organism's phenotype for a trait? Look at the combination of alleles in the organism's genotype for the gene that affects that trait. Some alleles have types called dominant and recessive. These two types can cause different versions of the trait to appear as the organism's phenotype.\nIf an organism's genotype has at least one dominant allele for a gene, the organism's phenotype will be the dominant allele's version of the gene's trait.\nIf an organism's genotype has only recessive alleles for a gene, the organism's phenotype will be the recessive allele's version of the gene's trait.\nA Punnett square shows what types of offspring a cross can produce. The expected ratio of offspring types compares how often the cross produces each type of offspring, on average. To write this ratio, count the number of boxes in the Punnett square representing each type.\nFor example, consider the Punnett square below.\n | F | f\nF | FF | Ff\nf | Ff | ff\nThere is 1 box with the genotype FF and 2 boxes with the genotype Ff. So, the expected ratio of offspring with the genotype FF to those with Ff is 1:2.\n",
+            "control_name": "baseline"
+          }
+        }
+      ]
+    },
+    {
+      "control_name": "text_only_blank",
+      "metrics": {
+        "correct": 2,
+        "total": 4,
+        "accuracy": 0.5
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_2",
+          "question": "What is the name of the colony shown?",
+          "choices": [
+            "Maryland",
+            "New Hampshire",
+            "Rhode Island",
+            "Vermont"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 2,
+          "output": "C\n\n\nC\n\nB\nA\nD\n\n\n\n\n\n\n\n\n\n\n\nD\n\nC\nA\nB",
+          "correct": false,
+          "metadata": {
+            "subject": "social science",
+            "grade": "grade5",
+            "topic": "us-history",
+            "lecture": "",
+            "control_name": "text_only_blank"
+          }
+        },
+        {
+          "sample_id": "test_9",
+          "question": "What is the expected ratio of offspring with a woolly fleece to offspring with a hairy fleece? Choose the most likely ratio.",
+          "choices": [
+            "0:4",
+            "4:0",
+            "2:2",
+            "1:3",
+            "3:1"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 0,
+          "output": "A\n\n\nD\n\nB\n\nC\n\nA\n\n\n\nAnswer: D\nB: 4\nC: 2",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade8",
+            "topic": "biology",
+            "lecture": "Offspring phenotypes: dominant or recessive?\nHow do you determine an organism's phenotype for a trait? Look at the combination of alleles in the organism's genotype for the gene that affects that trait. Some alleles have types called dominant and recessive. These two types can cause different versions of the trait to appear as the organism's phenotype.\nIf an organism's genotype has at least one dominant allele for a gene, the organism's phenotype will be the dominant allele's version of the gene's trait.\nIf an organism's genotype has only recessive alleles for a gene, the organism's phenotype will be the recessive allele's version of the gene's trait.\nA Punnett square shows what types of offspring a cross can produce. The expected ratio of offspring types compares how often the cross produces each type of offspring, on average. To write this ratio, count the number of boxes in the Punnett square representing each type.\nFor example, consider the Punnett square below.\n | F | f\nF | FF | Ff\nf | Ff | ff\nThere is 1 box with the genotype FF and 2 boxes with the genotype Ff. So, the expected ratio of offspring with the genotype FF to those with Ff is 1:2.\n",
+            "control_name": "text_only_blank"
+          }
+        }
+      ]
+    },
+    {
+      "control_name": "hint_ablation",
+      "metrics": {
+        "correct": 3,
+        "total": 4,
+        "accuracy": 0.75
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_9",
+          "question": "What is the expected ratio of offspring with a woolly fleece to offspring with a hairy fleece? Choose the most likely ratio.",
+          "choices": [
+            "0:4",
+            "4:0",
+            "2:2",
+            "1:3",
+            "3:1"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 2,
+          "output": "C\n\n\nB\n\nC\nD\n\nA\n\n\n\nAnswer: C\n\nB\nC\nD\nA\nAnswer:",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade8",
+            "topic": "biology",
+            "lecture": "Offspring phenotypes: dominant or recessive?\nHow do you determine an organism's phenotype for a trait? Look at the combination of alleles in the organism's genotype for the gene that affects that trait. Some alleles have types called dominant and recessive. These two types can cause different versions of the trait to appear as the organism's phenotype.\nIf an organism's genotype has at least one dominant allele for a gene, the organism's phenotype will be the dominant allele's version of the gene's trait.\nIf an organism's genotype has only recessive alleles for a gene, the organism's phenotype will be the recessive allele's version of the gene's trait.\nA Punnett square shows what types of offspring a cross can produce. The expected ratio of offspring types compares how often the cross produces each type of offspring, on average. To write this ratio, count the number of boxes in the Punnett square representing each type.\nFor example, consider the Punnett square below.\n | F | f\nF | FF | Ff\nf | Ff | ff\nThere is 1 box with the genotype FF and 2 boxes with the genotype Ff. So, the expected ratio of offspring with the genotype FF to those with Ff is 1:2.\n",
+            "control_name": "hint_ablation"
+          }
+        }
+      ]
+    },
+    {
+      "control_name": "option_shuffle",
+      "metrics": {
+        "correct": 3,
+        "total": 4,
+        "accuracy": 0.75
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_9",
+          "question": "What is the expected ratio of offspring with a woolly fleece to offspring with a hairy fleece? Choose the most likely ratio.",
+          "choices": [
+            "2:2",
+            "0:4",
+            "3:1",
+            "1:3",
+            "4:0"
+          ],
+          "answer_idx": 4,
+          "pred_idx": 0,
+          "output": "A\n\n\nB\n\nC\n\nD\n\n\nE\n\n\n\n\n\n\n\n\nA\n\n\n\n\nB",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade8",
+            "topic": "biology",
+            "lecture": "Offspring phenotypes: dominant or recessive?\nHow do you determine an organism's phenotype for a trait? Look at the combination of alleles in the organism's genotype for the gene that affects that trait. Some alleles have types called dominant and recessive. These two types can cause different versions of the trait to appear as the organism's phenotype.\nIf an organism's genotype has at least one dominant allele for a gene, the organism's phenotype will be the dominant allele's version of the gene's trait.\nIf an organism's genotype has only recessive alleles for a gene, the organism's phenotype will be the recessive allele's version of the gene's trait.\nA Punnett square shows what types of offspring a cross can produce. The expected ratio of offspring types compares how often the cross produces each type of offspring, on average. To write this ratio, count the number of boxes in the Punnett square representing each type.\nFor example, consider the Punnett square below.\n | F | f\nF | FF | Ff\nf | Ff | ff\nThere is 1 box with the genotype FF and 2 boxes with the genotype Ff. So, the expected ratio of offspring with the genotype FF to those with Ff is 1:2.\n",
+            "control_name": "option_shuffle",
+            "choice_permutation": [
+              2,
+              0,
+              4,
+              3,
+              1
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "control_name": "random_image_swap",
+      "metrics": {
+        "correct": 2,
+        "total": 4,
+        "accuracy": 0.5
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_2",
+          "question": "What is the name of the colony shown?",
+          "choices": [
+            "Maryland",
+            "New Hampshire",
+            "Rhode Island",
+            "Vermont"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 3,
+          "output": "D\n\n\nD\n\nD\n\nD\n\nD\n\nD\n\nD\n\nD\nD\nD\nD\nD",
+          "correct": false,
+          "metadata": {
+            "subject": "social science",
+            "grade": "grade5",
+            "topic": "us-history",
+            "lecture": "",
+            "control_name": "random_image_swap",
+            "swap_sample_id": "test_5"
+          }
+        },
+        {
+          "sample_id": "test_9",
+          "question": "What is the expected ratio of offspring with a woolly fleece to offspring with a hairy fleece? Choose the most likely ratio.",
+          "choices": [
+            "0:4",
+            "4:0",
+            "2:2",
+            "1:3",
+            "3:1"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 0,
+          "output": "A\n\n\nD\n\nB\n\nC\n\nA\n\n\n\nAnswer: D\n\nB\nAnswer: D \\_0:",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade8",
+            "topic": "biology",
+            "lecture": "Offspring phenotypes: dominant or recessive?\nHow do you determine an organism's phenotype for a trait? Look at the combination of alleles in the organism's genotype for the gene that affects that trait. Some alleles have types called dominant and recessive. These two types can cause different versions of the trait to appear as the organism's phenotype.\nIf an organism's genotype has at least one dominant allele for a gene, the organism's phenotype will be the dominant allele's version of the gene's trait.\nIf an organism's genotype has only recessive alleles for a gene, the organism's phenotype will be the recessive allele's version of the gene's trait.\nA Punnett square shows what types of offspring a cross can produce. The expected ratio of offspring types compares how often the cross produces each type of offspring, on average. To write this ratio, count the number of boxes in the Punnett square representing each type.\nFor example, consider the Punnett square below.\n | F | f\nF | FF | Ff\nf | Ff | ff\nThere is 1 box with the genotype FF and 2 boxes with the genotype Ff. So, the expected ratio of offspring with the genotype FF to those with Ff is 1:2.\n",
+            "control_name": "random_image_swap",
+            "swap_sample_id": "test_1"
+          }
+        }
+      ]
+    },
+    {
+      "control_name": "image_blur",
+      "metrics": {
+        "correct": 3,
+        "total": 4,
+        "accuracy": 0.75
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_9",
+          "question": "What is the expected ratio of offspring with a woolly fleece to offspring with a hairy fleece? Choose the most likely ratio.",
+          "choices": [
+            "0:4",
+            "4:0",
+            "2:2",
+            "1:3",
+            "3:1"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 2,
+          "output": "C\n\n\n\n\n\n\n\nB\n\n\n\nA\nM\n\n: 4:0\nD\n: 2:2",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade8",
+            "topic": "biology",
+            "lecture": "Offspring phenotypes: dominant or recessive?\nHow do you determine an organism's phenotype for a trait? Look at the combination of alleles in the organism's genotype for the gene that affects that trait. Some alleles have types called dominant and recessive. These two types can cause different versions of the trait to appear as the organism's phenotype.\nIf an organism's genotype has at least one dominant allele for a gene, the organism's phenotype will be the dominant allele's version of the gene's trait.\nIf an organism's genotype has only recessive alleles for a gene, the organism's phenotype will be the recessive allele's version of the gene's trait.\nA Punnett square shows what types of offspring a cross can produce. The expected ratio of offspring types compares how often the cross produces each type of offspring, on average. To write this ratio, count the number of boxes in the Punnett square representing each type.\nFor example, consider the Punnett square below.\n | F | f\nF | FF | Ff\nf | Ff | ff\nThere is 1 box with the genotype FF and 2 boxes with the genotype Ff. So, the expected ratio of offspring with the genotype FF to those with Ff is 1:2.\n",
+            "control_name": "image_blur"
+          }
+        }
+      ]
+    },
+    {
+      "control_name": "image_downsample",
+      "metrics": {
+        "correct": 2,
+        "total": 4,
+        "accuracy": 0.5
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_5",
+          "question": "Which of these organisms contains matter that was once part of the lichen?",
+          "choices": [
+            "bilberry",
+            "mushroom"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 0,
+          "output": "A\n\n\nB\n\n\nC\n\nB\n\n\nD\nA\n\n\n\nAnswer: B\n\n\n\n\nB",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade5",
+            "topic": "biology",
+            "lecture": "A food web is a model.\nA food web shows where organisms in an ecosystem get their food. Models can make things in nature easier to understand because models can represent complex things in a simpler way. If a food web showed every organism in an ecosystem, the food web would be hard to understand. So, each food web shows how some organisms in an ecosystem can get their food.\nArrows show how matter moves.\nA food web has arrows that point from one organism to another. Each arrow shows the direction that matter moves when one organism eats another organism. An arrow starts from the organism that is eaten. The arrow points to the organism that is doing the eating.\nAn organism in a food web can have more than one arrow pointing from it. This shows that the organism is eaten by more than one other organism in the food web.\nAn organism in a food web can also have more than one arrow pointing to it. This shows that the organism eats more than one other organism in the food web.",
+            "control_name": "image_downsample"
+          }
+        },
+        {
+          "sample_id": "test_9",
+          "question": "What is the expected ratio of offspring with a woolly fleece to offspring with a hairy fleece? Choose the most likely ratio.",
+          "choices": [
+            "0:4",
+            "4:0",
+            "2:2",
+            "1:3",
+            "3:1"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 2,
+          "output": "C\n\n\n\n\n\n\n\nB\n\n\n\nA\nM\n\nS\n: 4:0\nD\n: 2",
+          "correct": false,
+          "metadata": {
+            "subject": "natural science",
+            "grade": "grade8",
+            "topic": "biology",
+            "lecture": "Offspring phenotypes: dominant or recessive?\nHow do you determine an organism's phenotype for a trait? Look at the combination of alleles in the organism's genotype for the gene that affects that trait. Some alleles have types called dominant and recessive. These two types can cause different versions of the trait to appear as the organism's phenotype.\nIf an organism's genotype has at least one dominant allele for a gene, the organism's phenotype will be the dominant allele's version of the gene's trait.\nIf an organism's genotype has only recessive alleles for a gene, the organism's phenotype will be the recessive allele's version of the gene's trait.\nA Punnett square shows what types of offspring a cross can produce. The expected ratio of offspring types compares how often the cross produces each type of offspring, on average. To write this ratio, count the number of boxes in the Punnett square representing each type.\nFor example, consider the Punnett square below.\n | F | f\nF | FF | Ff\nf | Ff | ff\nThere is 1 box with the genotype FF and 2 boxes with the genotype Ff. So, the expected ratio of offspring with the genotype FF to those with Ff is 1:2.\n",
+            "control_name": "image_downsample"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,230 @@
+{
+  "run_config": {
+    "model_path": "/root/autodl-tmp/models/llama3-llava-next-8b-hf",
+    "adapter_path": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7",
+    "benchmarks": [
+      "ai2d",
+      "chartqa"
+    ],
+    "max_samples_per_benchmark": 4,
+    "max_new_tokens": 32,
+    "answer_mode": "hybrid",
+    "prompt_style": "legacy"
+  },
+  "model_load_info": {
+    "model_path": "/root/autodl-tmp/models/llama3-llava-next-8b-hf",
+    "adapter_path": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7",
+    "adapter_loaded": true,
+    "adapter_fingerprint": {
+      "adapter_path": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7",
+      "exists": true,
+      "adapter_model_file": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7/adapter_model.bin",
+      "adapter_model_md5": "4fc225e8058e8af3888d7baef411cf55",
+      "adapter_config_md5": "1b8e078d8d719baacdf3c9ed60d4717f"
+    },
+    "use_vq": true,
+    "vq_codebook_size": 1024,
+    "vq_codebook_path": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7/vq_codebook.pt",
+    "vq_codebook_loaded": true,
+    "projector_state_found": false,
+    "projector_state_loaded": 0,
+    "projector_state_skipped": 0,
+    "trainable_state_found": true,
+    "trainable_state_loaded": 592,
+    "trainable_state_skipped": 0
+  },
+  "metrics": {
+    "overall_correct": 6,
+    "overall_total": 8,
+    "overall_accuracy": 0.75
+  },
+  "benchmark_runs": [
+    {
+      "benchmark_name": "ai2d",
+      "dataset_name": "lmms-lab/ai2d",
+      "split": "test",
+      "metrics": {
+        "correct": 4,
+        "total": 4,
+        "accuracy": 1.0
+      },
+      "failure_cases": [],
+      "results": [
+        {
+          "sample_id": "test_0",
+          "dataset_name": "ai2d",
+          "task_type": "mcq",
+          "question": "which of these define dairy item",
+          "choices": [
+            "c",
+            "D",
+            "b",
+            "a"
+          ],
+          "answer_idx": 1,
+          "pred_idx": 1,
+          "output": "B\n\n\nD\n\nC\n\nA\nAnswer: B\n\nEx\nAnswer: B\n\nB\nAnswer: B\nD",
+          "correct": true,
+          "metadata": {
+            "raw_answer": "1"
+          }
+        },
+        {
+          "sample_id": "test_1",
+          "dataset_name": "ai2d",
+          "task_type": "mcq",
+          "question": "which of these define oil",
+          "choices": [
+            "b",
+            "a",
+            "d",
+            "k"
+          ],
+          "answer_idx": 3,
+          "pred_idx": 3,
+          "output": "D\nAnswer: C\n\n\nQuestion: which\nOptions:\nA\nB\nC\nD\nAnswer: D\n\nSupport:\nContext",
+          "correct": true,
+          "metadata": {
+            "raw_answer": "3"
+          }
+        },
+        {
+          "sample_id": "test_2",
+          "dataset_name": "ai2d",
+          "task_type": "mcq",
+          "question": "According to the given food chain what would happen if phytoplankton decreases?",
+          "choices": [
+            "Seal population will become extinct",
+            "Fish population would decrease.",
+            "Whale population would decrease.",
+            "Penguin population would increase."
+          ],
+          "answer_idx": 1,
+          "pred_idx": 1,
+          "output": "B\n\n\n\nB\n\n\nC\n\nB\n\n\nD\n\nB\n\n\nC\nB\n\n\n\n\nB",
+          "correct": true,
+          "metadata": {
+            "raw_answer": "1"
+          }
+        },
+        {
+          "sample_id": "test_3",
+          "dataset_name": "ai2d",
+          "task_type": "mcq",
+          "question": "According to the given food chain, which is the smallest organism?",
+          "choices": [
+            "krill",
+            "whale",
+            "Phytoplankton",
+            "leopard"
+          ],
+          "answer_idx": 2,
+          "pred_idx": 2,
+          "output": "C\n\n\nB\n\nA\nC\n\nD\n\n\nC\n\nA\nB\nD\n\nC\nA\nB",
+          "correct": true,
+          "metadata": {
+            "raw_answer": "2"
+          }
+        }
+      ]
+    },
+    {
+      "benchmark_name": "chartqa",
+      "dataset_name": "HuggingFaceM4/ChartQA",
+      "split": "test",
+      "metrics": {
+        "correct": 2,
+        "total": 4,
+        "accuracy": 0.5
+      },
+      "failure_cases": [
+        {
+          "sample_id": "test_0",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "How many food item is shown in the bar graph?",
+          "answers": [
+            "14"
+          ],
+          "output": "13\n\n</\np\nr\ne\ns\nl\ni\nt\n>\n1\n2\n3\n4\n5",
+          "correct": false,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        },
+        {
+          "sample_id": "test_1",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "What is the difference in value between Lamb and Corn?",
+          "answers": [
+            "0.57"
+          ],
+          "output": "85.45",
+          "correct": false,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        }
+      ],
+      "results": [
+        {
+          "sample_id": "test_0",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "How many food item is shown in the bar graph?",
+          "answers": [
+            "14"
+          ],
+          "output": "13\n\n</\np\nr\ne\ns\nl\ni\nt\n>\n1\n2\n3\n4\n5",
+          "correct": false,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        },
+        {
+          "sample_id": "test_1",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "What is the difference in value between Lamb and Corn?",
+          "answers": [
+            "0.57"
+          ],
+          "output": "85.45",
+          "correct": false,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        },
+        {
+          "sample_id": "test_2",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "How many bars are shown in the chart?",
+          "answers": [
+            "3"
+          ],
+          "output": "3\n* 1\n* 2\n* 3\n* 4\n* 5\n* 6\n* 7\n*",
+          "correct": true,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        },
+        {
+          "sample_id": "test_3",
+          "dataset_name": "chartqa",
+          "task_type": "open",
+          "question": "Is the sum value of Madagascar more then Fiji?",
+          "answers": [
+            "No"
+          ],
+          "output": "No",
+          "correct": true,
+          "metadata": {
+            "human_or_machine": 0
+          }
+        }
+      ]
+    }
+  ]
+}
