@@ -1272,6 +1272,7 @@ def save_stage3_checkpoint(model, save_dir: str):
     model.save_pretrained(save_dir, safe_serialization=False)
 
     save_vq_codebook(model, os.path.join(save_dir, "vq_codebook.pt"))
+    _save_projector_state(model, os.path.join(save_dir, "projector.pt"))
     torch.save(
         _get_trainable_parameter_state(model),
         os.path.join(save_dir, "trainable_model_state.pt")
