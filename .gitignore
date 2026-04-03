@@ -1,6 +1,5 @@
 logs/
 vq_lord_ckpts/
 vq_lord_data/
-vq_lord_test_results/
 __pycache__
 *.pyc
