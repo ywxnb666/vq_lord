@@ -1,9 +1,0 @@
-name: align_vq
-channels:
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch/
-  - defaults
-dependencies:
-  - python==3.10.18
-  - nvidia/label/cuda-12.1.1::cuda-toolkit

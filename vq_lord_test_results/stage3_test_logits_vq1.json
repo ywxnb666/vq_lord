@@ -1,31 +1,31 @@
 {
   "metrics": {
-    "accuracy": 0.9236489836390679,
+    "accuracy": 0.9558750619732276,
     "total": 2017,
-    "correct": 1863
+    "correct": 1928
   },
   "run_config": {
-    "model_path": "/root/autodl-tmp/models/llama3-llava-next-8b-hf",
-    "adapter_path": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7",
+    "model_path": "/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf",
+    "adapter_path": "/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7",
     "adapter_loaded": true,
     "adapter_fingerprint": {
-      "adapter_path": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7",
+      "adapter_path": "/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7",
       "exists": true,
-      "adapter_model_file": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7/adapter_model.bin",
+      "adapter_model_file": "/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7/adapter_model.bin",
       "adapter_model_md5": "4fc225e8058e8af3888d7baef411cf55",
       "adapter_config_md5": "1b8e078d8d719baacdf3c9ed60d4717f"
     },
-    "scienceqa_path": "/root/autodl-tmp/datasets/ScienceQA",
+    "scienceqa_path": "/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA",
     "split": "test",
     "max_samples": 0,
     "max_new_tokens": 128,
     "use_4bit": 0,
     "use_vq": 1,
     "vq_codebook_size": 1024,
-    "vq_codebook_path": "/root/workspace/vq_lord/vq_lord_ckpts/stage3_sub1_period7/vq_codebook.pt",
+    "vq_codebook_path": "/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7/vq_codebook.pt",
     "vq_codebook_loaded": true,
-    "projector_state_found": false,
-    "projector_state_loaded": 0,
+    "projector_state_found": true,
+    "projector_state_loaded": 4,
     "projector_state_skipped": 0,
     "trainable_state_found": true,
     "trainable_state_loaded": 592,
@@ -680,9 +680,9 @@
         "The magnitude of the magnetic force is the same in both pairs."
       ],
       "answer_idx": 2,
-      "pred_idx": 0,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which animal's legs are also adapted for wading?",
@@ -753,9 +753,9 @@
         "1/4"
       ],
       "answer_idx": 2,
-      "pred_idx": 0,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of Oklahoma?",
@@ -864,9 +864,9 @@
         "North Carolina"
       ],
       "answer_idx": 1,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of New Mexico?",
@@ -960,9 +960,9 @@
         "bat star"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Is marble a mineral or a rock?",
@@ -1472,9 +1472,9 @@
         "Papua New Guinea"
       ],
       "answer_idx": 1,
-      "pred_idx": 2,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Compare the average kinetic energies of the particles in each sample. Which sample has the higher temperature?",
@@ -1568,9 +1568,9 @@
         "Rhode Island"
       ],
       "answer_idx": 0,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these states is farthest east?",
@@ -2050,9 +2050,9 @@
         "New Hampshire"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of the following could Charlotte's test show?",
@@ -2539,9 +2539,9 @@
         "Haiti"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the name of the colony shown?",
@@ -2756,9 +2756,9 @@
         "Haiti"
       ],
       "answer_idx": 0,
-      "pred_idx": 2,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of the following could Rose's test show?",
@@ -3149,9 +3149,9 @@
         "The magnitude of the magnetic force is the same in both pairs."
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Think about the magnetic force between the magnets in each pair. Which of the following statements is true?",
@@ -3413,9 +3413,9 @@
         "June and July"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which country is highlighted?",
@@ -3451,9 +3451,9 @@
         "Minnesota"
       ],
       "answer_idx": 1,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": true
+      "correct": false
     },
     {
       "question": "Which better describes the Catoctin Mountain Park ecosystem?",
@@ -3728,9 +3728,9 @@
         "to the left than to the right"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of the following could Robert's test show?",
@@ -3977,9 +3977,9 @@
         "neither; their concentrations are the same"
       ],
       "answer_idx": 1,
-      "pred_idx": 2,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which month has the lowest average precipitation in London?",
@@ -4013,9 +4013,9 @@
         "Solomon Islands"
       ],
       "answer_idx": 2,
-      "pred_idx": 1,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these states is farthest east?",
@@ -4218,9 +4218,9 @@
         "The magnitude of the magnetic force is the same in both pairs."
       ],
       "answer_idx": 0,
-      "pred_idx": 2,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Think about the magnetic force between the magnets in each pair. Which of the following statements is true?",
@@ -4405,9 +4405,9 @@
         "The strength of the magnetic force is the same in both pairs."
       ],
       "answer_idx": 1,
-      "pred_idx": 2,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Based on the Venn diagram, which statement is true of Leonardo da Vinci?",
@@ -4783,9 +4783,9 @@
         "Grenada"
       ],
       "answer_idx": 0,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which property do these three objects have in common?",
@@ -6206,9 +6206,9 @@
         "the Dominican Republic"
       ],
       "answer_idx": 0,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which property matches this object?",
@@ -6793,9 +6793,9 @@
         "opaque"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Is the following statement about our solar system true or false?\n75% of the planets are made mainly of rock.",
@@ -6855,9 +6855,9 @@
         "the Marshall Islands"
       ],
       "answer_idx": 3,
-      "pred_idx": 1,
+      "pred_idx": 3,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these states is farthest south?",
@@ -7144,9 +7144,9 @@
         "Michigan"
       ],
       "answer_idx": 0,
-      "pred_idx": 2,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these organisms contains matter that was once part of the lichen?",
@@ -7177,9 +7177,9 @@
         "cardboard"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which country is highlighted?",
@@ -8611,9 +8611,9 @@
         "Solomon Islands"
       ],
       "answer_idx": 1,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these states is farthest north?",
@@ -9758,9 +9758,9 @@
         "sample B"
       ],
       "answer_idx": 1,
-      "pred_idx": 2,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which is the main persuasive appeal used in this ad?",
@@ -10100,9 +10100,9 @@
         "West Virginia"
       ],
       "answer_idx": 1,
-      "pred_idx": 2,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What can Gordon and Ariel trade to each get what they want?",
@@ -10455,9 +10455,9 @@
         "false"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these states is farthest west?",
@@ -10538,9 +10538,9 @@
         "The magnitude of the magnetic force is the same in both pairs."
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which better describes the Taklamakan Desert ecosystem?",
@@ -10730,9 +10730,9 @@
         "repel"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of Mississippi?",
@@ -10949,9 +10949,9 @@
         "The magnetic force is stronger in Pair 1."
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these organisms contains matter that was once part of the lichen?",
@@ -11098,9 +11098,9 @@
         "Palau"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Complete the sentence.\nPollination is what happens when ().",
@@ -11385,9 +11385,9 @@
         "repel"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which property matches this object?",
@@ -12048,7 +12048,7 @@
         "3:1"
       ],
       "answer_idx": 3,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
       "correct": false
     },
@@ -12784,9 +12784,9 @@
         "9 grams of water vapor per kilogram of air"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which continent is highlighted?",
@@ -12844,9 +12844,9 @@
         "sour"
       ],
       "answer_idx": 2,
-      "pred_idx": 0,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which state is highlighted?",
@@ -12991,9 +12991,9 @@
         "New Hampshire"
       ],
       "answer_idx": 0,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Is hematite a mineral or a rock?",
@@ -13016,7 +13016,7 @@
         "4:0"
       ],
       "answer_idx": 2,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
       "correct": false
     },
@@ -13417,9 +13417,9 @@
         "1:3"
       ],
       "answer_idx": 1,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which is this organism's scientific name?",
@@ -13622,9 +13622,9 @@
         "transparent"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which statement describes the Tibetan Plateau ecosystem?",
@@ -14211,9 +14211,9 @@
         "The magnitude of the magnetic force is greater in Pair 2."
       ],
       "answer_idx": 2,
-      "pred_idx": 1,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Is the following statement about our solar system true or false?\nThe smallest planet is made mainly of rock.",
@@ -14393,9 +14393,9 @@
         "The Bahamas"
       ],
       "answer_idx": 3,
-      "pred_idx": 1,
+      "pred_idx": 3,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which ocean is highlighted?",
@@ -14745,9 +14745,9 @@
         "an elementary substance"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which statement describes the Sonoran Desert ecosystem?",
@@ -15034,9 +15034,9 @@
         "Saint Lucia"
       ],
       "answer_idx": 0,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of South Dakota?",
@@ -15159,9 +15159,9 @@
         "3/4"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which bird's beak is also adapted to crack hard seeds?",
@@ -15473,9 +15473,9 @@
         "attract"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What can Nina and Ivan trade to each get what they want?",
@@ -15650,9 +15650,9 @@
         "bendable"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of Vermont?",
@@ -15676,9 +15676,9 @@
         "New Zealand"
       ],
       "answer_idx": 1,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which fish's mouth is also adapted for tearing through meat?",
@@ -15709,9 +15709,9 @@
         "repel"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these organisms contains matter that was once part of the kelp?",
@@ -15767,7 +15767,7 @@
         "Antigua and Barbuda"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 2,
       "output": "[logits_mode]",
       "correct": false
     },
@@ -15790,9 +15790,9 @@
         "scratchy"
       ],
       "answer_idx": 0,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": true
+      "correct": false
     },
     {
       "question": "According to the map, which of the following statements is true about North America in the early colonial era?",
@@ -16059,9 +16059,9 @@
         "Fiji"
       ],
       "answer_idx": 2,
-      "pred_idx": 0,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Select the mammal below.",
@@ -16457,7 +16457,7 @@
         "3:1"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 3,
       "output": "[logits_mode]",
       "correct": false
     },
@@ -16519,9 +16519,9 @@
         "Boston"
       ],
       "answer_idx": 2,
-      "pred_idx": 3,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What can Sally and Chloe trade to each get what they want?",
@@ -17140,9 +17140,9 @@
         "Solution A"
       ],
       "answer_idx": 2,
-      "pred_idx": 1,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which country is highlighted?",
@@ -17654,9 +17654,9 @@
         "The magnetic force is stronger in Pair 2."
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which animal's feet are also adapted for swimming?",
@@ -17848,9 +17848,9 @@
         "Connecticut"
       ],
       "answer_idx": 2,
-      "pred_idx": 1,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of Wisconsin?",
@@ -18200,9 +18200,9 @@
         "Vanuatu"
       ],
       "answer_idx": 0,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which country is highlighted?",
@@ -18816,9 +18816,9 @@
         "the Federated States of Micronesia"
       ],
       "answer_idx": 3,
-      "pred_idx": 0,
+      "pred_idx": 3,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which of these states is farthest east?",
@@ -19092,9 +19092,9 @@
         "Haiti"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which material is this door made of?",
@@ -19770,9 +19770,9 @@
         "South Carolina"
       ],
       "answer_idx": 1,
-      "pred_idx": 2,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Does this passage describe the weather or the climate?",
@@ -20280,9 +20280,9 @@
         "Vanuatu"
       ],
       "answer_idx": 0,
-      "pred_idx": 3,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Think about the magnetic force between the magnets in each pair. Which of the following statements is true?",
@@ -20937,9 +20937,9 @@
         "Louisiana"
       ],
       "answer_idx": 2,
-      "pred_idx": 0,
+      "pred_idx": 2,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Select the organism in the same species as the moon jellyfish.",
@@ -21476,7 +21476,7 @@
         "Boston"
       ],
       "answer_idx": 2,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
       "correct": false
     },
@@ -21489,9 +21489,9 @@
         "Virginia"
       ],
       "answer_idx": 3,
-      "pred_idx": 1,
+      "pred_idx": 3,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Select the fish below.",
@@ -21511,9 +21511,9 @@
         "true"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which better describes the tide pool ecosystems in Montaña De Oro State Park?",
@@ -21941,9 +21941,9 @@
         "the Indian Ocean"
       ],
       "answer_idx": 1,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Think about the magnetic force between the magnets in each pair. Which of the following statements is true?",
@@ -22001,9 +22001,9 @@
         "soft"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which country is highlighted?",
@@ -22014,9 +22014,9 @@
         "Jamaica"
       ],
       "answer_idx": 1,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which continent is highlighted?",
@@ -22104,9 +22104,9 @@
         "0:4"
       ],
       "answer_idx": 4,
-      "pred_idx": 3,
+      "pred_idx": 4,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Is an icicle a solid, a liquid, or a gas?",
@@ -22399,9 +22399,9 @@
         "Solution A"
       ],
       "answer_idx": 0,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": true
+      "correct": false
     },
     {
       "question": "What is the capital of Massachusetts?",
@@ -22760,7 +22760,7 @@
         "Maryland"
       ],
       "answer_idx": 0,
-      "pred_idx": 2,
+      "pred_idx": 3,
       "output": "[logits_mode]",
       "correct": false
     },
@@ -23059,9 +23059,9 @@
         "Solution B"
       ],
       "answer_idx": 1,
-      "pred_idx": 0,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which material is this spatula made of?",
@@ -23107,7 +23107,7 @@
         "4:0"
       ],
       "answer_idx": 2,
-      "pred_idx": 4,
+      "pred_idx": 0,
       "output": "[logits_mode]",
       "correct": false
     },
@@ -23867,9 +23867,9 @@
         "The magnitude of the magnetic force is smaller in Pair 2."
       ],
       "answer_idx": 1,
-      "pred_idx": 2,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of Alaska?",
@@ -24119,9 +24119,9 @@
         "West Virginia"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of Louisiana?",
@@ -24230,9 +24230,9 @@
         "Antigua and Barbuda"
       ],
       "answer_idx": 3,
-      "pred_idx": 2,
+      "pred_idx": 3,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "What is the capital of Washington?",
@@ -24315,9 +24315,9 @@
         "Iowa"
       ],
       "answer_idx": 0,
-      "pred_idx": 1,
+      "pred_idx": 0,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Is chocolate syrup a solid, a liquid, or a gas?",
@@ -24340,9 +24340,9 @@
         "Saint Lucia"
       ],
       "answer_idx": 1,
-      "pred_idx": 3,
+      "pred_idx": 1,
       "output": "[logits_mode]",
-      "correct": false
+      "correct": true
     },
     {
       "question": "Which continent is highlighted?",

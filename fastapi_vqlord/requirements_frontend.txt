@@ -1,0 +1,8 @@
+# synced 2026-03-30: frontend/backend control panel dependency audit for fastapi_vqlord/
+# audited entrypoints: app.py, backend.py
+fastapi==0.115.12
+pandas==2.2.0
+pydantic==2.11.3
+requests==2.31.0
+streamlit==1.44.1
+uvicorn==0.34.0
