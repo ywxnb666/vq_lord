@@ -1,5 +1,6 @@
 """Stage3 training logic for VQ-LoRD3."""
 
+import json
 import math
 import os
 import random

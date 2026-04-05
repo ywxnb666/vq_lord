@@ -1,9 +1,16 @@
 """Stage2 training logic for VQ-LoRD3."""
 
+import os
+
 import torch
 from tqdm import tqdm
 
-from train_vq_lord3 import _get_image_token_id, sanitize_image_sizes
+from train_vq_lord3 import (
+    _get_image_token_id,
+    maybe_set_dataloader_epoch,
+    sanitize_image_sizes,
+    save_stage2_checkpoint,
+)
 
 
 def _get_stage2_vq_loss(model, device: str, dtype: torch.dtype) -> torch.Tensor:
