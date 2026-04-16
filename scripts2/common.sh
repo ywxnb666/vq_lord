@@ -5,10 +5,14 @@
 # MODEL_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf"
 # SCIENCEQA_DEFAULT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/datasets/ScienceQA"
 
-ROOT_DEFAULT="/root/workspace/vq_lord"
-PYTHON_DEFAULT="/root/autodl-tmp/conda/envs/align_vq/bin/python"
-MODEL_DEFAULT="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
-SCIENCEQA_DEFAULT="/root/autodl-tmp/datasets/ScienceQA"
+# PYTHON_DEFAULT="/root/autodl-tmp/conda/envs/align_vq/bin/python"
+# MODEL_DEFAULT="/root/autodl-tmp/models/llama3-llava-next-8b-hf"
+# SCIENCEQA_DEFAULT="/root/autodl-tmp/datasets/ScienceQA"
+ROOT_DEFAULT="/home/songxinhao/workspace/vq_lord"
+PYTHON_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/miniconda3/envs/vq_lord/bin/python"
+MODEL_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/models/llama3-llava-next-8b-hf"
+SCIENCEQA_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/ScienceQA"
+# SCIENCEQA_DEFAULT="/home/songxinhao/workspace/datasets/ScienceQA"
 
 align_vq_init_paths() {
     ROOT_DIR="${ROOT_DIR:-$ROOT_DEFAULT}"
@@ -39,7 +43,7 @@ align_vq_setup_env() {
     export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
     export BNB_CUDA_VERSION="${BNB_CUDA_VERSION:-121}"
     export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-    export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-0}"
+    export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
     export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
     export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -49,13 +53,77 @@ align_vq_setup_env() {
     fi
 }
 
+align_vq_setup_distributed_env() {
+    export DDP_NPROC="${DDP_NPROC:-1}"
+    export TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+    export TORCHRUN_STANDALONE="${TORCHRUN_STANDALONE:-1}"
+    export MASTER_PORT="${MASTER_PORT:-29500}"
+    export ALIGN_VQ_TORCHRUN_MODE="${ALIGN_VQ_TORCHRUN_MODE:-bin}"
+
+    if ! [[ "${DDP_NPROC}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "错误: DDP_NPROC 必须是正整数，当前值: ${DDP_NPROC}"
+        exit 1
+    fi
+
+    if [ "${DDP_NPROC}" -gt 1 ]; then
+        if command -v "${TORCHRUN_BIN}" >/dev/null 2>&1; then
+            ALIGN_VQ_TORCHRUN_MODE="bin"
+        elif "${PYTHON_BIN}" -c "import torch.distributed.run" >/dev/null 2>&1; then
+            ALIGN_VQ_TORCHRUN_MODE="module"
+            echo "提示: PATH 中未找到 ${TORCHRUN_BIN}，将回退为 ${PYTHON_BIN} -m torch.distributed.run"
+        else
+            echo "错误: 未找到 torchrun 启动器，且 ${PYTHON_BIN} 无法导入 torch.distributed.run"
+            exit 1
+        fi
+        export ALIGN_VQ_TORCHRUN_MODE
+
+        local visible_devices="${CUDA_VISIBLE_DEVICES:-}"
+        if [ -n "${visible_devices}" ]; then
+            local count=0
+            local old_ifs="${IFS}"
+            IFS=','
+            # shellcheck disable=SC2206
+            local device_items=(${visible_devices})
+            IFS="${old_ifs}"
+            count="${#device_items[@]}"
+            if [ "${count}" -lt "${DDP_NPROC}" ]; then
+                echo "错误: CUDA_VISIBLE_DEVICES=${visible_devices} 仅提供 ${count} 张卡，少于 DDP_NPROC=${DDP_NPROC}"
+                exit 1
+            fi
+        fi
+    fi
+}
+
+align_vq_make_train_launcher() {
+    local out_name="$1"
+    local -n out_ref="${out_name}"
+
+    out_ref=("${PYTHON_BIN}")
+    if [ "${DDP_NPROC:-1}" -le 1 ]; then
+        return 0
+    fi
+
+    if [ "${ALIGN_VQ_TORCHRUN_MODE:-bin}" = "module" ]; then
+        out_ref=("${PYTHON_BIN}" "-m" "torch.distributed.run")
+    else
+        out_ref=("${TORCHRUN_BIN}")
+    fi
+    if [ "${TORCHRUN_STANDALONE:-1}" = "1" ]; then
+        out_ref+=("--standalone")
+    fi
+    out_ref+=("--nproc_per_node=${DDP_NPROC}")
+    if [ -n "${MASTER_PORT:-}" ]; then
+        out_ref+=("--master_port=${MASTER_PORT}")
+    fi
+}
+
 align_vq_ensure_runtime_dirs() {
     mkdir -p "${CKPT_DIR}" "${DATA_DIR}" "${PREPROCESS_DIR}" "${TEST_RESULT_DIR}" "${LOG_DIR}"
 }
 
 align_vq_setup_logging() {
     local log_name="$1"
-    align_vq_ensure_runtime_dirs
+    # align_vq_ensure_runtime_dirs
 
     if [ "${ALIGN_VQ_LOGGING_CONFIGURED:-0}" = "1" ]; then
         return 0

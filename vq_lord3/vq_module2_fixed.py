@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Sequence, Union
 
 
 class VectorQuantizer2(nn.Module):
@@ -81,12 +81,6 @@ class VectorQuantizer2(nn.Module):
             min_encoding_indices,
             minlength=self.num_embeddings,
         ).to(self.ema_cluster_size.dtype)
-
-        # 当 codebook 被显式冻结时，Stage2/Stage3 仍可能处于 train()。
-        # 这里必须跳过 EMA 和 dead-code reset，避免多卡下各 rank 的 buffer/codebook 漂移。
-        if not self.embedding.weight.requires_grad:
-            self.last_dead_code_resets.zero_()
-            return counts
 
         self.usage_update_steps += 1
         self.last_dead_code_resets.zero_()
@@ -264,6 +258,8 @@ class VQVisionEncoder(nn.Module):
         dead_code_threshold: float = 0.0,
         usage_decay: float = 0.99,
         dead_code_reset_interval: int = 0,
+        target_hidden_state_layer: Optional[Union[int, Sequence[int]]] = None,
+        vision_feature_select_strategy: str = "default",
         freeze_vision_tower: bool = False,
     ):
         super().__init__()
@@ -271,6 +267,10 @@ class VQVisionEncoder(nn.Module):
         self.vision_tower = vision_tower
         self.config = getattr(vision_tower, "config", None)
         self.freeze_vision_tower = freeze_vision_tower
+        self.target_hidden_state_layer = self._resolve_target_hidden_state_layer(target_hidden_state_layer)
+        self.vision_feature_select_strategy = self._resolve_feature_select_strategy(
+            vision_feature_select_strategy
+        )
         
         # 获取视觉编码器的输出维度
         # LLaVA 的 vision_tower 通常输出 1024 或 1152 维
@@ -315,6 +315,11 @@ class VQVisionEncoder(nn.Module):
             "pre_quant_features": None,
             "reconstructed_features": None,
             "target_features": None,
+            "target_hidden_state_layer": self.target_hidden_state_layer,
+            "resolved_target_hidden_state_layer": None,
+            "vision_feature_select_strategy": self.vision_feature_select_strategy,
+            "selected_hidden_states_before_vq": None,
+            "selected_hidden_states_after_vq": None,
             "perplexity": None,
             "dead_code_resets": 0,
             "dead_code_count": 0,
@@ -354,28 +359,129 @@ class VQVisionEncoder(nn.Module):
         compute_features = features.to(dtype=self.compute_dtype)
         return compute_features, original_dtype
 
+    def _resolve_target_hidden_state_layer(
+        self,
+        target_hidden_state_layer: Optional[Union[int, Sequence[int]]],
+    ) -> int:
+        if target_hidden_state_layer is None:
+            if self.config is not None and hasattr(self.config, "vision_feature_layer"):
+                target_hidden_state_layer = getattr(self.config, "vision_feature_layer")
+            else:
+                # 对齐 LlavaNext 常见默认值，避免继续量化到最后一层而下游读取倒数第二层。
+                target_hidden_state_layer = -2
+
+        if isinstance(target_hidden_state_layer, (list, tuple)):
+            if len(target_hidden_state_layer) != 1:
+                raise NotImplementedError(
+                    "vq_module2_fixed.py 当前只支持单个 vision_feature_layer；"
+                    f"收到多层配置: {target_hidden_state_layer}"
+                )
+            target_hidden_state_layer = target_hidden_state_layer[0]
+
+        return int(target_hidden_state_layer)
+
+    def _resolve_feature_select_strategy(self, strategy: str) -> str:
+        resolved = str(strategy or "default").strip().lower()
+        if resolved not in {"default", "full"}:
+            raise ValueError(
+                f"不支持的 vision_feature_select_strategy={strategy!r}，"
+                "仅支持 'default' 或 'full'"
+            )
+        return resolved
+
+    def _apply_feature_select_strategy(self, selected_hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.vision_feature_select_strategy == "default":
+            if selected_hidden_states.dim() != 3 or selected_hidden_states.shape[1] < 2:
+                raise RuntimeError(
+                    "vision_feature_select_strategy='default' 期望选中特征形状为 [bs, seq, dim] "
+                    "且至少包含 1 个 CLS token 和 1 个 patch token"
+                )
+            return selected_hidden_states[:, 1:]
+        return selected_hidden_states
+
+    def _restore_feature_select_strategy(
+        self,
+        original_selected_hidden_states: torch.Tensor,
+        quantized_features: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.vision_feature_select_strategy == "default":
+            expected_patch_count = original_selected_hidden_states.shape[1] - 1
+            if quantized_features.shape[1] != expected_patch_count:
+                raise RuntimeError(
+                    "量化后 patch token 数与原始选中特征不一致："
+                    f"quantized={quantized_features.shape[1]}, expected={expected_patch_count}"
+                )
+            # 与下游默认消费逻辑对齐：保留原 CLS，不对其进行量化。
+            return torch.cat(
+                [original_selected_hidden_states[:, :1], quantized_features],
+                dim=1,
+            )
+
+        if quantized_features.shape != original_selected_hidden_states.shape:
+            raise RuntimeError(
+                "量化后特征形状与原始选中特征不一致："
+                f"quantized={tuple(quantized_features.shape)}, "
+                f"original={tuple(original_selected_hidden_states.shape)}"
+            )
+        return quantized_features
+
+    def _normalize_hidden_state_layer_index(self, hidden_states) -> int:
+        if hidden_states is None or len(hidden_states) == 0:
+            raise RuntimeError("vision_tower 未返回 hidden_states，无法定位 vision_feature_layer")
+
+        num_layers = len(hidden_states)
+        target_idx = int(self.target_hidden_state_layer)
+        if target_idx < 0:
+            target_idx = num_layers + target_idx
+
+        if target_idx < 0 or target_idx >= num_layers:
+            raise RuntimeError(
+                f"vision_feature_layer={self.target_hidden_state_layer} 越界，"
+                f"当前 hidden_states 层数={num_layers}"
+            )
+        return target_idx
+
     def encode_features(self, pixel_values: torch.Tensor, *args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs["output_hidden_states"] = True
+        kwargs["return_dict"] = True
         if self.freeze_vision_tower:
             with torch.no_grad():
                 tower_output = self.vision_tower(pixel_values, *args, **kwargs)
         else:
             tower_output = self.vision_tower(pixel_values, *args, **kwargs)
-        return tower_output, self._extract_hidden_states(tower_output)
+        return tower_output, self._extract_target_hidden_states(tower_output)
 
-    def _extract_hidden_states(self, tower_output):
-        if hasattr(tower_output, "last_hidden_state"):
-            return tower_output.last_hidden_state
-        if isinstance(tower_output, tuple):
-            return tower_output[0]
+    def _extract_target_hidden_states(self, tower_output):
+        hidden_states = getattr(tower_output, "hidden_states", None)
+        if hidden_states is None:
+            raise RuntimeError("vision_tower 输出不包含 hidden_states，无法执行 VQ 特征替换")
+
+        resolved_idx = self._normalize_hidden_state_layer_index(hidden_states)
+        selected_hidden_states = hidden_states[resolved_idx]
+        self.vq_cache["target_hidden_state_layer"] = int(self.target_hidden_state_layer)
+        self.vq_cache["resolved_target_hidden_state_layer"] = int(resolved_idx)
+        self.vq_cache["vision_feature_select_strategy"] = self.vision_feature_select_strategy
+        return self._apply_feature_select_strategy(selected_hidden_states)
+
+    def _replace_target_hidden_states(self, tower_output, quantized_features):
+        hidden_states = getattr(tower_output, "hidden_states", None)
+        if hidden_states is None:
+            raise RuntimeError("vision_tower 输出不包含 hidden_states，无法回写 VQ 重构特征")
+
+        resolved_idx = self._normalize_hidden_state_layer_index(hidden_states)
+        hidden_states_list = list(hidden_states)
+        original_selected_hidden_states = hidden_states_list[resolved_idx]
+        hidden_states_list[resolved_idx] = self._restore_feature_select_strategy(
+            original_selected_hidden_states=original_selected_hidden_states,
+            quantized_features=quantized_features,
+        )
+        updated_hidden_states = tuple(hidden_states_list)
+        tower_output.hidden_states = updated_hidden_states
+
+        if resolved_idx == len(updated_hidden_states) - 1:
+            tower_output.last_hidden_state = hidden_states_list[resolved_idx]
         return tower_output
-
-    def _replace_hidden_states(self, tower_output, quantized_features):
-        if hasattr(tower_output, "last_hidden_state"):
-            tower_output.last_hidden_state = quantized_features
-            return tower_output
-        if isinstance(tower_output, tuple):
-            return (quantized_features,) + tower_output[1:]
-        return quantized_features
 
     def quantize_features(
         self,
@@ -437,6 +543,8 @@ class VQVisionEncoder(nn.Module):
         self.vq_cache["pre_quant_features"] = pre_quant_features
         self.vq_cache["reconstructed_features"] = reconstructed_features
         self.vq_cache["target_features"] = target_features_compute
+        self.vq_cache["selected_hidden_states_before_vq"] = target_features.detach()
+        self.vq_cache["selected_hidden_states_after_vq"] = reconstructed_features.detach()
         self.vq_cache["features"] = reconstructed_features
 
         return {
@@ -484,12 +592,14 @@ class VQVisionEncoder(nn.Module):
         self.vq_cache["pre_quant_features"] = pre_quant_features
         self.vq_cache["reconstructed_features"] = reconstructed_output
         self.vq_cache["target_features"] = vision_features.detach()
+        self.vq_cache["selected_hidden_states_before_vq"] = vision_features.detach()
+        self.vq_cache["selected_hidden_states_after_vq"] = reconstructed_output.detach()
         self.vq_cache["features"] = reconstructed_output
 
         if return_details:
             return reconstructed_output, indices, vq_loss, logits
 
-        return self._replace_hidden_states(tower_output, reconstructed_output)
+        return self._replace_target_hidden_states(tower_output, reconstructed_output)
     
     def get_vision_logits(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """

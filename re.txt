@@ -15,9 +15,10 @@ rouge==1.0.1
 scikit-learn==1.4.1.post1
 scipy==1.12.0
 tensorboard==2.16.2
-tokenizers==0.15.1
+tokenizers==0.21.4
 torch==2.5.1+cu121
 tqdm==4.66.2
 transformers==4.48.0
-triton==2.2.0
+triton==3.1.0
+einops==0.8.2
 trl @ git+https://github.com/huggingface/trl@685209716915b010098b7e18b05fbad42af864d3

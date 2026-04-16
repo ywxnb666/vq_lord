@@ -33,6 +33,9 @@ from typing import Optional, List, Dict, Tuple
 from pprint import pprint
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data._utils.collate import default_collate
 from torch.utils.tensorboard import SummaryWriter
 from datasets import load_dataset
@@ -68,6 +71,88 @@ import numpy as np
 
 # Ensure stage modules can import this module by name even when executed as a script.
 sys.modules.setdefault("train_vq_lord3", sys.modules[__name__])
+
+
+def is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_distributed() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_distributed() else 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def barrier_if_distributed():
+    if is_distributed():
+        backend = dist.get_backend()
+        if torch.cuda.is_available() and str(backend).lower() == "nccl":
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+            return
+        dist.barrier()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _get_reduce_device(device: Optional[str] = None) -> torch.device:
+    if device and str(device).startswith("cuda") and torch.cuda.is_available():
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def reduce_numeric_dict(metrics: Dict[str, float], device: Optional[str] = None) -> Dict[str, float]:
+    reduced = {str(k): float(v) for k, v in metrics.items()}
+    if not reduced or not is_distributed():
+        return reduced
+
+    keys = sorted(reduced.keys())
+    tensor = torch.tensor(
+        [reduced[key] for key in keys],
+        dtype=torch.float64,
+        device=_get_reduce_device(device),
+    )
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return {key: float(tensor[idx].item()) for idx, key in enumerate(keys)}
+
+
+def init_distributed_mode(args):
+    args.rank = 0
+    args.world_size = 1
+    args.local_rank = 0
+    args.distributed = False
+
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size_env <= 1:
+        args.is_main_process = True
+        return args
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("检测到 WORLD_SIZE>1，但当前环境无可用 CUDA，无法启动 DDP 训练。")
+
+    args.distributed = True
+    args.rank = int(os.environ["RANK"])
+    args.world_size = world_size_env
+    args.local_rank = int(os.environ["LOCAL_RANK"])
+    args.device = f"cuda:{args.local_rank}"
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend="nccl")
+    args.is_main_process = bool(args.rank == 0)
+    return args
+
+
+def cleanup_distributed():
+    if is_distributed():
+        dist.destroy_process_group()
 
 
 def build_scienceqa_samples(
@@ -732,6 +817,126 @@ class ScienceQABucketBatchSampler(torch.utils.data.Sampler):
         return total
 
 
+def _pad_batches_for_distributed(batches: List[List[int]], world_size: int) -> List[List[int]]:
+    if world_size <= 1 or not batches:
+        return list(batches)
+    padded = [list(batch) for batch in batches]
+    remainder = len(padded) % world_size
+    if remainder == 0:
+        return padded
+    extra = world_size - remainder
+    padded.extend([list(batch) for batch in padded[:extra]])
+    return padded
+
+
+class ScienceQAPrecomputedBatchPlanBatchSampler(torch.utils.data.Sampler):
+    """基于预处理 batch_plan 的 batch sampler，支持 DDP 按 batch 切分。"""
+
+    def __init__(
+        self,
+        batch_plan: List[List[int]],
+        shuffle: bool = True,
+        seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        if not isinstance(batch_plan, list) or not batch_plan:
+            raise ValueError("batch_plan 必须是非空列表")
+        self.batch_plan = [list(map(int, batch)) for batch in batch_plan]
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
+        self.epoch = 0
+        self._cached_epoch = None
+        self._cached_batches = None
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+        self._cached_epoch = None
+        self._cached_batches = None
+
+    def _build_epoch_batches(self) -> List[List[int]]:
+        if self._cached_epoch == self.epoch and self._cached_batches is not None:
+            return [list(batch) for batch in self._cached_batches]
+        batches = [list(batch) for batch in self.batch_plan]
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(batches)
+        batches = _pad_batches_for_distributed(batches, self.world_size)
+        self._cached_epoch = self.epoch
+        self._cached_batches = [list(batch) for batch in batches]
+        return [list(batch) for batch in batches]
+
+    def __iter__(self):
+        batches = self._build_epoch_batches()
+        return iter(batches[self.rank::self.world_size])
+
+    def __len__(self):
+        batches = self._build_epoch_batches()
+        return len(batches[self.rank::self.world_size])
+
+
+class DistributedScienceQABucketBatchSampler(torch.utils.data.Sampler):
+    """基于 sample_to_bucket 的分布式 batch sampler。"""
+
+    def __init__(
+        self,
+        sample_to_bucket: Dict[int, str],
+        batch_size: int,
+        drop_last: bool = False,
+        shuffle: bool = True,
+        seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        self.inner = ScienceQABucketBatchSampler(
+            sample_to_bucket=sample_to_bucket,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            shuffle=shuffle,
+            seed=seed,
+        )
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
+        self._cached_epoch = None
+        self._cached_batches = None
+
+    @property
+    def batch_size(self):
+        return self.inner.batch_size
+
+    @property
+    def drop_last(self):
+        return self.inner.drop_last
+
+    @property
+    def bucket_to_samples(self):
+        return self.inner.bucket_to_samples
+
+    def set_epoch(self, epoch: int):
+        self.inner.set_epoch(epoch)
+        self._cached_epoch = None
+        self._cached_batches = None
+
+    def _build_epoch_batches(self) -> List[List[int]]:
+        if self._cached_epoch == self.inner.epoch and self._cached_batches is not None:
+            return [list(batch) for batch in self._cached_batches]
+        batches = [list(batch) for batch in iter(self.inner)]
+        batches = _pad_batches_for_distributed(batches, self.world_size)
+        self._cached_epoch = self.inner.epoch
+        self._cached_batches = [list(batch) for batch in batches]
+        return [list(batch) for batch in batches]
+
+    def __iter__(self):
+        batches = self._build_epoch_batches()
+        return iter(batches[self.rank::self.world_size])
+
+    def __len__(self):
+        batches = self._build_epoch_batches()
+        return len(batches[self.rank::self.world_size])
+
+
 def load_scienceqa_preprocessed_buckets(preprocessed_path: str, expected_len: int, args) -> Optional[dict]:
     if not preprocessed_path:
         return None
@@ -743,6 +948,7 @@ def load_scienceqa_preprocessed_buckets(preprocessed_path: str, expected_len: in
 
     config = payload.get("config", {})
     records = payload.get("samples", [])
+    raw_batch_plan = payload.get("batch_plan", [])
     if not isinstance(records, list) or not records:
         raise RuntimeError(f"预处理文件缺少 samples 记录: {preprocessed_path}")
 
@@ -782,10 +988,27 @@ def load_scienceqa_preprocessed_buckets(preprocessed_path: str, expected_len: in
         f"bucket_by={config.get('bucket_by')}, batch_size={config.get('bucket_batch_size')}"
     )
 
+    batch_plan = []
+    if isinstance(raw_batch_plan, list):
+        for item in raw_batch_plan:
+            if not isinstance(item, dict):
+                continue
+            sample_ids_in_batch = item.get("sample_ids", [])
+            if not isinstance(sample_ids_in_batch, list) or not sample_ids_in_batch:
+                continue
+            normalized_batch = [int(sample_id) for sample_id in sample_ids_in_batch]
+            for sample_id in normalized_batch:
+                if sample_id not in sample_to_bucket:
+                    raise RuntimeError(
+                        f"预处理 batch_plan 含未知 sample_id={sample_id}: {preprocessed_path}"
+                    )
+            batch_plan.append(normalized_batch)
+
     return {
         "path": preprocessed_path,
         "config": config,
         "sample_to_bucket": sample_to_bucket,
+        "batch_plan": batch_plan,
     }
 
 
@@ -879,6 +1102,7 @@ def sanitize_image_sizes(image_sizes: Optional[torch.Tensor], batch_size: int) -
 
 def _get_image_token_id(model) -> int:
     """从 model.config 获取 image_token_index（已在 load_model_and_processor 中统一设置）。"""
+    model = unwrap_model(model)
     cfg = getattr(model, "config", None)
     if cfg is None:
         # PeftModel: 穿透到 base model
@@ -1073,6 +1297,7 @@ def _restore_rng_state(state: Optional[dict]):
 
 
 def _get_trainable_parameter_state(model) -> dict:
+    model = unwrap_model(model)
     trainable_state = {}
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -1081,6 +1306,7 @@ def _get_trainable_parameter_state(model) -> dict:
 
 
 def _load_parameter_state(model, parameter_state: dict, state_name: str):
+    model = unwrap_model(model)
     if not parameter_state:
         print(f"[Resume] {state_name} 为空，跳过加载")
         return
@@ -1126,6 +1352,7 @@ def _move_optimizer_state_to_device_(optimizer, device: str):
 
 
 def save_stage3_checkpoint(model, save_dir: str):
+    model = unwrap_model(model)
     os.makedirs(save_dir, exist_ok=True)
     model.save_pretrained(save_dir, safe_serialization=False)
 
@@ -1330,6 +1557,14 @@ def setup_args():
                        help="若存在已保存的Stage2模型则复用并跳过Stage2")
     parser.add_argument("--stage2_ckpt_path", type=str, default="",
                        help="Stage2 checkpoint 保存/加载路径 (为空则使用save_path/stage2_vision)")
+    parser.add_argument("--stage2_resume_path", type=str, default="",
+                       help="Stage2 断点目录，非空时从该目录恢复训练")
+    parser.add_argument("--stage2_resume_save_path", type=str, default="",
+                       help="Stage2 断点保存目录，默认 save_path/stage2_resume_latest")
+    parser.add_argument("--stage2_resume_save_optimizer", type=int, default=1,
+                       help="Stage2 断点是否保存 optimizer state（1=保存,0=不保存）")
+    parser.add_argument("--stage2_resume_save_interval", type=int, default=1,
+                       help="Stage2 每隔多少个 epoch 保存一次断点")
     parser.add_argument("--scienceqa_preprocessed_path", type=str, default="",
                        help="ScienceQA 预处理结果 JSON 路径，供 Stage1/2 分桶采样使用")
     parser.add_argument("--bucket_batch_size", type=int, default=0,
@@ -1367,7 +1602,8 @@ def setup_args():
 
 def load_model_and_processor(args):
     """加载模型和处理器"""
-    print(f"加载模型: {args.model_path}")
+    if is_main_process():
+        print(f"加载模型: {args.model_path}")
     
     # 量化配置
     if args.use_4bit:
@@ -1377,15 +1613,17 @@ def load_model_and_processor(args):
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
         )
+        device_map = {"": args.local_rank} if getattr(args, "distributed", False) else "auto"
         model = LlavaNextForConditionalGeneration.from_pretrained(
             args.model_path,
-            device_map="auto",
+            device_map=device_map,
             quantization_config=quantization_config,
             trust_remote_code=True,
         )
     else:
         model_dtype = _resolve_torch_dtype(args.model_dtype)
-        print(f"[Load] use_4bit=0，使用非量化训练路径，dtype={model_dtype}, device={args.device}")
+        if is_main_process():
+            print(f"[Load] use_4bit=0，使用非量化训练路径，dtype={model_dtype}, device={args.device}")
         model = LlavaNextForConditionalGeneration.from_pretrained(
             args.model_path,
             device_map=None,
@@ -1495,6 +1733,7 @@ def apply_lora(model, args):
 
 def save_checkpoint(model, args, suffix=""):
     """保存检查点"""
+    model = unwrap_model(model)
     save_path = os.path.join(args.save_path, suffix)
     os.makedirs(save_path, exist_ok=True)
     
@@ -1507,6 +1746,7 @@ def _get_vq_state_path(codebook_path: str) -> str:
 
 
 def save_vq_codebook(model, codebook_path: str):
+    model = unwrap_model(model)
     os.makedirs(os.path.dirname(codebook_path), exist_ok=True)
     torch.save(model.vq_vision_encoder.vq.embedding.weight.detach().cpu(), codebook_path)
     torch.save(model.vq_vision_encoder.get_vq_state(), _get_vq_state_path(codebook_path))
@@ -1521,6 +1761,7 @@ def save_stage1_checkpoint(model, args):
 
 
 def load_vq_codebook(model, codebook_path: str):
+    model = unwrap_model(model)
     codebook = torch.load(codebook_path, map_location="cpu")
     model.vq_vision_encoder.vq.embedding.weight.data.copy_(codebook)
     vq_state_path = _get_vq_state_path(codebook_path)
@@ -1536,6 +1777,7 @@ def _is_projector_param_name(name: str) -> bool:
 
 
 def _extract_projector_state(model) -> dict:
+    model = unwrap_model(model)
     projector_state = {}
     for name, tensor in model.state_dict().items():
         if _is_projector_param_name(name):
@@ -1554,6 +1796,7 @@ def _save_projector_state(model, projector_path: str) -> int:
 
 
 def _load_projector_state(model, projector_path: str) -> Tuple[int, int]:
+    model = unwrap_model(model)
     if not os.path.exists(projector_path):
         print(f"[Warn] 未找到 projector 权重文件，跳过加载: {projector_path}")
         return 0, 0
@@ -1571,6 +1814,7 @@ def _load_projector_state(model, projector_path: str) -> Tuple[int, int]:
 
 def save_stage2_checkpoint(model, args, ckpt_path: str):
     """保存 Stage2 检查点（包括 VQ codebook 和 LoRA 权重）"""
+    model = unwrap_model(model)
     os.makedirs(ckpt_path, exist_ok=True)
     
     save_vq_codebook(model, os.path.join(ckpt_path, "vq_codebook.pt"))
@@ -1604,6 +1848,7 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
 
 def load_stage2_checkpoint(model, ckpt_path: str):
     """加载 Stage2 检查点"""
+    model = unwrap_model(model)
     vq_path = os.path.join(ckpt_path, "vq_codebook.pt")
     if os.path.exists(vq_path):
         load_vq_codebook(model, vq_path)
@@ -1669,6 +1914,30 @@ def _stage2_contract_missing_files(ckpt_path: str) -> List[str]:
     return missing
 
 
+def wrap_model_for_ddp(model, args, find_unused_parameters: bool = False):
+    if not getattr(args, "distributed", False):
+        return model
+    if isinstance(model, DDP):
+        return model
+    return DDP(
+        model,
+        device_ids=[args.local_rank],
+        output_device=args.local_rank,
+        # VQ EMA/usage 这类 buffer 不应依赖 DDP 广播来维持一致；
+        # Stage2/Stage3 在 codebook 冻结时会显式禁止其更新。
+        broadcast_buffers=False,
+        find_unused_parameters=bool(find_unused_parameters),
+    )
+
+
+def wrap_model_for_stage2_ddp(model, args):
+    return wrap_model_for_ddp(model, args, find_unused_parameters=False)
+
+
+def wrap_model_for_stage3_ddp(model, args):
+    return wrap_model_for_ddp(model, args, find_unused_parameters=True)
+
+
 
 # Stage-specific training logic lives in separate modules for readability.
 from vq_lord_stage1 import train_stage1_vq
@@ -1725,264 +1994,348 @@ from vq_lord_stage3 import (
 
 def main():
     args = setup_args()
-    
-    print("=" * 60)
-    print("VQ-LoRD 训练")
-    print("=" * 60)
-    pprint(vars(args))
-    print("=" * 60)
+    tb_writer = None
+    init_distributed_mode(args)
 
-    if args.reuse_vq_codebook:
-        print("[Info] reuse_vq_codebook=1，若存在 stage1 codebook 将跳过 Stage1。")
-    if args.reuse_stage2:
-        print("[Info] reuse_stage2=1，若存在 stage2 ckpt 将跳过 Stage2。")
-    
-    # 创建保存目录
-    os.makedirs(args.save_path, exist_ok=True)
-    if not args.vq_codebook_path:
-        args.vq_codebook_path = os.path.join(args.save_path, "stage1_vq", "vq_codebook.pt")
-    tb_writer = SummaryWriter(log_dir=os.path.join(args.save_path, "logs"))
+    try:
+        if args.distributed and args.stage >= 1 and not bool(args.reuse_vq_codebook):
+            raise RuntimeError("当前未实现 Stage1 多卡训练；请先单卡准备 Stage1 codebook，再用多卡执行 Stage2/Stage3。")
 
-    # 先准备 ScienceQA 数据；仅 stage>=2 时再准备教师回答，避免 Stage1-only 多余 API 调用。
-    train_samples = None
-    train_bucket_meta = None
-    if args.dataset_name == "scienceqa":
-        print("\n加载 ScienceQA 样本（预加载阶段，不加载学生模型）...")
-        train_samples = build_scienceqa_samples(
-            scienceqa_path=args.scienceqa_path,
-            split=args.scienceqa_split,
-            train_num=args.train_num,
-            seed=args.scienceqa_seed,
-        )
+        if is_main_process():
+            print("=" * 60)
+            print("VQ-LoRD 训练")
+            print("=" * 60)
+            pprint(vars(args))
+            print("=" * 60)
+            if args.reuse_vq_codebook:
+                print("[Info] reuse_vq_codebook=1，若存在 stage1 codebook 将跳过 Stage1。")
+            if args.reuse_stage2:
+                print("[Info] reuse_stage2=1，若存在 stage2 ckpt 将跳过 Stage2。")
 
-        if int(args.stage) >= 2:
-            # 关键：仅在 Stage2/3 需要蒸馏时补齐教师回答
-            print("加载 ScienceQA 教师回答（stage>=2）...")
-            train_samples = attach_gpt4v_teacher_responses(train_samples, args)
+        os.makedirs(args.save_path, exist_ok=True)
+        if not args.vq_codebook_path:
+            args.vq_codebook_path = os.path.join(args.save_path, "stage1_vq", "vq_codebook.pt")
+        if is_main_process():
+            tb_writer = SummaryWriter(log_dir=os.path.join(args.save_path, "logs"))
+
+        train_samples = None
+        train_bucket_meta = None
+        if args.dataset_name == "scienceqa":
+            if is_main_process():
+                print("\n加载 ScienceQA 样本（预加载阶段，不加载学生模型）...")
+            train_samples = build_scienceqa_samples(
+                scienceqa_path=args.scienceqa_path,
+                split=args.scienceqa_split,
+                train_num=args.train_num,
+                seed=args.scienceqa_seed,
+            )
+
+            if int(args.stage) >= 2:
+                if args.distributed:
+                    if is_main_process():
+                        print("加载 ScienceQA 教师回答（stage>=2, rank0 负责补齐缓存）...")
+                        train_samples = attach_gpt4v_teacher_responses(train_samples, args)
+                    barrier_if_distributed()
+                    if not is_main_process():
+                        original_collect = args.collect_teacher_data
+                        args.collect_teacher_data = 0
+                        train_samples = attach_gpt4v_teacher_responses(train_samples, args)
+                        args.collect_teacher_data = original_collect
+                else:
+                    if is_main_process():
+                        print("加载 ScienceQA 教师回答（stage>=2）...")
+                    train_samples = attach_gpt4v_teacher_responses(train_samples, args)
+            elif is_main_process():
+                print("stage<2，跳过教师回答采集/补齐")
+
+            train_bucket_meta = load_scienceqa_preprocessed_buckets(
+                args.scienceqa_preprocessed_path,
+                expected_len=len(train_samples),
+                args=args,
+            )
+
+        model, processor = load_model_and_processor(args)
+        model = add_vq_to_model(model, args)
+        if args.use_lora:
+            model = apply_lora(model, args)
+
+        if is_main_process():
+            print("\n加载训练数据...")
+        if args.dataset_name == "scienceqa":
+            train_dataset = ScienceQADataset(
+                processor=processor,
+                scienceqa_path=args.scienceqa_path,
+                max_length=args.max_length,
+                samples=train_samples,
+                seed=args.scienceqa_seed,
+                teacher_lang=args.teacher_lang,
+                teacher_observed_max_tokens=args.teacher_observed_max_tokens,
+                teacher_context_max_tokens=args.teacher_context_max_tokens,
+                teacher_reasoning_max_tokens=args.teacher_reasoning_max_tokens,
+                teacher_answer_max_tokens=args.teacher_answer_max_tokens,
+                stage3_vic_include_context=bool(int(args.stage3_vic_include_context)),
+                require_teacher_annotation=bool(int(args.stage) >= 2),
+            )
         else:
-            print("stage<2，跳过教师回答采集/补齐")
+            collector = GPT4VDataCollector(save_dir=args.data_dir)
+            visual_qa_data = collector.load_collected_data("visual_qa_data.json")
+            image_descriptions = collector.load_collected_data("image_descriptions.json")
+            if not visual_qa_data and not image_descriptions:
+                print("警告：未找到预收集的数据，请先运行数据收集脚本")
+                print("示例：python data_collector2.py --collect_data")
+                return
 
-        train_bucket_meta = load_scienceqa_preprocessed_buckets(
-            args.scienceqa_preprocessed_path,
-            expected_len=len(train_samples),
-            args=args,
-        )
-    
-    # 加载模型
-    model, processor = load_model_and_processor(args)
-    
-    # 添加 VQ 层
-    model = add_vq_to_model(model, args)
-    
-    # 应用 LoRA
-    if args.use_lora:
-        model = apply_lora(model, args)
-    
-    # 加载数据
-    print("\n加载训练数据...")
-    if args.dataset_name == "scienceqa":
-        train_dataset = ScienceQADataset(
-            processor=processor,
-            scienceqa_path=args.scienceqa_path,
-            max_length=args.max_length,
-            samples=train_samples,
-            seed=args.scienceqa_seed,
-            teacher_lang=args.teacher_lang,
-            teacher_observed_max_tokens=args.teacher_observed_max_tokens,
-            teacher_context_max_tokens=args.teacher_context_max_tokens,
-            teacher_reasoning_max_tokens=args.teacher_reasoning_max_tokens,
-            teacher_answer_max_tokens=args.teacher_answer_max_tokens,
-            stage3_vic_include_context=bool(int(args.stage3_vic_include_context)),
-            require_teacher_annotation=bool(int(args.stage) >= 2),
-        )
-    else:
-        collector = GPT4VDataCollector(save_dir=args.data_dir)
+            visual_qa_items = [VisualQAItem(**item) for item in visual_qa_data]
+            desc_items = [ImageDescriptionItem(**item) for item in image_descriptions]
+            train_dataset = VQLORDDataset(
+                visual_qa_data=visual_qa_items,
+                image_descriptions=desc_items,
+                processor=processor,
+                max_length=args.max_length,
+            )
 
-        # 尝试加载已收集的数据
-        visual_qa_data = collector.load_collected_data("visual_qa_data.json")
-        image_descriptions = collector.load_collected_data("image_descriptions.json")
+        def vq_lord_collate(batch):
+            batch = [b for b in batch if b is not None]
+            if len(batch) == 0:
+                return None
 
-        if not visual_qa_data and not image_descriptions:
-            print("警告：未找到预收集的数据，请先运行数据收集脚本")
-            print("示例：python data_collector2.py --collect_data")
-            return
+            image_sizes_list = [b.get("image_sizes") for b in batch]
+            for idx, size in enumerate(image_sizes_list):
+                if size is None:
+                    pixel_values = batch[idx].get("pixel_values")
+                    if isinstance(pixel_values, torch.Tensor) and pixel_values.dim() >= 3:
+                        height = int(pixel_values.shape[-2])
+                        width = int(pixel_values.shape[-1])
+                        image_sizes_list[idx] = torch.tensor([height, width], dtype=torch.long)
 
-        # 创建数据集
-        visual_qa_items = [VisualQAItem(**item) for item in visual_qa_data]
-        desc_items = [ImageDescriptionItem(**item) for item in image_descriptions]
+            pad_token_id = processor.tokenizer.pad_token_id or 0
+            pad_keys = {
+                "input_ids": pad_token_id,
+                "attention_mask": 0,
+                "labels": -100,
+                "prompt_input_ids": pad_token_id,
+                "prompt_attention_mask": 0,
+                "full_input_ids": pad_token_id,
+                "full_attention_mask": 0,
+                "full_labels": -100,
+                "answer_input_ids": pad_token_id,
+                "answer_attention_mask": 0,
+                "answer_labels": -100,
+            }
 
-        train_dataset = VQLORDDataset(
-            visual_qa_data=visual_qa_items,
-            image_descriptions=desc_items,
-            processor=processor,
-            max_length=args.max_length,
-        )
-    
-    def vq_lord_collate(batch):
-        batch = [b for b in batch if b is not None]
-        if len(batch) == 0:
-            return None
+            max_lens = {}
+            for key in pad_keys:
+                lengths = [b[key].shape[-1] for b in batch if key in b and isinstance(b[key], torch.Tensor)]
+                if lengths:
+                    max_lens[key] = max(lengths)
 
-        # --- 处理 image_sizes ---
-        image_sizes_list = [b.get("image_sizes") for b in batch]
-        for idx, size in enumerate(image_sizes_list):
-            if size is None:
-                pixel_values = batch[idx].get("pixel_values")
-                if isinstance(pixel_values, torch.Tensor) and pixel_values.dim() >= 3:
-                    height = int(pixel_values.shape[-2])
-                    width = int(pixel_values.shape[-1])
-                    image_sizes_list[idx] = torch.tensor([height, width], dtype=torch.long)
+            for b in batch:
+                for key, pad_val in pad_keys.items():
+                    if key not in b or not isinstance(b[key], torch.Tensor):
+                        continue
+                    t = b[key]
+                    target_len = max_lens.get(key, t.shape[-1])
+                    if t.shape[-1] < target_len:
+                        pad_size = target_len - t.shape[-1]
+                        b[key] = F.pad(t, (0, pad_size), value=pad_val)
 
-        # --- 对不等长 1D 张量做 right-padding 对齐 ---
-        pad_token_id = processor.tokenizer.pad_token_id or 0
-        pad_keys = {
-            "input_ids": pad_token_id,
-            "attention_mask": 0,
-            "labels": -100,
-            "prompt_input_ids": pad_token_id,
-            "prompt_attention_mask": 0,
-            "full_input_ids": pad_token_id,
-            "full_attention_mask": 0,
-            "full_labels": -100,
-            "answer_input_ids": pad_token_id,
-            "answer_attention_mask": 0,
-            "answer_labels": -100,
-        }
+            pv_list = [b.get("pixel_values") for b in batch]
+            if all(isinstance(pv, torch.Tensor) for pv in pv_list):
+                pv_shapes = [pv.shape for pv in pv_list]
+                if len(set(pv_shapes)) > 1:
+                    max_patches = max(s[0] for s in pv_shapes)
+                    for i, pv in enumerate(pv_list):
+                        if pv.shape[0] < max_patches:
+                            pad_tensor = torch.zeros(
+                                (max_patches - pv.shape[0],) + pv.shape[1:],
+                                dtype=pv.dtype, device=pv.device,
+                            )
+                            batch[i]["pixel_values"] = torch.cat([pv, pad_tensor], dim=0)
 
-        max_lens = {}
-        for key in pad_keys:
-            lengths = [b[key].shape[-1] for b in batch if key in b and isinstance(b[key], torch.Tensor)]
-            if lengths:
-                max_lens[key] = max(lengths)
+            base = []
+            for b in batch:
+                item = dict(b)
+                item.pop("image_sizes", None)
+                base.append(item)
 
-        for b in batch:
-            for key, pad_val in pad_keys.items():
-                if key not in b or not isinstance(b[key], torch.Tensor):
-                    continue
-                t = b[key]
-                target_len = max_lens.get(key, t.shape[-1])
-                if t.shape[-1] < target_len:
-                    pad_size = target_len - t.shape[-1]
-                    b[key] = F.pad(t, (0, pad_size), value=pad_val)
+            collated = default_collate(base)
 
-        # pixel_values 可能形状不同（不同 patch 数），也需要对齐
-        pv_list = [b.get("pixel_values") for b in batch]
-        if all(isinstance(pv, torch.Tensor) for pv in pv_list):
-            pv_shapes = [pv.shape for pv in pv_list]
-            if len(set(pv_shapes)) > 1:
-                max_patches = max(s[0] for s in pv_shapes)
-                for i, pv in enumerate(pv_list):
-                    if pv.shape[0] < max_patches:
-                        pad_tensor = torch.zeros(
-                            (max_patches - pv.shape[0],) + pv.shape[1:],
-                            dtype=pv.dtype, device=pv.device,
+            if all(s is None for s in image_sizes_list):
+                collated["image_sizes"] = None
+            else:
+                tensor_list = [s for s in image_sizes_list if s is not None]
+                collated["image_sizes"] = torch.stack(tensor_list, dim=0)
+
+            return collated
+
+        def build_train_dataloader(stage_id: int):
+            use_bucket = (
+                args.dataset_name == "scienceqa"
+                and train_bucket_meta is not None
+                and not (stage_id == 3 and bool(args.disable_bucket_for_stage3))
+            )
+
+            if use_bucket:
+                config = train_bucket_meta["config"]
+                bucket_batch_size = int(config.get("bucket_batch_size", args.batch_size))
+                if args.bucket_batch_size > 0:
+                    bucket_batch_size = int(args.bucket_batch_size)
+                if stage_id == 3 and args.stage3_bucket_batch_size > 0:
+                    bucket_batch_size = int(args.stage3_bucket_batch_size)
+
+                if args.distributed and stage_id == 2:
+                    batch_sampler = DistributedScienceQABucketBatchSampler(
+                        sample_to_bucket=train_bucket_meta["sample_to_bucket"],
+                        batch_size=bucket_batch_size,
+                        drop_last=bool(config.get("bucket_drop_last", False)),
+                        shuffle=bool(config.get("shuffle", True)),
+                        seed=int(config.get("seed", args.scienceqa_seed)),
+                        rank=args.rank,
+                        world_size=args.world_size,
+                    )
+                    if is_main_process():
+                        print(
+                            f"Stage{stage_id} 使用 sample_to_bucket 分布式分桶采样: "
+                            f"path={train_bucket_meta['path']}, batch_size={batch_sampler.batch_size}, "
+                            f"local_batches={len(batch_sampler)}"
                         )
-                        batch[i]["pixel_values"] = torch.cat([pv, pad_tensor], dim=0)
+                    return DataLoader(
+                        train_dataset,
+                        batch_sampler=batch_sampler,
+                        num_workers=0,
+                        collate_fn=vq_lord_collate,
+                    )
 
-        base = []
-        for b in batch:
-            item = dict(b)
-            item.pop("image_sizes", None)
-            base.append(item)
+                batch_sampler = ScienceQABucketBatchSampler(
+                    sample_to_bucket=train_bucket_meta["sample_to_bucket"],
+                    batch_size=bucket_batch_size,
+                    drop_last=bool(config.get("bucket_drop_last", False)),
+                    shuffle=bool(config.get("shuffle", True)),
+                    seed=int(config.get("seed", args.scienceqa_seed)),
+                )
+                if is_main_process():
+                    print(
+                        f"Stage{stage_id} 使用预处理分桶采样: "
+                        f"path={train_bucket_meta['path']}, batch_size={batch_sampler.batch_size}, "
+                        f"num_batches={len(batch_sampler)}"
+                    )
+                return DataLoader(
+                    train_dataset,
+                    batch_sampler=batch_sampler,
+                    num_workers=0,
+                    collate_fn=vq_lord_collate,
+                )
 
-        collated = default_collate(base)
+            if args.distributed and stage_id == 2:
+                sampler = DistributedSampler(
+                    train_dataset,
+                    num_replicas=args.world_size,
+                    rank=args.rank,
+                    shuffle=True,
+                    drop_last=False,
+                )
+                if is_main_process():
+                    print(
+                        f"Stage{stage_id} 使用常规 DistributedSampler: "
+                        f"per_rank_batch_size={args.batch_size}, local_num_samples={len(sampler)}"
+                    )
+                return DataLoader(
+                    train_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    sampler=sampler,
+                    num_workers=0,
+                    collate_fn=vq_lord_collate,
+                )
 
-        if all(s is None for s in image_sizes_list):
-            collated["image_sizes"] = None
-        else:
-            tensor_list = [s for s in image_sizes_list if s is not None]
-            collated["image_sizes"] = torch.stack(tensor_list, dim=0)
-
-        return collated
-
-    def build_train_dataloader(stage_id: int):
-        use_bucket = (
-            args.dataset_name == "scienceqa"
-            and train_bucket_meta is not None
-            and not (stage_id == 3 and bool(args.disable_bucket_for_stage3))
-        )
-
-        if use_bucket:
-            config = train_bucket_meta["config"]
-            bucket_batch_size = int(config.get("bucket_batch_size", args.batch_size))
-            if args.bucket_batch_size > 0:
-                bucket_batch_size = int(args.bucket_batch_size)
-            if stage_id == 3 and args.stage3_bucket_batch_size > 0:
-                bucket_batch_size = int(args.stage3_bucket_batch_size)
-
-            batch_sampler = ScienceQABucketBatchSampler(
-                sample_to_bucket=train_bucket_meta["sample_to_bucket"],
-                batch_size=bucket_batch_size,
-                drop_last=bool(config.get("bucket_drop_last", False)),
-                shuffle=bool(config.get("shuffle", True)),
-                seed=int(config.get("seed", args.scienceqa_seed)),
-            )
-            print(
-                f"Stage{stage_id} 使用预处理分桶采样: "
-                f"path={train_bucket_meta['path']}, batch_size={batch_sampler.batch_size}, "
-                f"num_batches={len(batch_sampler)}"
-            )
+            if is_main_process():
+                print(f"Stage{stage_id} 使用常规 DataLoader: batch_size={args.batch_size}, shuffle=True")
             return DataLoader(
                 train_dataset,
-                batch_sampler=batch_sampler,
+                batch_size=args.batch_size,
+                shuffle=True,
                 num_workers=0,
                 collate_fn=vq_lord_collate,
             )
 
-        print(f"Stage{stage_id} 使用常规 DataLoader: batch_size={args.batch_size}, shuffle=True")
-        return DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=0,
-            collate_fn=vq_lord_collate,
-        )
-    
-    print(f"训练数据量: {len(train_dataset)}")
-    
-    # 根据阶段训练
-    if args.stage >= 1:
-        stage1_dataloader = build_train_dataloader(stage_id=1)
-        if args.reuse_vq_codebook and os.path.exists(args.vq_codebook_path):
-            print(f"检测到VQ codebook，跳过Stage1并加载: {args.vq_codebook_path}")
-            load_vq_codebook(model, args.vq_codebook_path)
-        else:
-            model = train_stage1_vq(model, stage1_dataloader, args, tb_writer)
-            save_stage1_checkpoint(model, args)
-    
-    if args.stage >= 2:
-        stage2_dataloader = build_train_dataloader(stage_id=2)
-        # Stage2 复用逻辑
-        if not args.stage2_ckpt_path:
-            args.stage2_ckpt_path = os.path.join(args.save_path, "stage2_vision")
-        
-        if args.reuse_stage2 and os.path.exists(args.stage2_ckpt_path) and os.path.exists(os.path.join(args.stage2_ckpt_path, "vq_codebook.pt")):
-            print(f"检测到Stage2检查点，跳过Stage2并加载: {args.stage2_ckpt_path}")
-            model = load_stage2_checkpoint(model, args.stage2_ckpt_path)
-        else:
-            model = train_stage2_vision(model, stage2_dataloader, args, tb_writer)
-            save_stage2_checkpoint(model, args, args.stage2_ckpt_path)
-            save_checkpoint(model, args, "stage2_vision")
-    
-    if args.stage >= 3:
-        if not args.stage2_ckpt_path:
-            args.stage2_ckpt_path = os.path.join(args.save_path, "stage2_vision")
-        if not os.path.isdir(args.stage2_ckpt_path):
-            raise RuntimeError(f"Stage3 需要可用的 Stage2 checkpoint 目录: {args.stage2_ckpt_path}")
-        missing_stage2_files = _stage2_contract_missing_files(args.stage2_ckpt_path)
-        if missing_stage2_files:
-            raise RuntimeError(
-                "Stage3 启动前 Stage2 工件不完整，缺失: "
-                + ", ".join(missing_stage2_files)
-            )
-        model = train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta=train_bucket_meta)
-        save_stage3_checkpoint(model, os.path.join(args.save_path, "stage3_lord_final"))
-    
-    print("\n" + "=" * 60)
-    print("VQ-LoRD 训练完成!")
-    print("=" * 60)
-    
-    tb_writer.close()
+        if is_main_process():
+            print(f"训练数据量: {len(train_dataset)}")
+
+        if args.stage >= 1:
+            stage1_dataloader = build_train_dataloader(stage_id=1)
+            if args.distributed and not os.path.exists(args.vq_codebook_path):
+                raise RuntimeError(
+                    "当前为 Stage2 多卡模式，但未找到可复用的 Stage1 codebook。"
+                    f"请先单卡完成 Stage1，期望路径: {args.vq_codebook_path}"
+                )
+            if args.reuse_vq_codebook and os.path.exists(args.vq_codebook_path):
+                if is_main_process():
+                    print(f"检测到VQ codebook，跳过Stage1并加载: {args.vq_codebook_path}")
+                load_vq_codebook(model, args.vq_codebook_path)
+            else:
+                model = train_stage1_vq(model, stage1_dataloader, args, tb_writer)
+                if is_main_process():
+                    save_stage1_checkpoint(model, args)
+                barrier_if_distributed()
+
+        if args.stage >= 2:
+            stage2_dataloader = build_train_dataloader(stage_id=2)
+            if not args.stage2_ckpt_path:
+                args.stage2_ckpt_path = os.path.join(args.save_path, "stage2_vision")
+
+            has_stage2_resume = bool(str(args.stage2_resume_path).strip())
+            if has_stage2_resume:
+                if is_main_process():
+                    print(f"检测到Stage2 resume路径，优先从断点恢复训练: {args.stage2_resume_path}")
+                model = wrap_model_for_stage2_ddp(model, args)
+                model = train_stage2_vision(model, stage2_dataloader, args, tb_writer)
+                model = unwrap_model(model)
+                barrier_if_distributed()
+                if is_main_process():
+                    save_stage2_checkpoint(model, args, args.stage2_ckpt_path)
+                    save_checkpoint(model, args, "stage2_vision")
+                barrier_if_distributed()
+            elif args.reuse_stage2 and os.path.exists(args.stage2_ckpt_path) and os.path.exists(os.path.join(args.stage2_ckpt_path, "vq_codebook.pt")):
+                if is_main_process():
+                    print(f"检测到Stage2检查点，跳过Stage2并加载: {args.stage2_ckpt_path}")
+                model = load_stage2_checkpoint(model, args.stage2_ckpt_path)
+            else:
+                model = wrap_model_for_stage2_ddp(model, args)
+                model = train_stage2_vision(model, stage2_dataloader, args, tb_writer)
+                model = unwrap_model(model)
+                barrier_if_distributed()
+                if is_main_process():
+                    save_stage2_checkpoint(model, args, args.stage2_ckpt_path)
+                    save_checkpoint(model, args, "stage2_vision")
+                barrier_if_distributed()
+
+        if args.stage >= 3:
+            if not args.stage2_ckpt_path:
+                args.stage2_ckpt_path = os.path.join(args.save_path, "stage2_vision")
+            if not os.path.isdir(args.stage2_ckpt_path):
+                raise RuntimeError(f"Stage3 需要可用的 Stage2 checkpoint 目录: {args.stage2_ckpt_path}")
+            missing_stage2_files = _stage2_contract_missing_files(args.stage2_ckpt_path)
+            if missing_stage2_files:
+                raise RuntimeError(
+                    "Stage3 启动前 Stage2 工件不完整，缺失: "
+                    + ", ".join(missing_stage2_files)
+                )
+            model = wrap_model_for_stage3_ddp(model, args)
+            model = train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta=train_bucket_meta)
+            model = unwrap_model(model)
+            barrier_if_distributed()
+            if is_main_process():
+                save_stage3_checkpoint(model, os.path.join(args.save_path, "stage3_lord_final"))
+            barrier_if_distributed()
+
+        if is_main_process():
+            print("\n" + "=" * 60)
+            print("VQ-LoRD 训练完成!")
+            print("=" * 60)
+    finally:
+        if tb_writer is not None:
+            tb_writer.close()
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

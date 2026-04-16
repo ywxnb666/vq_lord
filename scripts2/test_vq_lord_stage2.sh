@@ -17,14 +17,14 @@ EVAL_MAX_SAMPLES=0
 EVAL_MAX_NEW_TOKENS=128
 EVAL_ANSWER_MODE="logits"
 USE_4BIT=0
-USE_VQ=1
+USE_VQ=0
 VQ_CODEBOOK_SIZE=1024
 FREEZE_VISION_TOWER=0
 
 # Paths
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process.py"
-# STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2_vision}"
-STAGE2_CKPT_PATH="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage2_tune/round1_e3/stage2_vision_epoch15"
+STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch7}"
+# STAGE2_CKPT_PATH="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage2_tune/round1_e3/stage2_vision_epoch15"
 RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}.json}"
 
 align_vq_print_header "Stage2 产物评测"

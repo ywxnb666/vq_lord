@@ -285,6 +285,7 @@ def run_eval_shard(
     split: str,
     max_samples: int,
     max_new_tokens: int,
+    enable_second_pass: int,
     second_pass_max_new_tokens: int,
     save_path: str,
     answer_mode: str,
@@ -365,7 +366,7 @@ def run_eval_shard(
                     item["choices"],
                 )
 
-            if answer_mode == "generate":
+            if answer_mode == "generate" and int(enable_second_pass) == 1:
                 struct_prompts = [
                     build_two_pass_structured_prompt(
                         processor=processor,
@@ -559,6 +560,7 @@ def parse_args():
     parser.add_argument("--split", type=str, default="test", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=0, help="最大评测样本数，0 表示全量")
     parser.add_argument("--max_new_tokens", type=int, default=16, help="第一轮答案生成长度")
+    parser.add_argument("--enable_second_pass", type=int, default=1, help="是否启用第二轮结构化整理")
     parser.add_argument("--second_pass_max_new_tokens", type=int, default=256, help="第二轮结构化整理的生成长度")
     parser.add_argument("--use_4bit", type=int, default=0, help="是否使用4bit加载")
     parser.add_argument("--use_vq", type=int, default=1, help="是否启用训练同款VQ视觉量化路径")
@@ -592,13 +594,18 @@ def main():
             "split": args.split,
             "max_samples": int(args.max_samples),
             "max_new_tokens": int(args.max_new_tokens),
+            "enable_second_pass": int(args.enable_second_pass),
             "second_pass_max_new_tokens": int(args.second_pass_max_new_tokens),
             "use_4bit": int(args.use_4bit),
             "use_vq": int(args.use_vq),
             "vq_codebook_size": int(args.vq_codebook_size),
             "vq_codebook_path": args.vq_codebook_path,
             "answer_mode": args.answer_mode,
-            "prompt_style": "student_two_pass_legacy_then_structured_4field" if args.answer_mode == "generate" else "stage3_legacy",
+            "prompt_style": (
+                "student_two_pass_legacy_then_structured_4field"
+                if args.answer_mode == "generate" and int(args.enable_second_pass) == 1
+                else "stage3_legacy"
+            ),
             "parallel_eval": True,
             "bucketed_eval": True,
             "num_shards": int(args.num_shards),
@@ -631,6 +638,7 @@ def main():
         "split": args.split,
         "max_samples": int(args.max_samples),
         "max_new_tokens": int(args.max_new_tokens),
+        "enable_second_pass": int(args.enable_second_pass),
         "second_pass_max_new_tokens": int(args.second_pass_max_new_tokens),
         "use_4bit": int(args.use_4bit),
         "use_vq": int(args.use_vq),
@@ -644,7 +652,11 @@ def main():
         "trainable_state_loaded": load_info.get("trainable_state_loaded", 0),
         "trainable_state_skipped": load_info.get("trainable_state_skipped", 0),
         "answer_mode": args.answer_mode,
-        "prompt_style": "student_two_pass_legacy_then_structured_4field" if args.answer_mode == "generate" else "stage3_legacy",
+        "prompt_style": (
+            "student_two_pass_legacy_then_structured_4field"
+            if args.answer_mode == "generate" and int(args.enable_second_pass) == 1
+            else "stage3_legacy"
+        ),
         "parallel_eval": True,
         "bucketed_eval": True,
         "num_shards": int(args.num_shards),
@@ -659,6 +671,7 @@ def main():
         split=args.split,
         max_samples=int(args.max_samples),
         max_new_tokens=int(args.max_new_tokens),
+        enable_second_pass=int(args.enable_second_pass),
         second_pass_max_new_tokens=int(args.second_pass_max_new_tokens),
         save_path=args.save_path,
         answer_mode=args.answer_mode,

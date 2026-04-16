@@ -6,17 +6,25 @@ SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_SOURCE_DIR}/common.sh"
 
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+DDP_NPROC="${DDP_NPROC:-4}"
+
 align_vq_init_paths
 align_vq_setup_env
+align_vq_setup_distributed_env
 align_vq_ensure_runtime_dirs
 align_vq_setup_logging "run_stage2"
 
 # Paths
 TRAIN_ENTRY="${ROOT_DIR}/vq_lord3/train_vq_lord3.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process.py"
-SAVE_PATH="${CKPT_DIR}"
-STAGE1_CODEBOOK_PATH="${STAGE1_CODEBOOK_PATH:-${CKPT_DIR}/stage1_vq/vq_codebook.pt}"
+SAVE_PATH="${CKPT_DIR}/stage2"
+STAGE1_CODEBOOK_PATH="${STAGE1_CODEBOOK_PATH:-${CKPT_DIR}/stage3_sub1_period7_1/vq_codebook.pt}"
 STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2_vision}"
+STAGE2_RESUME_PATH="${STAGE2_RESUME_PATH:-}"
+STAGE2_RESUME_SAVE_PATH="${STAGE2_RESUME_SAVE_PATH:-${CKPT_DIR}/stage2_resume_latest}"
+STAGE2_RESUME_SAVE_OPTIMIZER="${STAGE2_RESUME_SAVE_OPTIMIZER:-1}"
+STAGE2_RESUME_SAVE_INTERVAL="${STAGE2_RESUME_SAVE_INTERVAL:-1}"
 
 # Data
 DATASET_NAME="scienceqa"
@@ -24,19 +32,20 @@ SCIENCEQA_SPLIT="${SCIENCEQA_SPLIT:-train}"
 TRAIN_NUM="${TRAIN_NUM:-0}"
 SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
 BUCKET_BY="${BUCKET_BY:-patches}"
-PREPROCESS_BUCKET_BATCH_SIZE="${PREPROCESS_BUCKET_BATCH_SIZE:-8}"
-BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-8}"
-STAGE3_BUCKET_BATCH_SIZE="${STAGE3_BUCKET_BATCH_SIZE:-8}"
+STAGE3_BUCKET_BATCH_SIZE="${STAGE3_BUCKET_BATCH_SIZE:-4}"
 BUCKET_DROP_LAST="${BUCKET_DROP_LAST:-0}"
 DISABLE_BUCKET_FOR_STAGE3="${DISABLE_BUCKET_FOR_STAGE3:-0}"
 SCIENCEQA_PREPROCESSED_PATH="${SCIENCEQA_PREPROCESSED_PATH:-${PREPROCESS_DIR}/scienceqa_${SCIENCEQA_SPLIT}_n${TRAIN_NUM}_seed${SCIENCEQA_SEED}_${BUCKET_BY}_bs${PREPROCESS_BUCKET_BATCH_SIZE}.json}"
 
-# Stage2 latest H200 config
+# Stage2 4x H200 config
+# 保持与原 1 卡配置近似的有效 batch：8 * 4(accum) -> 8 * 4卡 * 1(accum)
 STAGE="2"
-EPOCHS="${EPOCHS:-3}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
-STAGE2_GRAD_ACCUM="${STAGE2_GRAD_ACCUM:-4}"
+EPOCHS="${EPOCHS:-100}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+PREPROCESS_BUCKET_BATCH_SIZE="${BATCH_SIZE}"
+BUCKET_BATCH_SIZE="${BATCH_SIZE}"
+GRAD_ACCUM="${GRAD_ACCUM:-2}"
+STAGE2_GRAD_ACCUM="${STAGE2_GRAD_ACCUM:-2}"
 STAGE3_GRAD_ACCUM="${STAGE3_GRAD_ACCUM:-0}"
 LR="${LR:-3e-5}"
 STAGE1_LR="${STAGE1_LR:-5e-5}"
@@ -97,16 +106,23 @@ echo "SCIENCEQA_PATH: ${SCIENCEQA_PATH}"
 echo "SCIENCEQA_PREPROCESSED_PATH: ${SCIENCEQA_PREPROCESSED_PATH}"
 echo "STAGE1_CODEBOOK_PATH: ${STAGE1_CODEBOOK_PATH}"
 echo "STAGE2_CKPT_PATH: ${STAGE2_CKPT_PATH}"
+echo "STAGE2_RESUME_PATH: ${STAGE2_RESUME_PATH:-<empty>}"
+echo "STAGE2_RESUME_SAVE_PATH: ${STAGE2_RESUME_SAVE_PATH}"
 echo "RESULT_PATH: ${RESULT_PATH}"
 echo "EPOCHS: ${EPOCHS}"
 echo "LR: ${LR}"
 echo "BATCH_SIZE: ${BATCH_SIZE}"
 echo "GRAD_ACCUM/STAGE2_GRAD_ACCUM: ${GRAD_ACCUM}/${STAGE2_GRAD_ACCUM}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "DDP_NPROC: ${DDP_NPROC}"
 echo "LOG_FILE: ${LOG_FILE}"
 
 align_vq_require_file "${TRAIN_ENTRY}" "Stage2 训练入口"
 align_vq_require_file "${EVAL_ENTRY}" "Stage2 评测入口"
 align_vq_require_stage1_artifacts "${STAGE1_CODEBOOK_PATH}"
+if [ -n "${STAGE2_RESUME_PATH}" ]; then
+    align_vq_require_file "${STAGE2_RESUME_PATH}/stage2_resume_state.pt" "Stage2 resume state"
+fi
 align_vq_prepare_scienceqa_preprocess \
     "${SCIENCEQA_PREPROCESSED_PATH}" \
     "${SCIENCEQA_SPLIT}" \
@@ -119,7 +135,12 @@ align_vq_prepare_scienceqa_preprocess \
     "10" \
     "10"
 
-"${PYTHON_BIN}" "${TRAIN_ENTRY}" \
+mkdir -p "${STAGE2_RESUME_SAVE_PATH}"
+
+TRAIN_LAUNCHER=()
+align_vq_make_train_launcher TRAIN_LAUNCHER
+
+"${TRAIN_LAUNCHER[@]}" "${TRAIN_ENTRY}" \
     --model_path="${MODEL_PATH}" \
     --victim_model="${VICTIM_MODEL}" \
     --teacher_api_base="${TEACHER_API_BASE}" \
@@ -177,6 +198,10 @@ align_vq_prepare_scienceqa_preprocess \
     --reuse_stage2="${REUSE_STAGE2}" \
     --vq_codebook_path="${STAGE1_CODEBOOK_PATH}" \
     --stage2_ckpt_path="${STAGE2_CKPT_PATH}" \
+    --stage2_resume_path="${STAGE2_RESUME_PATH}" \
+    --stage2_resume_save_path="${STAGE2_RESUME_SAVE_PATH}" \
+    --stage2_resume_save_optimizer="${STAGE2_RESUME_SAVE_OPTIMIZER}" \
+    --stage2_resume_save_interval="${STAGE2_RESUME_SAVE_INTERVAL}" \
     --save_path="${SAVE_PATH}" \
     --log_step="${LOG_STEP}" \
     --save_step="${SAVE_STEP}" \

@@ -7,7 +7,7 @@ source "${SCRIPT_SOURCE_DIR}/common.sh"
 
 align_vq_init_paths
 align_vq_setup_env
-align_vq_ensure_runtime_dirs
+# align_vq_ensure_runtime_dirs
 align_vq_setup_logging "test_vq_lord_stage3"
 
 # Evaluation

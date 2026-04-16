@@ -13,7 +13,7 @@ align_vq_setup_logging "run_stage1"
 
 # Paths
 TRAIN_ENTRY="${ROOT_DIR}/vq_lord3/train_vq_lord3.py"
-SAVE_PATH="${CKPT_DIR}"
+SAVE_PATH="${CKPT_DIR}/stage1"
 STAGE1_CODEBOOK_PATH="${CKPT_DIR}/stage1_vq/vq_codebook.pt"
 
 # Data

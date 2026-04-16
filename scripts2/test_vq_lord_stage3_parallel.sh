@@ -14,6 +14,7 @@ align_vq_setup_logging "test_vq_lord_stage3_parallel"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-16}"
+ENABLE_SECOND_PASS="${ENABLE_SECOND_PASS:-0}"
 SECOND_PASS_MAX_NEW_TOKENS="${SECOND_PASS_MAX_NEW_TOKENS:-1024}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate}"
 USE_4BIT="${USE_4BIT:-0}"
@@ -33,8 +34,8 @@ GPU_IDS="${GPU_IDS:-0 1 2 3}"
 # Paths
 PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
-# STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3_sub1_period7}"
-STAGE3_FINAL_ADAPTER_PATH="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7"
+STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3/stage3_sub1_period13}"
+# STAGE3_FINAL_ADAPTER_PATH="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7"
 BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/scienceqa_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
 SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_shards}"
 RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_parallel.json}"
@@ -50,6 +51,7 @@ echo "BUCKET_PLAN_PATH: ${BUCKET_PLAN_PATH}"
 echo "NUM_SHARDS: ${NUM_SHARDS}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "EVAL_MAX_NEW_TOKENS: ${EVAL_MAX_NEW_TOKENS}"
+echo "ENABLE_SECOND_PASS: ${ENABLE_SECOND_PASS}"
 echo "SECOND_PASS_MAX_NEW_TOKENS: ${SECOND_PASS_MAX_NEW_TOKENS}"
 echo "EVAL_BUCKET_BATCH_SIZE: ${EVAL_BUCKET_BATCH_SIZE}"
 echo "SHARD_RESULT_DIR: ${SHARD_RESULT_DIR}"
@@ -107,6 +109,7 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
             --split="${EVAL_SPLIT}" \
             --max_samples="${EVAL_MAX_SAMPLES}" \
             --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
+            --enable_second_pass="${ENABLE_SECOND_PASS}" \
             --second_pass_max_new_tokens="${SECOND_PASS_MAX_NEW_TOKENS}" \
             --use_4bit="${USE_4BIT}" \
             --use_vq="${USE_VQ}" \
@@ -146,6 +149,7 @@ fi
     --split="${EVAL_SPLIT}" \
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
+    --enable_second_pass="${ENABLE_SECOND_PASS}" \
     --second_pass_max_new_tokens="${SECOND_PASS_MAX_NEW_TOKENS}" \
     --use_4bit="${USE_4BIT}" \
     --use_vq="${USE_VQ}" \
