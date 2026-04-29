@@ -42,6 +42,7 @@ mkdir -p "$(dirname "${RESULT_PATH}")"
 
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --adapter_path="${STAGE2_CKPT_PATH}" \
     --scienceqa_path="${SCIENCEQA_PATH}" \
     --split="${EVAL_SPLIT}" \

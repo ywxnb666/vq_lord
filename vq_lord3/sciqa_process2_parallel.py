@@ -26,6 +26,8 @@ from sciqa_process2 import (
     build_prompt,
     extract_choice_from_output,
     load_model_and_processor,
+    normalize_dataset_name,
+    resolve_eval_answer_idx,
 )
 
 
@@ -157,11 +159,18 @@ def load_bucket_payload(bucket_plan_path: str) -> dict:
     return payload
 
 
-def validate_bucket_payload(payload: dict, scienceqa_path: str, split: str, max_samples: int) -> None:
+def validate_bucket_payload(payload: dict, scienceqa_path: str, split: str, max_samples: int, dataset_name: str) -> None:
     cfg = payload.get("config", {})
+    payload_dataset_name = str(cfg.get("dataset_name", "") or "").strip().lower()
     payload_split = str(cfg.get("split", ""))
     payload_train_num = int(cfg.get("train_num", 0) or 0)
     payload_bucket_by = str(cfg.get("bucket_by", ""))
+
+    expected_dataset_name = normalize_dataset_name(dataset_name)
+    if payload_dataset_name and payload_dataset_name != expected_dataset_name:
+        raise ValueError(
+            f"bucket plan dataset_name mismatch: expected={expected_dataset_name}, got={payload_dataset_name}"
+        )
 
     if payload_split and payload_split != split:
         raise ValueError(
@@ -177,7 +186,8 @@ def validate_bucket_payload(payload: dict, scienceqa_path: str, split: str, max_
         )
 
 
-def build_eval_sample_map(scienceqa_path: str, split: str, bucket_payload: dict) -> Dict[int, dict]:
+def build_eval_sample_map(scienceqa_path: str, split: str, bucket_payload: dict, dataset_name: str) -> Dict[int, dict]:
+    dataset_name = normalize_dataset_name(dataset_name)
     dataset = load_dataset(scienceqa_path, split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
@@ -197,7 +207,7 @@ def build_eval_sample_map(scienceqa_path: str, split: str, bucket_payload: dict)
             "source_index": source_index,
             "question": item.get("question", ""),
             "choices": item.get("choices", []),
-            "answer_idx": item.get("answer", 0),
+            "answer_idx": resolve_eval_answer_idx(item, dataset_name=dataset_name),
             "hint": item.get("hint", ""),
             "image": item.get("image"),
             "patch_count": int(record.get("patch_count", 0)),
@@ -281,6 +291,7 @@ def run_eval_shard(
     model,
     processor,
     bucket_plan_path: str,
+    dataset_name: str,
     scienceqa_path: str,
     split: str,
     max_samples: int,
@@ -293,10 +304,17 @@ def run_eval_shard(
     shard_id: int,
     run_config: Optional[dict] = None,
 ):
+    dataset_name = normalize_dataset_name(dataset_name)
     bucket_payload = load_bucket_payload(bucket_plan_path)
-    validate_bucket_payload(bucket_payload, scienceqa_path=scienceqa_path, split=split, max_samples=max_samples)
+    validate_bucket_payload(
+        bucket_payload,
+        scienceqa_path=scienceqa_path,
+        split=split,
+        max_samples=max_samples,
+        dataset_name=dataset_name,
+    )
 
-    sample_map = build_eval_sample_map(scienceqa_path, split, bucket_payload)
+    sample_map = build_eval_sample_map(scienceqa_path, split, bucket_payload, dataset_name=dataset_name)
     batch_plan = bucket_payload.get("batch_plan", [])
     shard_plan = shard_batches(batch_plan, num_shards=num_shards, shard_id=shard_id)
 
@@ -458,6 +476,12 @@ def run_eval_shard(
 
         for row_idx, item in enumerate(batch_samples):
             pred_idx = batch_pred_idx[row_idx]
+            if item["answer_idx"] < 0 or item["answer_idx"] >= len(item["choices"]):
+                raise RuntimeError(
+                    f"answer_idx 越界。dataset_name={dataset_name}, split={split}, "
+                    f"sample_id={item['sample_id']}, answer_idx={item['answer_idx']}, "
+                    f"num_choices={len(item['choices'])}"
+                )
             is_correct = pred_idx == item["answer_idx"]
             total += 1
             if is_correct:
@@ -555,7 +579,9 @@ def merge_shard_results(
 def parse_args():
     parser = argparse.ArgumentParser(description="ScienceQA patch 分桶并行验证脚本")
     parser.add_argument("--model_path", type=str, default="", help="基础模型路径")
+    parser.add_argument("--student_model_type", type=str, default="llava_next", choices=["llava_next", "qwen2_vl"], help="学生模型后端类型")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
+    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa"], help="评测数据集名称")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="test", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=0, help="最大评测样本数，0 表示全量")
@@ -590,6 +616,7 @@ def main():
         merge_run_config = {
             "model_path": args.model_path,
             "adapter_path": args.adapter_path,
+            "dataset_name": args.dataset_name,
             "scienceqa_path": args.scienceqa_path,
             "split": args.split,
             "max_samples": int(args.max_samples),
@@ -628,12 +655,14 @@ def main():
         args.vq_codebook_size,
         args.freeze_vision_tower,
         args.vq_codebook_path,
+        args.student_model_type,
     )
     run_config = {
         "model_path": args.model_path,
         "adapter_path": args.adapter_path,
         "adapter_loaded": load_info.get("adapter_loaded", False),
         "adapter_fingerprint": load_info.get("adapter_fingerprint"),
+        "dataset_name": args.dataset_name,
         "scienceqa_path": args.scienceqa_path,
         "split": args.split,
         "max_samples": int(args.max_samples),
@@ -667,6 +696,7 @@ def main():
         model=model,
         processor=processor,
         bucket_plan_path=args.bucket_plan_path,
+        dataset_name=args.dataset_name,
         scienceqa_path=args.scienceqa_path,
         split=args.split,
         max_samples=int(args.max_samples),

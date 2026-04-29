@@ -22,6 +22,7 @@ from train_vq_lord3 import (
     ScienceQADataset,
     _capture_rng_state,
     _get_image_token_id,
+    _is_hf_multichoice_dataset,
     _get_trainable_parameter_state,
     _load_parameter_state,
     _move_optimizer_state_to_device_,
@@ -38,10 +39,13 @@ from train_vq_lord3 import (
     get_world_size,
     is_distributed,
     is_main_process,
+    is_projector_param,
     maybe_set_dataloader_epoch,
     reduce_numeric_dict,
     sanitize_image_sizes,
     save_stage3_checkpoint,
+    student_forward,
+    student_generate,
     unwrap_model,
 )
 
@@ -92,18 +96,23 @@ def _stage3_masked_mean_ddp(
 
 def _compute_token_log_probs(
     model,
+    args,
     ids: torch.Tensor,
     mask: torch.Tensor,
     pixel_values: torch.Tensor,
     image_sizes: Optional[torch.Tensor],
     prompt_lens: torch.Tensor,
+    image_grid_thw: Optional[torch.Tensor] = None,
 ):
     """返回 token-level log-prob 与生成段 mask。"""
-    out = model(
+    out = student_forward(
+        model=model,
+        args=args,
         input_ids=ids,
         attention_mask=mask,
         pixel_values=pixel_values,
         image_sizes=image_sizes,
+        image_grid_thw=image_grid_thw,
     )
     logits = out.logits[:, :-1, :]
     log_probs = F.log_softmax(logits, dim=-1)
@@ -127,6 +136,7 @@ class Stage3SampleCacheItem:
     y_vic_mask: torch.Tensor
     pixel_values: torch.Tensor
     image_sizes: Optional[torch.Tensor]
+    image_grid_thw: Optional[torch.Tensor]
     prompt_len: int
     observed_ids: Optional[torch.Tensor] = None
     context_ids: Optional[torch.Tensor] = None
@@ -184,6 +194,7 @@ def _stage3_resume_meta_path(resume_dir: str) -> str:
 def _stage3_resume_config(args) -> dict:
     return {
         "model_path": str(args.model_path),
+        "student_model_type": str(getattr(args, "student_model_type", "llava_next")),
         "use_lora": int(args.use_lora),
         "lora_rank": int(args.lora_rank),
         "lora_alpha": int(args.lora_alpha),
@@ -234,6 +245,7 @@ def _stage3_resume_config(args) -> dict:
         "scienceqa_preprocessed_path": str(getattr(args, "scienceqa_preprocessed_path", "")),
         "stage3_sample_cache_path": str(getattr(args, "stage3_sample_cache_path", "")),
         "vq_codebook_path": str(getattr(args, "vq_codebook_path", "")),
+        "remove_vq_codebook": int(getattr(args, "remove_vq_codebook", 0)),
         "stage2_ckpt_path": str(getattr(args, "stage2_ckpt_path", "")),
         "world_size": int(getattr(args, "world_size", 1)),
     }
@@ -246,6 +258,7 @@ def _validate_stage3_resume_config(resume_config: dict, args):
     current = _stage3_resume_config(args)
     strict_keys = [
         "model_path",
+        "student_model_type",
         "use_lora",
         "lora_rank",
         "lora_alpha",
@@ -286,9 +299,11 @@ def _validate_stage3_resume_config(resume_config: dict, args):
         "stage3_wrong_image_margin",
         "stage3_force_cold_start_period0",
         "scienceqa_preprocessed_path",
-        "vq_codebook_path",
+        "remove_vq_codebook",
         "stage2_ckpt_path",
     ]
+    if not int(getattr(args, "remove_vq_codebook", 0)):
+        strict_keys.append("vq_codebook_path")
     for key in strict_keys:
         if key in resume_config and resume_config[key] != current[key]:
             raise RuntimeError(
@@ -573,6 +588,80 @@ def _validate_stage3_chunk_merge(
         )
 
 
+def _normalize_image_size_key(image_sizes: Optional[torch.Tensor]) -> Tuple[int, int]:
+    if image_sizes is None:
+        return (-1, -1)
+    if isinstance(image_sizes, torch.Tensor):
+        flat = image_sizes.detach().view(-1)
+        if flat.numel() >= 2:
+            return (int(flat[0].item()), int(flat[1].item()))
+    if isinstance(image_sizes, (list, tuple)) and len(image_sizes) >= 2:
+        return (int(image_sizes[0]), int(image_sizes[1]))
+    return (-1, -1)
+
+
+def _count_image_tokens(ids: torch.Tensor, image_token_id: Optional[int]) -> int:
+    if image_token_id is None:
+        return -1
+    return int((ids == int(image_token_id)).sum().item())
+
+
+def _build_rotating_next_lookup(groups: Dict[tuple, List[int]]) -> Dict[int, int]:
+    lookup: Dict[int, int] = {}
+    for _, members in groups.items():
+        if len(members) <= 1:
+            continue
+        for idx, sample_idx in enumerate(members):
+            lookup[int(sample_idx)] = int(members[(idx + 1) % len(members)])
+    return lookup
+
+
+def _build_wrong_image_lookup(
+    active_indices: List[int],
+    sample_cache: List[Stage3SampleCacheItem],
+    image_token_id: Optional[int],
+) -> Tuple[Dict[int, int], Dict[str, int]]:
+    ordered_indices = [int(idx) for idx in active_indices]
+    if not ordered_indices:
+        return {}, {"primary": 0, "fallback_patch": 0, "fallback_token": 0, "self": 0}
+
+    primary_groups: Dict[tuple, List[int]] = defaultdict(list)
+    fallback_patch_groups: Dict[tuple, List[int]] = defaultdict(list)
+    fallback_token_groups: Dict[tuple, List[int]] = defaultdict(list)
+
+    for idx in ordered_indices:
+        sample = sample_cache[idx]
+        image_token_count = _count_image_tokens(sample.y_vic_ids, image_token_id)
+        patch_count = int(sample.pixel_values.shape[0]) if sample.pixel_values.dim() >= 1 else 0
+        image_size_key = _normalize_image_size_key(sample.image_sizes)
+        primary_groups[(image_token_count, patch_count, image_size_key)].append(idx)
+        fallback_patch_groups[(image_token_count, patch_count)].append(idx)
+        fallback_token_groups[(image_token_count,)].append(idx)
+
+    primary_next = _build_rotating_next_lookup(primary_groups)
+    fallback_patch_next = _build_rotating_next_lookup(fallback_patch_groups)
+    fallback_token_next = _build_rotating_next_lookup(fallback_token_groups)
+
+    wrong_lookup: Dict[int, int] = {}
+    stats = {"primary": 0, "fallback_patch": 0, "fallback_token": 0, "self": 0}
+    for idx in ordered_indices:
+        if idx in primary_next:
+            wrong_lookup[idx] = int(primary_next[idx])
+            stats["primary"] += 1
+            continue
+        if idx in fallback_patch_next:
+            wrong_lookup[idx] = int(fallback_patch_next[idx])
+            stats["fallback_patch"] += 1
+            continue
+        if idx in fallback_token_next:
+            wrong_lookup[idx] = int(fallback_token_next[idx])
+            stats["fallback_token"] += 1
+            continue
+        wrong_lookup[idx] = int(idx)
+        stats["self"] += 1
+    return wrong_lookup, stats
+
+
 class PeriodTrainingDataset(torch.utils.data.Dataset):
     def __init__(self, items: List[PeriodTrainingItem], sample_cache: List[Stage3SampleCacheItem]):
         self.items = items
@@ -602,8 +691,10 @@ class PeriodTrainingDataset(torch.utils.data.Dataset):
             "old_token_mask_vic": pair.old_token_mask_vic,
             "pixel_values": sample.pixel_values,
             "image_sizes": sample.image_sizes,
+            "image_grid_thw": sample.image_grid_thw,
             "wrong_pixel_values": wrong_sample.pixel_values,
             "wrong_image_sizes": wrong_sample.image_sizes,
+            "wrong_image_grid_thw": wrong_sample.image_grid_thw,
             "vic_observed_mask": sample.vic_observed_mask,
             "vic_context_mask": sample.vic_context_mask,
             "vic_reasoning_mask": sample.vic_reasoning_mask,
@@ -690,6 +781,21 @@ def _stack_optional_image_sizes(image_sizes_list: List[Optional[torch.Tensor]]) 
         ],
         dim=0,
     )
+
+
+def _stack_optional_image_grid_thw(grid_list: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+    if not any(grid is not None for grid in grid_list):
+        return None
+    normalized = []
+    for grid in grid_list:
+        if grid is None:
+            raise RuntimeError("同一 batch 中 Qwen image_grid_thw 不能部分缺失")
+        if not isinstance(grid, torch.Tensor):
+            grid = torch.tensor(grid, dtype=torch.long)
+        if grid.dim() == 1:
+            grid = grid.unsqueeze(0)
+        normalized.append(grid.to(dtype=torch.long))
+    return torch.cat(normalized, dim=0)
 
 
 def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
@@ -793,6 +899,8 @@ def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
     wrong_pixel_values = _stack_pixel_values("wrong_pixel_values")
     image_sizes = _stack_image_sizes("image_sizes")
     wrong_image_sizes = _stack_image_sizes("wrong_image_sizes")
+    image_grid_thw = _stack_optional_image_grid_thw([item.get("image_grid_thw") for item in batch])
+    wrong_image_grid_thw = _stack_optional_image_grid_thw([item.get("wrong_image_grid_thw") for item in batch])
     vic_observed_mask = _collate_vic_field_mask("vic_observed_mask")
     vic_context_mask = _collate_vic_field_mask("vic_context_mask")
     vic_reasoning_mask = _collate_vic_field_mask("vic_reasoning_mask")
@@ -818,8 +926,10 @@ def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
         "old_token_mask_vic": old_mask_vic,
         "pixel_values": pixel_values,
         "image_sizes": image_sizes,
+        "image_grid_thw": image_grid_thw,
         "wrong_pixel_values": wrong_pixel_values,
         "wrong_image_sizes": wrong_image_sizes,
+        "wrong_image_grid_thw": wrong_image_grid_thw,
         "vic_observed_mask": vic_observed_mask,
         "vic_context_mask": vic_context_mask,
         "vic_reasoning_mask": vic_reasoning_mask,
@@ -1002,6 +1112,7 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
             y_vic_mask=y_vic_mask.detach().cpu().long(),
             pixel_values=pixel_values.detach().cpu(),
             image_sizes=image_sizes,
+            image_grid_thw=sample.get("image_grid_thw"),
             prompt_len=prompt_len,
             observed_ids=observed_ids,
             context_ids=context_ids,
@@ -1082,7 +1193,7 @@ def _set_stage3_trainable_params(model, args) -> List[torch.nn.Parameter]:
         name_l = name.lower()
         is_lora = "lora_" in name_l or "modules_to_save" in name_l
         is_projector = (
-            ("projector" in name_l or "multi_modal_projector" in name_l)
+            is_projector_param(name, getattr(args, "student_model_type", "llava_next"))
             and bool(args.stage3_train_projector)
         )
         param.requires_grad = bool(is_lora or is_projector)
@@ -1119,6 +1230,7 @@ def _generate_candidate_single(
     prompt_mask = sample.prompt_mask.unsqueeze(0).to(device)
     pixel_values = sample.pixel_values.unsqueeze(0).to(device)
     image_sizes = sanitize_image_sizes(sample.image_sizes.unsqueeze(0), batch_size=1)
+    image_grid_thw = _stack_optional_image_grid_thw([sample.image_grid_thw])
     allowed_img_count = int((sample.prompt_ids == int(image_token_id)).sum().item()) if image_token_id is not None else 0
 
     gen_kwargs = dict(
@@ -1126,6 +1238,7 @@ def _generate_candidate_single(
         attention_mask=prompt_mask,
         pixel_values=pixel_values,
         image_sizes=image_sizes,
+        image_grid_thw=image_grid_thw,
         do_sample=bool(do_sample),
         max_new_tokens=int(args.max_new_tokens),
         bad_words_ids=[[int(image_token_id)]] if image_token_id is not None else None,
@@ -1143,7 +1256,7 @@ def _generate_candidate_single(
             torch.cuda.manual_seed_all(seed)
     try:
         with torch.no_grad():
-            generated = model.generate(**gen_kwargs)
+            generated = student_generate(model, args, **gen_kwargs)
     finally:
         if rng_state is not None:
             _restore_rng_state(rng_state)
@@ -1188,6 +1301,7 @@ def _generate_candidate_batch(
         _stack_optional_image_sizes([sample.image_sizes for sample in samples]),
         batch_size=len(samples),
     )
+    image_grid_thw = _stack_optional_image_grid_thw([sample.image_grid_thw for sample in samples])
     allowed_img_counts = [
         int((sample.prompt_ids == int(image_token_id)).sum().item()) if image_token_id is not None else 0
         for sample in samples
@@ -1198,6 +1312,7 @@ def _generate_candidate_batch(
         attention_mask=prompt_mask,
         pixel_values=pixel_values,
         image_sizes=image_sizes,
+        image_grid_thw=image_grid_thw,
         do_sample=bool(do_sample),
         max_new_tokens=int(args.max_new_tokens),
         bad_words_ids=[[int(image_token_id)]] if image_token_id is not None else None,
@@ -1215,7 +1330,7 @@ def _generate_candidate_batch(
             torch.cuda.manual_seed_all(seed)
     try:
         with torch.no_grad():
-            generated = model.generate(**gen_kwargs)
+            generated = student_generate(model, args, **gen_kwargs)
     finally:
         if rng_state is not None:
             _restore_rng_state(rng_state)
@@ -1303,18 +1418,23 @@ def _build_stage3_choice_token_map(tokenizer, max_choices: int = 8) -> Dict[int,
 
 def _compute_choice_scores_from_prompt_batch(
     model,
+    args,
     prompt_ids: torch.Tensor,
     prompt_mask: torch.Tensor,
     pixel_values: torch.Tensor,
     image_sizes: Optional[torch.Tensor],
     num_choices: torch.Tensor,
     choice_token_map: Dict[int, List[int]],
+    image_grid_thw: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    outputs = model(
+    outputs = student_forward(
+        model=model,
+        args=args,
         input_ids=prompt_ids,
         attention_mask=prompt_mask,
         pixel_values=pixel_values,
         image_sizes=image_sizes,
+        image_grid_thw=image_grid_thw,
         use_cache=False,
     )
     last_positions = prompt_mask.long().sum(dim=-1).clamp(min=1) - 1
@@ -1401,6 +1521,7 @@ def _evaluate_stage3_answer_metrics(
                     _stack_optional_image_sizes([sample.image_sizes for sample in batch_samples]),
                     batch_size=len(batch_samples),
                 )
+                image_grid_thw = _stack_optional_image_grid_thw([sample.image_grid_thw for sample in batch_samples])
                 num_choices = torch.tensor(
                     [int(sample.num_choices) for sample in batch_samples],
                     device=args.device,
@@ -1408,12 +1529,14 @@ def _evaluate_stage3_answer_metrics(
                 )
                 choice_scores, valid_rows = _compute_choice_scores_from_prompt_batch(
                     model=model,
+                    args=args,
                     prompt_ids=prompt_ids,
                     prompt_mask=prompt_mask,
                     pixel_values=pixel_values,
                     image_sizes=image_sizes,
                     num_choices=num_choices,
                     choice_token_map=choice_token_map,
+                    image_grid_thw=image_grid_thw,
                 )
                 pred_indices = _predict_choice_from_choice_scores(choice_scores, num_choices, valid_rows)
                 for local_idx, sample_idx in enumerate(batch_indices):
@@ -1474,6 +1597,7 @@ def _score_sequences_no_grad_batch(
             _stack_optional_image_sizes([sample.image_sizes for sample in samples]),
             batch_size=len(samples),
         )
+        image_grid_thw = _stack_optional_image_grid_thw([sample.image_grid_thw for sample in samples])
         prompt_lens = torch.tensor(
             [sample.prompt_len for sample in samples],
             device=ids_b.device,
@@ -1482,11 +1606,13 @@ def _score_sequences_no_grad_batch(
 
         token_lp, token_mask = _compute_token_log_probs(
             model=model,
+            args=args,
             ids=ids_b,
             mask=mask_b,
             pixel_values=pixel_values,
             image_sizes=image_sizes,
             prompt_lens=prompt_lens,
+            image_grid_thw=image_grid_thw,
         )
         avg_lp_tensor = (token_lp * token_mask).sum(dim=-1) / token_mask.sum(dim=-1).clamp(min=1.0)
 
@@ -1538,7 +1664,7 @@ def _build_stage3_static_batches(
     if batch_size <= 1:
         return [[int(idx)] for idx in active_indices]
 
-    use_bucket = args.dataset_name == "scienceqa"
+    use_bucket = _is_hf_multichoice_dataset(args.dataset_name)
 
     batches: List[List[int]] = []
     if use_bucket:
@@ -1746,11 +1872,19 @@ def _build_pairs_and_next_states_distributed(
         )
 
     base_model = unwrap_model(model)
-    num_active = len(active_indices)
-    wrong_sample_lookup = {
-        int(idx): (int(active_indices[(rank + 1) % num_active]) if num_active > 1 else int(idx))
-        for rank, idx in enumerate(active_indices)
-    }
+    wrong_sample_lookup, wrong_lookup_stats = _build_wrong_image_lookup(
+        active_indices=active_indices,
+        sample_cache=sample_cache,
+        image_token_id=image_token_id,
+    )
+    if is_main_process():
+        print(
+            "[Stage3] wrong-image pairing stats: "
+            f"primary={wrong_lookup_stats['primary']}, "
+            f"fallback_patch={wrong_lookup_stats['fallback_patch']}, "
+            f"fallback_token={wrong_lookup_stats['fallback_token']}, "
+            f"self={wrong_lookup_stats['self']}"
+        )
     global_batches = _build_stage3_static_batches(
         active_indices=active_indices,
         sample_cache=sample_cache,
@@ -2179,11 +2313,19 @@ def _build_pairs_and_next_states(
     use_cache_states = _set_model_use_cache(model, True)
     gc_states = _set_model_gradient_checkpointing(model, False)
     try:
-        num_active = len(active_indices)
-        wrong_sample_lookup = {
-            int(idx): (int(active_indices[(rank + 1) % num_active]) if num_active > 1 else int(idx))
-            for rank, idx in enumerate(active_indices)
-        }
+        wrong_sample_lookup, wrong_lookup_stats = _build_wrong_image_lookup(
+            active_indices=active_indices,
+            sample_cache=sample_cache,
+            image_token_id=image_token_id,
+        )
+        if is_main_process():
+            print(
+                "[Stage3] wrong-image pairing stats: "
+                f"primary={wrong_lookup_stats['primary']}, "
+                f"fallback_patch={wrong_lookup_stats['fallback_patch']}, "
+                f"fallback_token={wrong_lookup_stats['fallback_token']}, "
+                f"self={wrong_lookup_stats['self']}"
+            )
         stage3_batches = _build_stage3_static_batches(
             active_indices=active_indices,
             sample_cache=sample_cache,
@@ -2419,6 +2561,7 @@ def _run_one_period_train(
     total_wrong = 0.0
     total_mc = 0.0
     total_mc_acc = 0.0
+    wrong_mismatch_count = 0
     total_field = {
         "observed": 0.0,
         "context": 0.0,
@@ -2459,11 +2602,13 @@ def _run_one_period_train(
         y_vic_mask = batch["y_vic_mask"].to(args.device)
         pixel_values = batch["pixel_values"].to(args.device)
         image_sizes = sanitize_image_sizes(batch.get("image_sizes"), batch_size=y_plus_ids.size(0))
+        image_grid_thw = batch.get("image_grid_thw")
         wrong_pixel_values = batch["wrong_pixel_values"].to(args.device)
         wrong_image_sizes = sanitize_image_sizes(
             batch.get("wrong_image_sizes"),
             batch_size=y_plus_ids.size(0),
         )
+        wrong_image_grid_thw = batch.get("wrong_image_grid_thw")
         prompt_lens = batch["prompt_lens"].to(args.device)
 
         old_lp_plus = batch["old_token_lp_plus"].to(args.device)
@@ -2492,7 +2637,7 @@ def _run_one_period_train(
         )
 
         cur_lp_plus, cur_mask_plus = _compute_token_log_probs(
-            model, y_plus_ids, y_plus_mask, pixel_values, image_sizes, prompt_lens
+            model, args, y_plus_ids, y_plus_mask, pixel_values, image_sizes, prompt_lens, image_grid_thw=image_grid_thw
         )
         if cur_lp_plus.shape[1] != old_lp_plus.shape[1]:
             target = min(cur_lp_plus.shape[1], old_lp_plus.shape[1])
@@ -2513,7 +2658,7 @@ def _run_one_period_train(
         del cur_lp_plus, cur_mask_plus, mask_plus, loss_plus
 
         cur_lp_minus, cur_mask_minus = _compute_token_log_probs(
-            model, y_minus_ids, y_minus_mask, pixel_values, image_sizes, prompt_lens
+            model, args, y_minus_ids, y_minus_mask, pixel_values, image_sizes, prompt_lens, image_grid_thw=image_grid_thw
         )
         if cur_lp_minus.shape[1] != old_lp_minus.shape[1]:
             target = min(cur_lp_minus.shape[1], old_lp_minus.shape[1])
@@ -2534,7 +2679,7 @@ def _run_one_period_train(
         del cur_lp_minus, cur_mask_minus, mask_minus, loss_minus
 
         cur_lp_vic, cur_mask_vic = _compute_token_log_probs(
-            model, y_vic_ids, y_vic_mask, pixel_values, image_sizes, prompt_lens
+            model, args, y_vic_ids, y_vic_mask, pixel_values, image_sizes, prompt_lens, image_grid_thw=image_grid_thw
         )
         if cur_lp_vic.shape[1] != old_lp_vic.shape[1]:
             target = min(cur_lp_vic.shape[1], old_lp_vic.shape[1])
@@ -2576,19 +2721,34 @@ def _run_one_period_train(
 
         loss_wrong = torch.zeros((), device=args.device, dtype=loss_reg.dtype)
         loss_wrong_val = 0.0
+        cur_lp_wrong_vic = None
+        cur_mask_wrong_vic = None
+        wrong_mask = None
+        wrong_delta = None
         if wrong_image_enable:
-            cur_lp_wrong_vic, cur_mask_wrong_vic = _compute_token_log_probs(
-                model, y_vic_ids, y_vic_mask, wrong_pixel_values, wrong_image_sizes, prompt_lens
-            )
-            if cur_lp_wrong_vic.shape[1] != cur_lp_vic.shape[1]:
-                target = min(cur_lp_wrong_vic.shape[1], cur_lp_vic.shape[1])
-                cur_lp_wrong_vic = cur_lp_wrong_vic[:, :target]
-                cur_mask_wrong_vic = cur_mask_wrong_vic[:, :target]
-                cur_lp_vic = cur_lp_vic[:, :target]
-                mask_vic = mask_vic[:, :target]
-            wrong_mask = (mask_vic * cur_mask_wrong_vic).float()
-            wrong_delta = F.relu(cur_lp_wrong_vic - cur_lp_vic + wrong_image_margin)
-            loss_wrong, loss_wrong_val = _stage3_masked_mean_ddp(wrong_delta, wrong_mask)
+            try:
+                cur_lp_wrong_vic, cur_mask_wrong_vic = _compute_token_log_probs(
+                    model, args, y_vic_ids, y_vic_mask, wrong_pixel_values, wrong_image_sizes, prompt_lens, image_grid_thw=wrong_image_grid_thw
+                )
+            except ValueError as exc:
+                if "Image features and image tokens do not match" not in str(exc):
+                    raise
+                wrong_mismatch_count += 1
+                if is_main_process():
+                    print(
+                        f"[Stage3][Warn] step={global_step} wrong-image token/feature mismatch，"
+                        f"本 batch 跳过 wrong-image loss。detail={exc}"
+                    )
+            if cur_lp_wrong_vic is not None and cur_mask_wrong_vic is not None:
+                if cur_lp_wrong_vic.shape[1] != cur_lp_vic.shape[1]:
+                    target = min(cur_lp_wrong_vic.shape[1], cur_lp_vic.shape[1])
+                    cur_lp_wrong_vic = cur_lp_wrong_vic[:, :target]
+                    cur_mask_wrong_vic = cur_mask_wrong_vic[:, :target]
+                    cur_lp_vic = cur_lp_vic[:, :target]
+                    mask_vic = mask_vic[:, :target]
+                wrong_mask = (mask_vic * cur_mask_wrong_vic).float()
+                wrong_delta = F.relu(cur_lp_wrong_vic - cur_lp_vic + wrong_image_margin)
+                loss_wrong, loss_wrong_val = _stage3_masked_mean_ddp(wrong_delta, wrong_mask)
 
         loss_vic_total = reg_weight * loss_reg + answer_anchor_weight * loss_answer_anchor + wrong_image_weight * loss_wrong
         if _sync_skip(
@@ -2603,12 +2763,14 @@ def _run_one_period_train(
         if mc_weight > 0.0 and choice_token_map:
             choice_scores, valid_mc_rows = _compute_choice_scores_from_prompt_batch(
                 model=model,
+                args=args,
                 prompt_ids=prompt_ids,
                 prompt_mask=prompt_mask,
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
                 num_choices=num_choices,
                 choice_token_map=choice_token_map,
+                image_grid_thw=image_grid_thw,
             )
             valid_mc_rows = valid_mc_rows & (num_choices > 0) & (answer_idx >= 0) & (answer_idx < num_choices)
             valid_mc_rows_exist = bool(valid_mc_rows.any().item())
@@ -2621,7 +2783,7 @@ def _run_one_period_train(
             with sync_ctx:
                 (loss_vic_total / grad_accum).backward()
         del cur_lp_vic, cur_mask_vic, mask_vic, delta_vic, loss_reg, loss_answer_anchor, loss_vic_total
-        if wrong_image_enable:
+        if cur_lp_wrong_vic is not None and cur_mask_wrong_vic is not None:
             del cur_lp_wrong_vic, cur_mask_wrong_vic, wrong_mask, wrong_delta
 
         loss_mc = torch.zeros((), device=args.device, dtype=old_lp_vic.dtype)
@@ -2716,6 +2878,7 @@ def _run_one_period_train(
             "total_wrong": total_wrong,
             "total_mc": total_mc,
             "total_mc_acc": total_mc_acc,
+            "wrong_mismatch_count": float(wrong_mismatch_count),
             "total_observed": total_field["observed"],
             "total_context": total_field["context"],
             "total_reasoning": total_field["reasoning"],
@@ -2731,6 +2894,11 @@ def _run_one_period_train(
         "reasoning": reduced_epoch["total_reasoning"] / denom,
         "answer": reduced_epoch["total_answer"] / denom,
     }
+    if is_main_process() and reduced_epoch.get("wrong_mismatch_count", 0.0) > 0.0:
+        print(
+            f"[Stage3][Warn] 当前 period 共有 "
+            f"{int(reduced_epoch['wrong_mismatch_count'])} 个 batch 触发 wrong-image mismatch 兜底。"
+        )
     return (
         reduced_epoch["total_loss"] / denom,
         reduced_epoch["total_mc"] / denom,
@@ -2762,7 +2930,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
     sub_set_num = int(args.sub_set_num)
     stage3_lr = float(args.lr) * float(args.stage3_lr_scale)
     stage3_phase_a_batch_size = _get_stage3_phase_a_batch_size(args, train_bucket_meta)
-    stage3_use_static_bucket = bool(args.dataset_name == "scienceqa" and train_bucket_meta is not None)
+    stage3_use_static_bucket = bool(_is_hf_multichoice_dataset(args.dataset_name) and train_bucket_meta is not None)
     stage3_eval_answer_mode = str(args.stage3_eval_answer_mode).strip().lower()
 
     if is_main_process():
@@ -2842,13 +3010,16 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
     ):
         eval_samples = build_scienceqa_samples(
             scienceqa_path=stage3_eval_path,
+            dataset_name=args.dataset_name,
             split=stage3_eval_split,
             train_num=stage3_eval_train_num,
             seed=int(args.scienceqa_seed),
+            include_dataset_answer=True,
         )
         eval_dataset = ScienceQADataset(
             processor=train_dataset.processor,
             scienceqa_path=stage3_eval_path,
+            dataset_name=args.dataset_name,
             split=stage3_eval_split,
             train_num=stage3_eval_train_num,
             max_length=args.max_length,
@@ -3143,6 +3314,9 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                     if tb_writer is not None:
                         tb_writer.add_scalar("stage3/val_answer_acc", val_acc, period_counter)
                         tb_writer.add_scalar("stage3/format_rate", val_fmt, period_counter)
+                        tb_writer.add_scalar("stage3_eval/val_answer_acc", val_acc, period_counter)
+                        tb_writer.add_scalar("stage3_eval/format_rate", val_fmt, period_counter)
+                        tb_writer.add_scalar("stage3_eval/val_samples", float(val_n), period_counter)
                 if is_distributed():
                     barrier_if_distributed()
 
@@ -3193,7 +3367,12 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                         args.save_path,
                         f"stage3_sub{sub_stage_idx+1}_period{period_idx+1}",
                     )
-                    save_stage3_checkpoint(model, ckpt_dir)
+                    save_stage3_checkpoint(
+                        model,
+                        ckpt_dir,
+                        remove_vq_codebook=bool(args.remove_vq_codebook),
+                        student_model_type=str(args.student_model_type),
+                    )
                 barrier_if_distributed()
 
         resume_period_idx = 0

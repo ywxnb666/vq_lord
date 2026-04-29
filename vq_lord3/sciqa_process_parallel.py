@@ -24,26 +24,71 @@ from sciqa_process import (
     build_prompt,
     extract_choice_from_output,
     load_model_and_processor,
+    normalize_dataset_name,
     predict_choice_with_next_token_logits,
+    resolve_eval_answer_idx,
+)
+from student_models import (
+    LLAVA_NEXT,
+    encode_multimodal,
+    normalize_student_model_type,
+    student_generate,
 )
 
 
-def build_eval_samples(scienceqa_path: str, split: str, max_samples: int) -> List[dict]:
+def build_eval_samples(scienceqa_path: str, split: str, max_samples: int, dataset_name: str) -> List[dict]:
+    dataset_name = normalize_dataset_name(dataset_name)
     dataset = load_dataset(scienceqa_path, split=split)
-    dataset_with_images = [item for item in dataset if item.get("image") is not None]
+    filtered_items = []
+    drop_no_image = 0
+    drop_non_mc = 0
+    drop_bad_answer = 0
 
-    if max_samples > 0 and len(dataset_with_images) > max_samples:
-        dataset_with_images = dataset_with_images[:max_samples]
+    for item in dataset:
+        image = item.get("image")
+        if image is None:
+            drop_no_image += 1
+            continue
+
+        choices = item.get("choices")
+        if not isinstance(choices, list) or len(choices) < 2:
+            drop_non_mc += 1
+            continue
+
+        try:
+            answer_idx = resolve_eval_answer_idx(item, dataset_name=dataset_name)
+        except RuntimeError:
+            drop_bad_answer += 1
+            continue
+        if answer_idx < 0 or answer_idx >= len(choices):
+            drop_bad_answer += 1
+            continue
+
+        filtered_items.append({
+            "question": item.get("question", ""),
+            "choices": choices,
+            "answer_idx": answer_idx,
+            "image": image,
+        })
+
+    if max_samples > 0 and len(filtered_items) > max_samples:
+        filtered_items = filtered_items[:max_samples]
 
     samples = []
-    for source_index, item in enumerate(dataset_with_images):
+    for source_index, item in enumerate(filtered_items):
         samples.append({
             "source_index": int(source_index),
-            "question": item.get("question", ""),
-            "choices": item.get("choices", []),
-            "answer_idx": item.get("answer", 0),
-            "image": item.get("image"),
+            "question": item["question"],
+            "choices": item["choices"],
+            "answer_idx": item["answer_idx"],
+            "image": item["image"],
         })
+
+    print(
+        f"[build_eval_samples] dataset={dataset_name} split={split} "
+        f"kept={len(samples)} drop_no_image={drop_no_image} "
+        f"drop_non_mc={drop_non_mc} drop_bad_answer={drop_bad_answer}"
+    )
     return samples
 
 
@@ -59,6 +104,8 @@ def shard_eval_samples(samples: List[dict], num_shards: int, shard_id: int) -> L
 def run_eval_shard(
     model,
     processor,
+    student_model_type: str,
+    dataset_name: str,
     scienceqa_path: str,
     split: str,
     max_samples: int,
@@ -69,7 +116,10 @@ def run_eval_shard(
     shard_id: int,
     run_config: Optional[dict] = None,
 ):
-    samples = build_eval_samples(scienceqa_path, split, max_samples)
+    dataset_name = normalize_dataset_name(dataset_name)
+    student_model_type = normalize_student_model_type(student_model_type)
+    runtime_args = type("Args", (), {"student_model_type": student_model_type})()
+    samples = build_eval_samples(scienceqa_path, split, max_samples, dataset_name=dataset_name)
     shard_samples = shard_eval_samples(samples, num_shards=num_shards, shard_id=shard_id)
 
     results = []
@@ -80,16 +130,31 @@ def run_eval_shard(
         question = item["question"]
         choices = item["choices"]
         answer_idx = item["answer_idx"]
+        if answer_idx < 0 or answer_idx >= len(choices):
+            raise RuntimeError(
+                f"answer_idx 越界。dataset_name={dataset_name}, split={split}, "
+                f"source_index={item['source_index']}, answer_idx={answer_idx}, num_choices={len(choices)}"
+            )
         image = item["image"]
 
-        prompt = build_prompt(question, choices)
-        inputs = processor(
-            text=prompt,
-            images=image,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
-        )
+        if student_model_type == LLAVA_NEXT:
+            prompt = build_prompt(question, choices)
+            inputs = processor(
+                text=prompt,
+                images=image,
+                return_tensors="pt",
+                padding="longest",
+                truncation=False,
+            )
+        else:
+            instruction_text = build_prompt(question, choices).replace("<image>\n", "", 1)
+            inputs = encode_multimodal(
+                processor,
+                student_model_type,
+                instruction_text=instruction_text,
+                image=image,
+                add_generation_prompt=True,
+            )
 
         input_ids = inputs["input_ids"].to(model.device)
         attention_mask = inputs["attention_mask"].to(model.device)
@@ -97,23 +162,42 @@ def run_eval_shard(
         image_sizes = inputs.get("image_sizes")
         if image_sizes is not None:
             image_sizes = image_sizes.to(model.device)
+        image_grid_thw = inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.to(model.device)
 
         output_text = ""
         pred_idx = None
 
         if answer_mode in ("generate", "hybrid"):
             with torch.no_grad():
-                generated = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=1,
-                    do_sample=False,
-                    pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
-                    eos_token_id=processor.tokenizer.eos_token_id,
-                )
+                if student_model_type == LLAVA_NEXT:
+                    generated = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=1,
+                        do_sample=False,
+                        pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id,
+                    )
+                else:
+                    generated = student_generate(
+                        model,
+                        runtime_args,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        image_grid_thw=image_grid_thw,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=1,
+                        do_sample=False,
+                        pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id,
+                    )
 
             prompt_len = input_ids.shape[-1]
             gen_tokens = generated[0][prompt_len:]
@@ -133,6 +217,8 @@ def run_eval_shard(
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
                 num_choices=len(choices),
+                student_model_type=student_model_type,
+                image_grid_thw=image_grid_thw,
             )
             if answer_mode == "logits":
                 output_text = "[logits_mode]"
@@ -231,7 +317,9 @@ def merge_shard_results(
 def parse_args():
     parser = argparse.ArgumentParser(description="ScienceQA 多模态并行验证脚本")
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
+    parser.add_argument("--student_model_type", type=str, default="llava_next", choices=["llava_next", "qwen2_vl"], help="学生模型后端类型")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
+    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa"], help="评测数据集名称")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="validation", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")
@@ -263,6 +351,7 @@ def main():
         merge_run_config = {
             "model_path": args.model_path,
             "adapter_path": args.adapter_path,
+            "dataset_name": args.dataset_name,
             "scienceqa_path": args.scienceqa_path,
             "split": args.split,
             "max_samples": int(args.max_samples),
@@ -293,12 +382,14 @@ def main():
         args.vq_codebook_size,
         args.freeze_vision_tower,
         args.vq_codebook_path,
+        args.student_model_type,
     )
     run_config = {
         "model_path": args.model_path,
         "adapter_path": args.adapter_path,
         "adapter_loaded": load_info.get("adapter_loaded", False),
         "adapter_fingerprint": load_info.get("adapter_fingerprint"),
+        "dataset_name": args.dataset_name,
         "scienceqa_path": args.scienceqa_path,
         "split": args.split,
         "max_samples": int(args.max_samples),
@@ -323,6 +414,8 @@ def main():
     run_eval_shard(
         model=model,
         processor=processor,
+        student_model_type=args.student_model_type,
+        dataset_name=args.dataset_name,
         scienceqa_path=args.scienceqa_path,
         split=args.split,
         max_samples=int(args.max_samples),

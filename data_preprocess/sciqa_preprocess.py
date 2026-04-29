@@ -26,11 +26,19 @@ import json
 import math
 import os
 import random
+import sys
 from collections import defaultdict
-from typing import Dict, Hashable, List, Optional, Sequence, Tuple
+from typing import Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
 from datasets import load_dataset
-from transformers import LlavaNextProcessor
+from transformers import AutoProcessor, LlavaNextProcessor
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+VQ_LORD3_DIR = os.path.join(REPO_ROOT, "vq_lord3")
+if VQ_LORD3_DIR not in sys.path:
+	sys.path.insert(0, VQ_LORD3_DIR)
+
+from textvqa_mcq import build_textvqa_mcq_samples, materialize_textvqa_image
 
 
 # 与 train_vq_lord.py 保持一致，避免旧版配置里的 image_token 触发报错。
@@ -52,13 +60,55 @@ DEFAULT_MODEL_CANDIDATES = [
 ]
 
 
+def normalize_dataset_name(dataset_name: str) -> str:
+	name = str(dataset_name or "").strip().lower()
+	if not name:
+		return "scienceqa"
+	return name
+
+
+def resolve_mc_answer_idx(item: dict, dataset_name: str) -> int:
+	dataset_name = normalize_dataset_name(dataset_name)
+	if dataset_name == "aokvqa":
+		field_candidates = ("correct_choice_idx", "answer")
+	else:
+		field_candidates = ("answer", "correct_choice_idx")
+
+	for field in field_candidates:
+		raw_value = item.get(field)
+		if raw_value is None:
+			continue
+		try:
+			return int(raw_value)
+		except (TypeError, ValueError):
+			continue
+
+	available = ",".join(sorted(item.keys()))
+	raise RuntimeError(
+		f"样本缺少有效答案字段。dataset_name={dataset_name}, "
+		f"expected_fields={field_candidates}, available_fields={available}"
+	)
+
+
 def build_scienceqa_samples(
 	dataset_path: str,
 	split: str,
 	train_num: int,
 	seed: int,
+	dataset_name: str = "scienceqa",
+	allowed_source_indices: Optional[Set[int]] = None,
 ) -> List[dict]:
 	"""复用 train_vq_lord.py 的采样语义，只保留有图像样本。"""
+	dataset_name = normalize_dataset_name(dataset_name)
+	if dataset_name == "textvqa":
+		return build_textvqa_mcq_samples(
+			dataset_path=dataset_path,
+			split=split,
+			train_num=train_num,
+			seed=seed,
+			allowed_source_indices=allowed_source_indices,
+		)
+
 	try:
 		dataset = load_dataset(dataset_path, split=split)
 	except Exception as exc:
@@ -72,7 +122,13 @@ def build_scienceqa_samples(
 		) from exc
 	dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
-	all_indices = list(range(len(dataset_with_images)))
+	if allowed_source_indices is not None:
+		all_indices = [
+			idx for idx in sorted(allowed_source_indices)
+			if 0 <= int(idx) < len(dataset_with_images)
+		]
+	else:
+		all_indices = list(range(len(dataset_with_images)))
 	random.seed(seed)
 	random.shuffle(all_indices)
 	if train_num > 0 and len(all_indices) > train_num:
@@ -83,11 +139,24 @@ def build_scienceqa_samples(
 		item = dataset_with_images[dataset_idx]
 		question = item.get("question", "")
 		choices = item.get("choices", [])
+		if not isinstance(choices, list):
+			raise RuntimeError(
+				f"样本 choices 不是 list。dataset_name={dataset_name}, split={split}, source_index={dataset_idx}"
+			)
+		if not choices:
+			raise RuntimeError(
+				f"样本 choices 为空。dataset_name={dataset_name}, split={split}, source_index={dataset_idx}"
+			)
 		choices_text = ""
 		for choice_idx, choice in enumerate(choices):
 			choices_text += f"({chr(65 + choice_idx)}) {choice}\n"
 
-		answer_idx = item.get("answer", 0)
+		answer_idx = resolve_mc_answer_idx(item, dataset_name=dataset_name)
+		if answer_idx < 0 or answer_idx >= len(choices):
+			raise RuntimeError(
+				f"样本 answer_idx 越界。dataset_name={dataset_name}, split={split}, "
+				f"source_index={dataset_idx}, answer_idx={answer_idx}, num_choices={len(choices)}"
+			)
 		answer = choices[answer_idx] if choices and answer_idx < len(choices) else ""
 		lecture = item.get("lecture", "")
 		solution = item.get("solution", "")
@@ -112,6 +181,51 @@ def build_scienceqa_samples(
 	return samples
 
 
+def load_cached_teacher_source_indices(
+	cache_path: str,
+	dataset_name: str,
+	split: str,
+) -> Set[int]:
+	if not cache_path:
+		raise RuntimeError("sample-only-cached-teacher=1 时必须提供 --teacher-cache-path")
+	if not os.path.exists(cache_path):
+		raise RuntimeError(f"teacher cache 不存在: {cache_path}")
+
+	with open(cache_path, "r", encoding="utf-8") as f:
+		payload = json.load(f)
+	cache_samples = payload.get("samples")
+	if not isinstance(cache_samples, dict):
+		raise RuntimeError(f"教师缓存 samples 字段无效: {cache_path}")
+
+	required_fields = (
+		"observed_facts_visual",
+		"context_textual",
+		"reasoning",
+		"answer",
+	)
+	prefix = f"{normalize_dataset_name(dataset_name)}::{split}::"
+	allowed: Set[int] = set()
+	for cache_key, teacher_payload in cache_samples.items():
+		if not isinstance(cache_key, str) or not cache_key.startswith(prefix):
+			continue
+		suffix = cache_key[len(prefix):]
+		try:
+			source_index = int(suffix)
+		except (TypeError, ValueError):
+			continue
+		if not isinstance(teacher_payload, dict):
+			continue
+		valid = True
+		for field in required_fields:
+			value = teacher_payload.get(field)
+			if not isinstance(value, str) or len(value.strip()) == 0:
+				valid = False
+				break
+		if valid:
+			allowed.add(source_index)
+	return allowed
+
+
 def extract_image_hw(image) -> Tuple[int, int]:
 	if image is None:
 		raise ValueError("image is None")
@@ -123,13 +237,18 @@ def extract_image_hw(image) -> Tuple[int, int]:
 	raise ValueError("unable to extract image size")
 
 
-def estimate_patch_count(processor: LlavaNextProcessor, image) -> int:
+def estimate_patch_count(processor, image) -> int:
+	image = materialize_textvqa_image(image)
 	image_processor = getattr(processor, "image_processor", None)
 	if image_processor is not None:
 		inputs = image_processor(images=image, return_tensors="pt")
 	else:
 		inputs = processor(text="", images=image, return_tensors="pt")
 	pixel_values = inputs["pixel_values"]
+	if pixel_values.dim() == 2:
+		if "image_grid_thw" not in inputs:
+			raise RuntimeError("Qwen2-VL pixel_values 为二维，但 processor 输出缺少 image_grid_thw")
+		return int(pixel_values.shape[0])
 	if pixel_values.dim() == 5:
 		return int(pixel_values.shape[1])
 	if pixel_values.dim() == 4:
@@ -147,13 +266,13 @@ def resolve_model_path(requested_model_path: str) -> str:
 			return candidate
 
 	raise FileNotFoundError(
-		"未找到可用的 LlavaNextProcessor 路径，请显式传入 --model-path。"
+		"未找到可用的 processor 路径，请显式传入 --model-path。"
 	)
 
 
 def build_sample_records(
 	samples: Sequence[dict],
-	processor: LlavaNextProcessor,
+	processor,
 	bucket_by: str,
 ) -> List[dict]:
 	records: List[dict] = []
@@ -290,6 +409,13 @@ def print_summary(records: Sequence[dict], bucket_summary: Sequence[dict], batch
 def build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="ScienceQA patch 分桶预处理")
 	parser.add_argument(
+		"--dataset-name",
+		type=str,
+		default="scienceqa",
+		choices=["scienceqa", "aokvqa", "textvqa"],
+		help="数据集名称（用于字段映射）",
+	)
+	parser.add_argument(
 		"--dataset-path",
 		type=str,
 		default="/root/autodl-tmp/datasets/ScienceQA",
@@ -318,6 +444,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		type=int,
 		default=20240306,
 		help="样本采样随机种子",
+	)
+	parser.add_argument(
+		"--sample-only-cached-teacher",
+		type=int,
+		default=0,
+		help="是否仅从教师缓存可用样本中抽样，1=是，0=否",
+	)
+	parser.add_argument(
+		"--teacher-cache-path",
+		type=str,
+		default="",
+		help="教师缓存路径（启用 sample-only-cached-teacher 时必填）",
 	)
 	parser.add_argument(
 		"--bucket-by",
@@ -373,14 +511,29 @@ def main() -> None:
 
 	args.model_path = resolve_model_path(args.model_path)
 	print(f"加载 processor: {args.model_path}")
-	processor = LlavaNextProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+	processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
 
 	print(f"加载 ScienceQA split={args.split}, train_num={args.train_num}, seed={args.seed}")
+	allowed_source_indices = None
+	if int(args.sample_only_cached_teacher) == 1:
+		allowed_source_indices = load_cached_teacher_source_indices(
+			cache_path=args.teacher_cache_path,
+			dataset_name=args.dataset_name,
+			split=args.split,
+		)
+		print(
+			f"[SampleFilter] sample-only-cached-teacher=1, "
+			f"cached_valid_source_indices={len(allowed_source_indices)}"
+		)
+		if len(allowed_source_indices) == 0:
+			raise RuntimeError("sample-only-cached-teacher=1 但缓存中没有可用四字段样本")
 	samples = build_scienceqa_samples(
 		dataset_path=args.dataset_path,
+		dataset_name=args.dataset_name,
 		split=args.split,
 		train_num=args.train_num,
 		seed=args.seed,
+		allowed_source_indices=allowed_source_indices,
 	)
 
 	print(f"开始构建样本记录，bucket_by={args.bucket_by}")
@@ -408,11 +561,14 @@ def main() -> None:
 			os.makedirs(save_dir, exist_ok=True)
 		payload = {
 			"config": {
+				"dataset_name": args.dataset_name,
 				"dataset_path": args.dataset_path,
 				"model_path": args.model_path,
 				"split": args.split,
 				"train_num": args.train_num,
 				"seed": args.seed,
+				"sample_only_cached_teacher": bool(args.sample_only_cached_teacher),
+				"teacher_cache_path": args.teacher_cache_path,
 				"bucket_by": args.bucket_by,
 				"bucket_batch_size": args.bucket_batch_size,
 				"bucket_drop_last": bool(args.bucket_drop_last),

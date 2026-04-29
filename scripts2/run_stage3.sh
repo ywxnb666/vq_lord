@@ -9,6 +9,12 @@ source "${SCRIPT_SOURCE_DIR}/common.sh"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 DDP_NPROC="${DDP_NPROC:-4}"
 
+# CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+# DDP_NPROC="${DDP_NPROC:-2}"
+
+# CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# DDP_NPROC="${DDP_NPROC:-1}"
+
 align_vq_init_paths
 align_vq_setup_env
 align_vq_setup_distributed_env
@@ -19,20 +25,11 @@ align_vq_setup_logging "run_stage3"
 TRAIN_ENTRY="${ROOT_DIR}/vq_lord3/train_vq_lord3.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2.py"
 SAVE_PATH="${CKPT_DIR}/stage3"
-STAGE1_CODEBOOK_PATH="${STAGE1_CODEBOOK_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch15/vq_codebook.pt}"
-STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch15}"
+STAGE1_CODEBOOK_PATH="${STAGE1_CODEBOOK_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch3/vq_codebook.pt}"
+STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch3}"
 STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${SAVE_PATH}/stage3_lord_final}"
 STAGE3_RESUME_SAVE_PATH="${STAGE3_RESUME_SAVE_PATH:-${SAVE_PATH}/stage3_resume_latest}"
 STAGE3_RESUME_PATH="${STAGE3_RESUME_PATH:-${STAGE3_RESUME_SAVE_PATH}}"
-
-# Data
-DATASET_NAME="scienceqa"
-SCIENCEQA_SPLIT="${SCIENCEQA_SPLIT:-train}"
-TRAIN_NUM="${TRAIN_NUM:-0}"
-SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
-BUCKET_BY="${BUCKET_BY:-patches}"
-BUCKET_DROP_LAST="${BUCKET_DROP_LAST:-0}"
-DISABLE_BUCKET_FOR_STAGE3="${DISABLE_BUCKET_FOR_STAGE3:-0}"
 
 # Stage3 4x H200 config
 # 保持与原 1 卡配置近似的有效 batch：2 * 4(accum) -> 2 * 4卡 * 1(accum)
@@ -42,7 +39,7 @@ SUB_STAGE_NUM="${SUB_STAGE_NUM:-1}"
 PERIOD_NUM="${PERIOD_NUM:-50}"
 SUB_SET_NUM="${SUB_SET_NUM:-0}"
 PHASE_A_BATCH_SIZE="${PHASE_A_BATCH_SIZE:-8}"
-PHASE_B_BATCH_SIZE="${PHASE_B_BATCH_SIZE:-2}"
+PHASE_B_BATCH_SIZE="${PHASE_B_BATCH_SIZE:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 STAGE2_GRAD_ACCUM="${STAGE2_GRAD_ACCUM:-1}"
 STAGE3_GRAD_ACCUM="${STAGE3_GRAD_ACCUM:-1}"
@@ -59,14 +56,15 @@ BATCH_SIZE="${BATCH_SIZE:-${PHASE_B_BATCH_SIZE}}"
 BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-${PHASE_A_BATCH_SIZE}}"
 STAGE3_BUCKET_BATCH_SIZE="${STAGE3_BUCKET_BATCH_SIZE:-${PHASE_A_BATCH_SIZE}}"
 PREPROCESS_BUCKET_BATCH_SIZE="${PREPROCESS_BUCKET_BATCH_SIZE:-${BUCKET_BATCH_SIZE}}"
-SCIENCEQA_PREPROCESSED_PATH="${SCIENCEQA_PREPROCESSED_PATH:-${PREPROCESS_DIR}/scienceqa_${SCIENCEQA_SPLIT}_n${TRAIN_NUM}_seed${SCIENCEQA_SEED}_${BUCKET_BY}_bs${PREPROCESS_BUCKET_BATCH_SIZE}.json}"
+align_vq_set_dataset_preprocessed_path "${PREPROCESS_BUCKET_BATCH_SIZE}"
 
 # Stage3 objective
 STAGE3_EVAL_MAX_SAMPLES="${STAGE3_EVAL_MAX_SAMPLES:-2097}"
 STAGE3_EVAL_EVERY_PERIOD="${STAGE3_EVAL_EVERY_PERIOD:-1}"
-STAGE3_EVAL_SCIENCEQA_SPLIT="${STAGE3_EVAL_SCIENCEQA_SPLIT:-validation}"
-STAGE3_EVAL_SCIENCEQA_PATH="${STAGE3_EVAL_SCIENCEQA_PATH:-}"
+STAGE3_EVAL_SPLIT="${STAGE3_EVAL_SPLIT:-validation}"
+STAGE3_EVAL_DATASET_PATH="${STAGE3_EVAL_DATASET_PATH:-}"
 STAGE3_EVAL_TRAIN_NUM="${STAGE3_EVAL_TRAIN_NUM:-0}"
+# STAGE3_EVAL_TRAIN_NUM="${STAGE3_EVAL_TRAIN_NUM:-320}"
 STAGE3_EVAL_ANSWER_MODE="${STAGE3_EVAL_ANSWER_MODE:-logits}"
 STAGE3_FIELD_WEIGHT_OBSERVED="${STAGE3_FIELD_WEIGHT_OBSERVED:-1.15}"
 STAGE3_FIELD_WEIGHT_CONTEXT="${STAGE3_FIELD_WEIGHT_CONTEXT:-0.30}"
@@ -77,9 +75,9 @@ STAGE3_OBJ_WEIGHT="${STAGE3_OBJ_WEIGHT:-0.05}"
 STAGE3_REG_WEIGHT="${STAGE3_REG_WEIGHT:-0.30}"
 STAGE3_ANSWER_ANCHOR_WEIGHT="${STAGE3_ANSWER_ANCHOR_WEIGHT:-1.00}"
 STAGE3_PAIR_USE_ANSWER_CORRECTNESS="${STAGE3_PAIR_USE_ANSWER_CORRECTNESS:-1}"
-STAGE3_WRONG_IMAGE_ENABLE="${STAGE3_WRONG_IMAGE_ENABLE:-0}"
-STAGE3_WRONG_IMAGE_WEIGHT="${STAGE3_WRONG_IMAGE_WEIGHT:-0.2}"
-STAGE3_WRONG_IMAGE_MARGIN="${STAGE3_WRONG_IMAGE_MARGIN:-0.0}"
+STAGE3_WRONG_IMAGE_ENABLE="${STAGE3_WRONG_IMAGE_ENABLE:-1}"
+STAGE3_WRONG_IMAGE_WEIGHT="${STAGE3_WRONG_IMAGE_WEIGHT:-0.25}"
+STAGE3_WRONG_IMAGE_MARGIN="${STAGE3_WRONG_IMAGE_MARGIN:-0.1}"
 STAGE3_FORCE_COLD_START_PERIOD0="${STAGE3_FORCE_COLD_START_PERIOD0:-0}"
 
 # VQ / model
@@ -98,19 +96,15 @@ USE_4BIT="${USE_4BIT:-0}"
 MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 
 # Distillation / cache
-COLLECT_TEACHER_DATA="${COLLECT_TEACHER_DATA:-0}"
-STRICT_TEACHER_DISTILL="${STRICT_TEACHER_DISTILL:-0}"
-TEACHER_LANG="${TEACHER_LANG:-en}"
-TEACHER_CACHE_PATH="${TEACHER_CACHE_PATH:-}"
 TEACHER_OBSERVED_MAX_TOKENS="${TEACHER_OBSERVED_MAX_TOKENS:-256}"
 TEACHER_CONTEXT_MAX_TOKENS="${TEACHER_CONTEXT_MAX_TOKENS:-192}"
 TEACHER_REASONING_MAX_TOKENS="${TEACHER_REASONING_MAX_TOKENS:-256}"
 TEACHER_ANSWER_MAX_TOKENS="${TEACHER_ANSWER_MAX_TOKENS:-64}"
 TEACHER_MAX_NEW_TOKENS_TOTAL="${TEACHER_MAX_NEW_TOKENS_TOTAL:-768}"
 STAGE3_VIC_INCLUDE_CONTEXT="${STAGE3_VIC_INCLUDE_CONTEXT:-0}"
-REUSE_VQ_CODEBOOK="${REUSE_VQ_CODEBOOK:-1}"
 REUSE_STAGE2="${REUSE_STAGE2:-1}"
-STAGE3_SAMPLE_CACHE_PATH="${STAGE3_SAMPLE_CACHE_PATH:-${DATA_DIR}/stage3/stage3_sample_cache_${VICTIM_MODEL}_${SCIENCEQA_SPLIT}_n${TRAIN_NUM}_seed${SCIENCEQA_SEED}_ml${MAX_LENGTH}_ctx${STAGE3_VIC_INCLUDE_CONTEXT}_obs${TEACHER_OBSERVED_MAX_TOKENS}_txt${TEACHER_CONTEXT_MAX_TOKENS}_rsn${TEACHER_REASONING_MAX_TOKENS}_ans${TEACHER_ANSWER_MAX_TOKENS}.pt}"
+STAGE3_SAMPLE_CACHE_DATASET_PREFIX="${STAGE3_SAMPLE_CACHE_DATASET_PREFIX:-${DATASET_TAG}_}"
+STAGE3_SAMPLE_CACHE_PATH="${STAGE3_SAMPLE_CACHE_PATH:-${DATA_DIR}/stage3/stage3_sample_cache_${STAGE3_SAMPLE_CACHE_DATASET_PREFIX}${VICTIM_MODEL}_${DATASET_SPLIT}_n${TRAIN_NUM}_seed${DATASET_SEED}_ml${MAX_LENGTH}_ctx${STAGE3_VIC_INCLUDE_CONTEXT}_obs${TEACHER_OBSERVED_MAX_TOKENS}_txt${TEACHER_CONTEXT_MAX_TOKENS}_rsn${TEACHER_REASONING_MAX_TOKENS}_ans${TEACHER_ANSWER_MAX_TOKENS}.pt}"
 
 # Stage1/2 filler args required by parser
 STAGE1_LR="${STAGE1_LR:-5e-5}"
@@ -132,7 +126,7 @@ STAGE3_VALIDATION_RESULT_PATH="${STAGE3_VALIDATION_RESULT_PATH:-${TEST_RESULT_DI
 STAGE3_TEST_RESULT_PATH="${STAGE3_TEST_RESULT_PATH:-${TEST_RESULT_DIR}/stage3_test_logits.json}"
 
 # Logging / save
-LOG_STEP="${LOG_STEP:-100}"
+LOG_STEP="${LOG_STEP:-1000000}"
 SAVE_STEP="${SAVE_STEP:-0}"
 SAVE_EACH_EPOCH="${SAVE_EACH_EPOCH:-1}"
 STAGE3_RESUME_SAVE_OPTIMIZER="${STAGE3_RESUME_SAVE_OPTIMIZER:-1}"
@@ -143,14 +137,20 @@ echo "ROOT_DIR: ${ROOT_DIR}"
 echo "TRAIN_ENTRY: ${TRAIN_ENTRY}"
 echo "EVAL_ENTRY: ${EVAL_ENTRY}"
 echo "MODEL_PATH: ${MODEL_PATH}"
-echo "SCIENCEQA_PATH: ${SCIENCEQA_PATH}"
-echo "SCIENCEQA_PREPROCESSED_PATH: ${SCIENCEQA_PREPROCESSED_PATH}"
+echo "DATASET_NAME: ${DATASET_NAME}"
+echo "DATASET_TAG: ${DATASET_TAG}"
+echo "TRAIN_DATASET_NAME: ${TRAIN_DATASET_NAME}"
+echo "DATASET_PATH: ${DATASET_PATH}"
+echo "DATASET_PREPROCESSED_PATH: ${DATASET_PREPROCESSED_PATH}"
 echo "STAGE1_CODEBOOK_PATH: ${STAGE1_CODEBOOK_PATH}"
 echo "STAGE2_CKPT_PATH: ${STAGE2_CKPT_PATH}"
 echo "STAGE3_FINAL_ADAPTER_PATH: ${STAGE3_FINAL_ADAPTER_PATH}"
 echo "STAGE3_SAMPLE_CACHE_PATH: ${STAGE3_SAMPLE_CACHE_PATH}"
 echo "STAGE3_RESUME_PATH: ${STAGE3_RESUME_PATH:-<empty>}"
 echo "STAGE3_RESUME_SAVE_PATH: ${STAGE3_RESUME_SAVE_PATH}"
+echo "REMOVE_VQ_CODEBOOK: ${REMOVE_VQ_CODEBOOK}"
+echo "TEACHER_CACHE_PATH: ${TEACHER_CACHE_PATH:-<empty>}"
+echo "SAMPLE_ONLY_CACHED_TEACHER: ${SAMPLE_ONLY_CACHED_TEACHER}"
 echo "EPOCHS/PERIOD_NUM: ${EPOCHS}/${PERIOD_NUM}"
 echo "PHASE_A_BATCH_SIZE/PHASE_B_BATCH_SIZE: ${PHASE_A_BATCH_SIZE}/${BATCH_SIZE}"
 echo "PREPROCESS_BUCKET_BATCH_SIZE: ${PREPROCESS_BUCKET_BATCH_SIZE}"
@@ -163,13 +163,15 @@ echo "LOG_FILE: ${LOG_FILE}"
 
 align_vq_require_file "${TRAIN_ENTRY}" "Stage3 训练入口"
 align_vq_require_file "${EVAL_ENTRY}" "Stage3 评测入口"
-align_vq_require_stage1_artifacts "${STAGE1_CODEBOOK_PATH}"
+if [ "${REMOVE_VQ_CODEBOOK}" != "1" ]; then
+    align_vq_require_stage1_artifacts "${STAGE1_CODEBOOK_PATH}"
+fi
 align_vq_require_stage2_artifacts "${STAGE2_CKPT_PATH}"
-align_vq_prepare_scienceqa_preprocess \
-    "${SCIENCEQA_PREPROCESSED_PATH}" \
-    "${SCIENCEQA_SPLIT}" \
+align_vq_prepare_dataset_preprocess \
+    "${DATASET_PREPROCESSED_PATH}" \
+    "${DATASET_SPLIT}" \
     "${TRAIN_NUM}" \
-    "${SCIENCEQA_SEED}" \
+    "${DATASET_SEED}" \
     "${BUCKET_BY}" \
     "${PREPROCESS_BUCKET_BATCH_SIZE}" \
     "${BUCKET_DROP_LAST}" \
@@ -184,6 +186,7 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
 
 "${TRAIN_LAUNCHER[@]}" "${TRAIN_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --victim_model="${VICTIM_MODEL}" \
     --vq_codebook_size="${VQ_CODEBOOK_SIZE}" \
     --vq_commitment_cost="${VQ_COMMITMENT_COST}" \
@@ -191,6 +194,7 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
     --vq_usage_decay="${VQ_USAGE_DECAY}" \
     --vq_dead_code_reset_interval="${VQ_DEAD_CODE_RESET_INTERVAL}" \
     --vq_legacy_loss="${VQ_LEGACY_LOSS}" \
+    --remove_vq_codebook="${REMOVE_VQ_CODEBOOK}" \
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --beta="${BETA}" \
     --temperature="${TEMPERATURE}" \
@@ -224,8 +228,8 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
     --stage3_train_projector="${STAGE3_TRAIN_PROJECTOR}" \
     --stage3_eval_max_samples="${STAGE3_EVAL_MAX_SAMPLES}" \
     --stage3_eval_every_period="${STAGE3_EVAL_EVERY_PERIOD}" \
-    --stage3_eval_scienceqa_split="${STAGE3_EVAL_SCIENCEQA_SPLIT}" \
-    --stage3_eval_scienceqa_path="${STAGE3_EVAL_SCIENCEQA_PATH}" \
+    --stage3_eval_scienceqa_split="${STAGE3_EVAL_SPLIT}" \
+    --stage3_eval_scienceqa_path="${STAGE3_EVAL_DATASET_PATH}" \
     --stage3_eval_train_num="${STAGE3_EVAL_TRAIN_NUM}" \
     --stage3_eval_answer_mode="${STAGE3_EVAL_ANSWER_MODE}" \
     --stage3_field_weight_observed="${STAGE3_FIELD_WEIGHT_OBSERVED}" \
@@ -247,11 +251,11 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
     --max_new_tokens="${MAX_NEW_TOKENS}" \
     --data_dir="${DATA_DIR}" \
     --train_num="${TRAIN_NUM}" \
-    --dataset_name="${DATASET_NAME}" \
-    --scienceqa_path="${SCIENCEQA_PATH}" \
-    --scienceqa_split="${SCIENCEQA_SPLIT}" \
-    --scienceqa_seed="${SCIENCEQA_SEED}" \
-    --scienceqa_preprocessed_path="${SCIENCEQA_PREPROCESSED_PATH}" \
+    --dataset_name="${TRAIN_DATASET_NAME}" \
+    --scienceqa_path="${DATASET_PATH}" \
+    --scienceqa_split="${DATASET_SPLIT}" \
+    --scienceqa_seed="${DATASET_SEED}" \
+    --scienceqa_preprocessed_path="${DATASET_PREPROCESSED_PATH}" \
     --bucket_batch_size="${BUCKET_BATCH_SIZE}" \
     --stage3_bucket_batch_size="${STAGE3_BUCKET_BATCH_SIZE}" \
     --disable_bucket_for_stage3="${DISABLE_BUCKET_FOR_STAGE3}" \
@@ -259,6 +263,7 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
     --strict_teacher_distill="${STRICT_TEACHER_DISTILL}" \
     --teacher_lang="${TEACHER_LANG}" \
     --teacher_cache_path="${TEACHER_CACHE_PATH}" \
+    --sample_only_cached_teacher="${SAMPLE_ONLY_CACHED_TEACHER}" \
     --teacher_observed_max_tokens="${TEACHER_OBSERVED_MAX_TOKENS}" \
     --teacher_context_max_tokens="${TEACHER_CONTEXT_MAX_TOKENS}" \
     --teacher_reasoning_max_tokens="${TEACHER_REASONING_MAX_TOKENS}" \
@@ -282,17 +287,26 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
 
 align_vq_require_dir "${STAGE3_FINAL_ADAPTER_PATH}" "Stage3 最终 adapter 目录"
 align_vq_require_file "${STAGE3_FINAL_ADAPTER_PATH}/adapter_config.json" "Stage3 adapter_config.json"
-align_vq_require_file "${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" "Stage3 vq_codebook"
+if [ "${REMOVE_VQ_CODEBOOK}" != "1" ]; then
+    align_vq_require_file "${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" "Stage3 vq_codebook"
+fi
+
+EVAL_USE_VQ=1
+if [ "${REMOVE_VQ_CODEBOOK}" = "1" ]; then
+    EVAL_USE_VQ=0
+fi
 
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --adapter_path="${STAGE3_FINAL_ADAPTER_PATH}" \
-    --scienceqa_path="${SCIENCEQA_PATH}" \
+    --dataset_name="${DATASET_NAME}" \
+    --scienceqa_path="${DATASET_PATH}" \
     --split="validation" \
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
     --use_4bit="${USE_4BIT}" \
-    --use_vq=1 \
+    --use_vq="${EVAL_USE_VQ}" \
     --vq_codebook_size="${VQ_CODEBOOK_SIZE}" \
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --vq_codebook_path="${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" \
@@ -301,13 +315,15 @@ align_vq_require_file "${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" "Stage3 vq_c
 
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --adapter_path="${STAGE3_FINAL_ADAPTER_PATH}" \
-    --scienceqa_path="${SCIENCEQA_PATH}" \
+    --dataset_name="${DATASET_NAME}" \
+    --scienceqa_path="${DATASET_PATH}" \
     --split="test" \
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
     --use_4bit="${USE_4BIT}" \
-    --use_vq=1 \
+    --use_vq="${EVAL_USE_VQ}" \
     --vq_codebook_size="${VQ_CODEBOOK_SIZE}" \
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --vq_codebook_path="${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" \

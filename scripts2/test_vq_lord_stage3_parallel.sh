@@ -14,11 +14,14 @@ align_vq_setup_logging "test_vq_lord_stage3_parallel"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-16}"
-ENABLE_SECOND_PASS="${ENABLE_SECOND_PASS:-0}"
+ENABLE_SECOND_PASS="${ENABLE_SECOND_PASS:-1}"
 SECOND_PASS_MAX_NEW_TOKENS="${SECOND_PASS_MAX_NEW_TOKENS:-1024}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate}"
 USE_4BIT="${USE_4BIT:-0}"
 USE_VQ="${USE_VQ:-1}"
+if [ "${REMOVE_VQ_CODEBOOK}" = "1" ]; then
+    USE_VQ=0
+fi
 VQ_CODEBOOK_SIZE="${VQ_CODEBOOK_SIZE:-1024}"
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-0}"
 
@@ -34,7 +37,8 @@ GPU_IDS="${GPU_IDS:-0 1 2 3}"
 # Paths
 PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
-STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3/stage3_sub1_period13}"
+# STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3/stage3_sub1_period7}"
+STAGE3_FINAL_ADAPTER_PATH="/home/songxinhao/workspace/vq_lord/vq_lord_ckpts/Qwen3.5flash/stage3/stage3_sub1_period7"
 # STAGE3_FINAL_ADAPTER_PATH="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7"
 BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/scienceqa_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
 SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_shards}"
@@ -62,7 +66,9 @@ align_vq_require_file "${PREPROCESS_ENTRY}" "预处理分桶入口"
 align_vq_require_file "${EVAL_ENTRY}" "并行分桶评测入口"
 align_vq_require_dir "${STAGE3_FINAL_ADAPTER_PATH}" "Stage3 最终 adapter 目录"
 align_vq_require_file "${STAGE3_FINAL_ADAPTER_PATH}/adapter_config.json" "Stage3 adapter_config.json"
-align_vq_require_file "${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" "Stage3 vq_codebook"
+if [ "${REMOVE_VQ_CODEBOOK}" != "1" ]; then
+    align_vq_require_file "${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" "Stage3 vq_codebook"
+fi
 align_vq_assert_scienceqa_path
 
 mkdir -p "${PREPROCESS_DIR}" "${SHARD_RESULT_DIR}" "$(dirname "${RESULT_PATH}")"
@@ -104,6 +110,7 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
         export CUDA_VISIBLE_DEVICES="${gpu_id}"
         "${PYTHON_BIN}" "${EVAL_ENTRY}" \
             --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
             --adapter_path="${STAGE3_FINAL_ADAPTER_PATH}" \
             --scienceqa_path="${SCIENCEQA_PATH}" \
             --split="${EVAL_SPLIT}" \
@@ -144,6 +151,7 @@ fi
 
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --adapter_path="${STAGE3_FINAL_ADAPTER_PATH}" \
     --scienceqa_path="${SCIENCEQA_PATH}" \
     --split="${EVAL_SPLIT}" \

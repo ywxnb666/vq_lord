@@ -22,17 +22,23 @@ from train_vq_lord3 import (
     get_world_size,
     is_distributed,
     is_main_process,
+    is_projector_param,
+    is_vision_param,
     maybe_set_dataloader_epoch,
     reduce_numeric_dict,
     sanitize_image_sizes,
     save_stage2_checkpoint,
+    student_forward,
     unwrap_model,
 )
 
 
 def _get_stage2_vq_loss(model, device: str, dtype: torch.dtype) -> torch.Tensor:
     model = unwrap_model(model)
-    vq_loss = model._vq_loss_container.get("loss", None)
+    container = getattr(model, "_vq_loss_container", None)
+    if not isinstance(container, dict):
+        return torch.zeros((), device=device, dtype=dtype)
+    vq_loss = container.get("loss", None)
     if isinstance(vq_loss, torch.Tensor):
         return vq_loss
     return torch.zeros((), device=device, dtype=dtype)
@@ -40,13 +46,16 @@ def _get_stage2_vq_loss(model, device: str, dtype: torch.dtype) -> torch.Tensor:
 
 def _get_stage2_vq_stats(model) -> tuple[float, int, int]:
     model = unwrap_model(model)
-    perplexity = model._vq_loss_container.get("perplexity", None)
+    container = getattr(model, "_vq_loss_container", None)
+    if not isinstance(container, dict):
+        return 0.0, 0, 0
+    perplexity = container.get("perplexity", None)
     if isinstance(perplexity, torch.Tensor):
         perplexity_val = float(perplexity.detach().item())
     else:
         perplexity_val = 0.0
-    dead_code_resets = int(model._vq_loss_container.get("dead_code_resets", 0))
-    dead_code_count = int(model._vq_loss_container.get("dead_code_count", 0))
+    dead_code_resets = int(container.get("dead_code_resets", 0))
+    dead_code_count = int(container.get("dead_code_count", 0))
     return perplexity_val, dead_code_resets, dead_code_count
 
 
@@ -118,6 +127,7 @@ def _stage2_resume_rng_state_path(resume_dir: str, rank: int) -> str:
 def _stage2_resume_config(args) -> dict:
     return {
         "model_path": str(args.model_path),
+        "student_model_type": str(getattr(args, "student_model_type", "llava_next")),
         "use_lora": int(args.use_lora),
         "lora_rank": int(args.lora_rank),
         "lora_alpha": int(args.lora_alpha),
@@ -147,6 +157,7 @@ def _stage2_resume_config(args) -> dict:
         "teacher_reasoning_max_tokens": int(getattr(args, "teacher_reasoning_max_tokens", 0)),
         "teacher_answer_max_tokens": int(getattr(args, "teacher_answer_max_tokens", 0)),
         "vq_codebook_path": str(getattr(args, "vq_codebook_path", "")),
+        "remove_vq_codebook": int(getattr(args, "remove_vq_codebook", 0)),
         "scienceqa_preprocessed_path": str(getattr(args, "scienceqa_preprocessed_path", "")),
         "world_size": int(getattr(args, "world_size", 1)),
     }
@@ -159,6 +170,7 @@ def _validate_stage2_resume_config(resume_config: dict, args):
     current = _stage2_resume_config(args)
     strict_keys = [
         "model_path",
+        "student_model_type",
         "use_lora",
         "lora_rank",
         "lora_alpha",
@@ -175,9 +187,11 @@ def _validate_stage2_resume_config(resume_config: dict, args):
         "teacher_context_max_tokens",
         "teacher_reasoning_max_tokens",
         "teacher_answer_max_tokens",
-        "vq_codebook_path",
+        "remove_vq_codebook",
         "freeze_vision_tower",
     ]
+    if not int(getattr(args, "remove_vq_codebook", 0)):
+        strict_keys.append("vq_codebook_path")
     for key in strict_keys:
         if key in resume_config and resume_config[key] != current[key]:
             raise RuntimeError(
@@ -375,10 +389,10 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
 
         name_l = name.lower()
         is_lora = "lora_" in name_l or "modules_to_save" in name_l
-        is_projector = "projector" in name_l or "multi_modal_projector" in name_l
+        is_projector = is_projector_param(name, getattr(args, "student_model_type", "llava_next"))
         is_prepost = "pre_quant" in name_l or "post_quant" in name_l
         is_vq_embedding = "vq.embedding.weight" in name_l
-        is_vision = "vision" in name_l and not args.freeze_vision_tower
+        is_vision = is_vision_param(name, getattr(args, "student_model_type", "llava_next")) and not args.freeze_vision_tower
 
         if is_vq_embedding:
             param.requires_grad = False
@@ -496,11 +510,14 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
                         f"首个 batch 缺少 image token: counts={n_img.tolist()}, id={image_token_id}"
                     )
 
-            outputs_answer = model(
+            outputs_answer = student_forward(
+                model=model,
+                args=args,
                 input_ids=answer_input_ids,
                 attention_mask=answer_attention_mask,
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
+                image_grid_thw=batch.get("answer_image_grid_thw", batch.get("image_grid_thw")),
                 labels=answer_labels,
             )
             answer_loss_sum, answer_token_count = _compute_stage2_token_loss_sum(
@@ -514,11 +531,14 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
             answer_vq_loss = _get_stage2_vq_loss(model, args.device, outputs_answer.logits.dtype)
 
             if has_any_rationale:
-                outputs_full = model(
+                outputs_full = student_forward(
+                    model=model,
+                    args=args,
                     input_ids=full_input_ids,
                     attention_mask=full_attention_mask,
                     pixel_values=pixel_values,
                     image_sizes=image_sizes,
+                    image_grid_thw=batch.get("full_image_grid_thw", batch.get("image_grid_thw")),
                     labels=rationale_labels,
                 )
                 rationale_loss_sum, rationale_token_count = _compute_stage2_token_loss_sum(

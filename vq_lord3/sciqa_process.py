@@ -27,6 +27,20 @@ from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor, 
 from peft import PeftModel
 from tqdm import tqdm
 from vq_module2 import VQVisionEncoder
+from student_models import (
+    LLAVA_NEXT,
+    add_vq_to_student_model,
+    encode_multimodal,
+    load_student_model_and_processor,
+    normalize_student_model_type,
+    student_forward,
+    student_generate,
+)
+from textvqa_mcq import (
+    build_textvqa_mcq_samples,
+    materialize_textvqa_image,
+    textvqa_soft_score,
+)
 
 
 def file_md5(path: str) -> str:
@@ -69,19 +83,49 @@ def build_prompt(question: str, choices: List[str]) -> str:
     choices_text = ""
     for idx, choice in enumerate(choices):
         choices_text += f"({chr(65 + idx)}) {choice}\n"
-    return (
-        f"<image>\n"
+    instruction = (
         f"Question: {question}\n"
         f"Options:\n{choices_text}"
         "Answer with only one option letter (A, B, C, ...).\n"
         "Answer:"
     )
+    return f"<image>\n{instruction}"
 
 
 def normalize_text(text: str) -> str:
     text = text.strip().lower()
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+def normalize_dataset_name(dataset_name: str) -> str:
+    name = str(dataset_name or "").strip().lower()
+    if not name:
+        return "scienceqa"
+    return name
+
+
+def resolve_eval_answer_idx(item: dict, dataset_name: str) -> int:
+    dataset_name = normalize_dataset_name(dataset_name)
+    if dataset_name == "aokvqa":
+        field_candidates = ("correct_choice_idx", "answer")
+    else:
+        field_candidates = ("answer", "correct_choice_idx")
+
+    for field in field_candidates:
+        raw_value = item.get(field)
+        if raw_value is None:
+            continue
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            continue
+
+    question_id = item.get("question_id", "<unknown>")
+    raise RuntimeError(
+        f"缺少可用于评测的答案字段。dataset_name={dataset_name}, "
+        f"question_id={question_id}, expected_fields={field_candidates}"
+    )
 
 
 def extract_choice_from_output(output_text: str, choices: List[str]) -> Optional[int]:
@@ -166,19 +210,35 @@ def predict_choice_with_next_token_logits(
     pixel_values,
     image_sizes,
     num_choices: int,
+    student_model_type: str = LLAVA_NEXT,
+    image_grid_thw=None,
 ) -> Optional[int]:
     """基于 Answer: 之后的下一 token 概率直接选择 A/B/C/..."""
     if num_choices <= 0:
         return None
 
+    student_model_type = normalize_student_model_type(student_model_type)
     with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
-            use_cache=False,
-        )
+        if student_model_type == LLAVA_NEXT:
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                use_cache=False,
+            )
+        else:
+            args_obj = type("Args", (), {"student_model_type": student_model_type})()
+            outputs = student_forward(
+                model,
+                args_obj,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                image_grid_thw=image_grid_thw,
+                use_cache=False,
+            )
 
     next_token_logits = outputs.logits[0, -1, :]
 
@@ -313,6 +373,7 @@ def load_model_and_processor(
     vq_codebook_size: int,
     freeze_vision_tower: int,
     vq_codebook_path: str,
+    student_model_type: str = "llava_next",
 ):
     load_info = {
         "model_path": model_path,
@@ -330,6 +391,51 @@ def load_model_and_processor(
         "trainable_state_loaded": 0,
         "trainable_state_skipped": 0,
     }
+
+    student_model_type = normalize_student_model_type(student_model_type)
+    if student_model_type != LLAVA_NEXT:
+        args_obj = type("Args", (), {
+            "model_path": model_path,
+            "student_model_type": student_model_type,
+            "use_4bit": use_4bit,
+            "model_dtype": "bf16",
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "distributed": False,
+            "local_rank": 0,
+            "vq_codebook_size": vq_codebook_size,
+            "vq_commitment_cost": 0.25,
+            "vq_legacy_loss": 0,
+            "vq_dead_code_threshold": 0.0,
+            "vq_usage_decay": 0.99,
+            "vq_dead_code_reset_interval": 0,
+            "freeze_vision_tower": freeze_vision_tower,
+        })()
+        model, processor = load_student_model_and_processor(args_obj)
+        processor.student_model_type = student_model_type
+        if adapter_path:
+            if os.path.exists(adapter_path):
+                model = PeftModel.from_pretrained(model, adapter_path)
+                load_info["adapter_loaded"] = True
+            else:
+                raise FileNotFoundError(
+                    f"adapter_path does not exist, refusing to fallback to base model: {adapter_path}"
+                )
+        if adapter_path:
+            found, loaded, skipped = load_projector_state_for_inference(model, adapter_path)
+            load_info["projector_state_found"] = bool(found)
+            load_info["projector_state_loaded"] = int(loaded)
+            load_info["projector_state_skipped"] = int(skipped)
+        if use_vq:
+            model = add_vq_to_student_model(model, args_obj)
+            loaded = load_vq_codebook_for_inference(model, vq_codebook_path)
+            load_info["vq_codebook_loaded"] = bool(loaded)
+        if adapter_path:
+            found, loaded, skipped = load_trainable_state_for_inference(model, adapter_path)
+            load_info["trainable_state_found"] = bool(found)
+            load_info["trainable_state_loaded"] = int(loaded)
+            load_info["trainable_state_skipped"] = int(skipped)
+        model.eval()
+        return model, processor, load_info
 
     if use_4bit:
         quantization_config = BitsAndBytesConfig(
@@ -406,6 +512,7 @@ def load_model_and_processor(
 def run_eval(
     model,
     processor,
+    dataset_name: str,
     scienceqa_path: str,
     split: str,
     max_samples: int,
@@ -414,54 +521,110 @@ def run_eval(
     answer_mode: str,
     run_config: Optional[dict] = None,
 ):
-    dataset = load_dataset(scienceqa_path, split=split)
-    dataset_with_images = [item for item in dataset if item.get("image") is not None]
+    dataset_name = normalize_dataset_name(dataset_name)
+    if dataset_name == "textvqa":
+        dataset_with_images = build_textvqa_mcq_samples(
+            dataset_path=scienceqa_path,
+            split=split,
+            train_num=max_samples,
+            seed=20240306,
+        )
+    else:
+        dataset = load_dataset(scienceqa_path, split=split)
+        dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
-    if max_samples > 0 and len(dataset_with_images) > max_samples:
+    if dataset_name != "textvqa" and max_samples > 0 and len(dataset_with_images) > max_samples:
         dataset_with_images = dataset_with_images[:max_samples]
 
     results = []
     correct = 0
     total = 0
+    soft_score_sum = 0.0
+    gold_soft_sum = 0.0
+    oracle_soft_sum = 0.0
+    distractor_soft_sum = 0.0
+    distractor_soft_count = 0
+    student_model_type = normalize_student_model_type(
+        getattr(getattr(model, "config", None), "student_model_type", LLAVA_NEXT)
+    )
+    runtime_args = type("Args", (), {"student_model_type": student_model_type})()
+    device = next(model.parameters()).device
 
     for item in tqdm(dataset_with_images, desc="ScienceQA Eval"):
         question = item.get("question", "")
         choices = item.get("choices", [])
-        answer_idx = item.get("answer", 0)
-        image = item.get("image")
+        if dataset_name == "textvqa":
+            answer_idx = int(item.get("answer_idx", 0))
+        else:
+            answer_idx = resolve_eval_answer_idx(item, dataset_name=dataset_name)
+        if answer_idx < 0 or answer_idx >= len(choices):
+            raise RuntimeError(
+                f"answer_idx 越界。dataset_name={dataset_name}, split={split}, "
+                f"answer_idx={answer_idx}, num_choices={len(choices)}"
+            )
+        image = materialize_textvqa_image(item.get("image"))
 
-        prompt = build_prompt(question, choices)
-        inputs = processor(
-            text=prompt,
-            images=image,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
-        )
+        if student_model_type == LLAVA_NEXT:
+            prompt = build_prompt(question, choices)
+            inputs = processor(
+                text=prompt,
+                images=image,
+                return_tensors="pt",
+                padding="longest",
+                truncation=False,
+            )
+        else:
+            instruction_text = build_prompt(question, choices).replace("<image>\n", "", 1)
+            inputs = encode_multimodal(
+                processor,
+                student_model_type,
+                instruction_text=instruction_text,
+                image=image,
+                add_generation_prompt=True,
+            )
 
-        input_ids = inputs["input_ids"].to(model.device)
-        attention_mask = inputs["attention_mask"].to(model.device)
-        pixel_values = inputs["pixel_values"].to(model.device)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+        pixel_values = inputs["pixel_values"].to(device)
         image_sizes = inputs.get("image_sizes")
         if image_sizes is not None:
-            image_sizes = image_sizes.to(model.device)
+            image_sizes = image_sizes.to(device)
+        image_grid_thw = inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.to(device)
 
         output_text = ""
         pred_idx = None
 
         if answer_mode in ("generate", "hybrid"):
             with torch.no_grad():
-                generated = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=1,
-                    do_sample=False,
-                    pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
-                    eos_token_id=processor.tokenizer.eos_token_id,
-                )
+                if student_model_type == LLAVA_NEXT:
+                    generated = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=1,
+                        do_sample=False,
+                        pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id,
+                    )
+                else:
+                    generated = student_generate(
+                        model,
+                        runtime_args,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        image_grid_thw=image_grid_thw,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=1,
+                        do_sample=False,
+                        pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id,
+                    )
 
             # 仅解码新生成部分，避免把整段 prompt 回显当成答案解析。
             prompt_len = input_ids.shape[-1]
@@ -483,6 +646,8 @@ def run_eval(
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
                 num_choices=len(choices),
+                student_model_type=student_model_type,
+                image_grid_thw=image_grid_thw,
             )
             if answer_mode == "logits":
                 output_text = "[logits_mode]"
@@ -492,22 +657,55 @@ def run_eval(
                 output_text = f"{output_text}\n[hybrid_fallback_to_logits]"
 
         is_correct = pred_idx == answer_idx
+        textvqa_metrics = {}
+        if dataset_name == "textvqa":
+            human_answers = item.get("textvqa_answers", [])
+            pred_answer = choices[pred_idx] if pred_idx is not None and 0 <= pred_idx < len(choices) else ""
+            choice_soft_scores = [textvqa_soft_score(choice, human_answers) for choice in choices]
+            pred_soft = textvqa_soft_score(pred_answer, human_answers)
+            gold_soft = choice_soft_scores[answer_idx]
+            oracle_soft = max(choice_soft_scores) if choice_soft_scores else 0.0
+            distractor_scores = [score for idx, score in enumerate(choice_soft_scores) if idx != answer_idx]
+            soft_score_sum += pred_soft
+            gold_soft_sum += gold_soft
+            oracle_soft_sum += oracle_soft
+            distractor_soft_sum += sum(distractor_scores)
+            distractor_soft_count += len(distractor_scores)
+            textvqa_metrics = {
+                "pred_answer": pred_answer,
+                "textvqa_answers": human_answers,
+                "choice_soft_scores": choice_soft_scores,
+                "pred_soft_score": pred_soft,
+                "gold_soft_score": gold_soft,
+                "choice_oracle_soft_score": oracle_soft,
+                "distractor_soft_scores": distractor_scores,
+            }
 
         total += 1
         if is_correct:
             correct += 1
 
-        results.append({
+        result = {
             "question": question,
             "choices": choices,
             "answer_idx": answer_idx,
             "pred_idx": pred_idx,
             "output": output_text,
             "correct": is_correct,
-        })
+        }
+        result.update(textvqa_metrics)
+        results.append(result)
 
     accuracy = correct / total if total else 0.0
     metrics = {"accuracy": accuracy, "total": total, "correct": correct}
+    if dataset_name == "textvqa":
+        metrics.update({
+            "mcq_exact_acc": accuracy,
+            "textvqa_soft_acc": soft_score_sum / total if total else 0.0,
+            "gold_soft_acc": gold_soft_sum / total if total else 0.0,
+            "choice_oracle_soft_acc": oracle_soft_sum / total if total else 0.0,
+            "distractor_soft_avg": distractor_soft_sum / distractor_soft_count if distractor_soft_count else 0.0,
+        })
 
     save_dir = os.path.dirname(save_path)
     if save_dir:
@@ -521,13 +719,18 @@ def run_eval(
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
+    if dataset_name == "textvqa":
+        print(f"TextVQA soft accuracy: {metrics['textvqa_soft_acc']:.4f}")
+        print(f"Choice oracle soft accuracy: {metrics['choice_oracle_soft_acc']:.4f}")
     print(f"Results saved to: {save_path}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ScienceQA 多模态验证脚本")
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
+    parser.add_argument("--student_model_type", type=str, default="llava_next", choices=["llava_next", "qwen2_vl"], help="学生模型后端类型")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
+    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa", "textvqa"], help="评测数据集名称")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="validation", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")
@@ -558,12 +761,15 @@ def main():
         args.vq_codebook_size,
         args.freeze_vision_tower,
         args.vq_codebook_path,
+        args.student_model_type,
     )
     run_config = {
         "model_path": args.model_path,
+        "student_model_type": args.student_model_type,
         "adapter_path": args.adapter_path,
         "adapter_loaded": load_info.get("adapter_loaded", False),
         "adapter_fingerprint": load_info.get("adapter_fingerprint"),
+        "dataset_name": args.dataset_name,
         "scienceqa_path": args.scienceqa_path,
         "split": args.split,
         "max_samples": args.max_samples,
@@ -584,6 +790,7 @@ def main():
     run_eval(
         model=model,
         processor=processor,
+        dataset_name=args.dataset_name,
         scienceqa_path=args.scienceqa_path,
         split=args.split,
         max_samples=args.max_samples,

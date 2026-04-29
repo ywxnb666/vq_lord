@@ -27,6 +27,15 @@ from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor, 
 from peft import PeftModel
 from tqdm import tqdm
 from vq_module2 import VQVisionEncoder
+from student_models import (
+    LLAVA_NEXT,
+    add_vq_to_student_model,
+    encode_multimodal,
+    load_student_model_and_processor,
+    normalize_student_model_type,
+    student_forward,
+    student_generate,
+)
 
 
 def file_md5(path: str) -> str:
@@ -93,6 +102,36 @@ def normalize_text(text: str) -> str:
     text = text.strip().lower()
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+def normalize_dataset_name(dataset_name: str) -> str:
+    name = str(dataset_name or "").strip().lower()
+    if not name:
+        return "scienceqa"
+    return name
+
+
+def resolve_eval_answer_idx(item: dict, dataset_name: str) -> int:
+    dataset_name = normalize_dataset_name(dataset_name)
+    if dataset_name == "aokvqa":
+        field_candidates = ("correct_choice_idx", "answer")
+    else:
+        field_candidates = ("answer", "correct_choice_idx")
+
+    for field in field_candidates:
+        raw_value = item.get(field)
+        if raw_value is None:
+            continue
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            continue
+
+    question_id = item.get("question_id", "<unknown>")
+    raise RuntimeError(
+        f"缺少可用于评测的答案字段。dataset_name={dataset_name}, "
+        f"question_id={question_id}, expected_fields={field_candidates}"
+    )
 
 
 def extract_choice_from_output(output_text: str, choices: List[str]) -> Optional[int]:
@@ -177,19 +216,35 @@ def predict_choice_with_next_token_logits(
     pixel_values,
     image_sizes,
     num_choices: int,
+    student_model_type: str = LLAVA_NEXT,
+    image_grid_thw=None,
 ) -> Optional[int]:
     """基于 Answer: 之后的下一 token 概率直接选择 A/B/C/..."""
     if num_choices <= 0:
         return None
 
+    student_model_type = normalize_student_model_type(student_model_type)
     with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
-            use_cache=False,
-        )
+        if student_model_type == LLAVA_NEXT:
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                use_cache=False,
+            )
+        else:
+            args_obj = type("Args", (), {"student_model_type": student_model_type})()
+            outputs = student_forward(
+                model,
+                args_obj,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                image_grid_thw=image_grid_thw,
+                use_cache=False,
+            )
 
     next_token_logits = outputs.logits[0, -1, :]
 
@@ -324,6 +379,7 @@ def load_model_and_processor(
     vq_codebook_size: int,
     freeze_vision_tower: int,
     vq_codebook_path: str,
+    student_model_type: str = "llava_next",
 ):
     load_info = {
         "model_path": model_path,
@@ -341,6 +397,51 @@ def load_model_and_processor(
         "trainable_state_loaded": 0,
         "trainable_state_skipped": 0,
     }
+
+    student_model_type = normalize_student_model_type(student_model_type)
+    if student_model_type != LLAVA_NEXT:
+        args_obj = type("Args", (), {
+            "model_path": model_path,
+            "student_model_type": student_model_type,
+            "use_4bit": use_4bit,
+            "model_dtype": "bf16",
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "distributed": False,
+            "local_rank": 0,
+            "vq_codebook_size": vq_codebook_size,
+            "vq_commitment_cost": 0.25,
+            "vq_legacy_loss": 0,
+            "vq_dead_code_threshold": 0.0,
+            "vq_usage_decay": 0.99,
+            "vq_dead_code_reset_interval": 0,
+            "freeze_vision_tower": freeze_vision_tower,
+        })()
+        model, processor = load_student_model_and_processor(args_obj)
+        processor.student_model_type = student_model_type
+        if adapter_path:
+            if os.path.exists(adapter_path):
+                model = PeftModel.from_pretrained(model, adapter_path)
+                load_info["adapter_loaded"] = True
+            else:
+                raise FileNotFoundError(
+                    f"adapter_path does not exist, refusing to fallback to base model: {adapter_path}"
+                )
+        if adapter_path:
+            found, loaded, skipped = load_projector_state_for_inference(model, adapter_path)
+            load_info["projector_state_found"] = bool(found)
+            load_info["projector_state_loaded"] = int(loaded)
+            load_info["projector_state_skipped"] = int(skipped)
+        if use_vq:
+            model = add_vq_to_student_model(model, args_obj)
+            loaded = load_vq_codebook_for_inference(model, vq_codebook_path)
+            load_info["vq_codebook_loaded"] = bool(loaded)
+        if adapter_path:
+            found, loaded, skipped = load_trainable_state_for_inference(model, adapter_path)
+            load_info["trainable_state_found"] = bool(found)
+            load_info["trainable_state_loaded"] = int(loaded)
+            load_info["trainable_state_skipped"] = int(skipped)
+        model.eval()
+        return model, processor, load_info
 
     if use_4bit:
         quantization_config = BitsAndBytesConfig(
@@ -417,6 +518,7 @@ def load_model_and_processor(
 def run_eval(
     model,
     processor,
+    dataset_name: str,
     scienceqa_path: str,
     split: str,
     max_samples: int,
@@ -425,6 +527,7 @@ def run_eval(
     answer_mode: str,
     run_config: Optional[dict] = None,
 ):
+    dataset_name = normalize_dataset_name(dataset_name)
     dataset = load_dataset(scienceqa_path, split=split)
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
@@ -434,46 +537,85 @@ def run_eval(
     results = []
     correct = 0
     total = 0
+    student_model_type = normalize_student_model_type(
+        getattr(getattr(model, "config", None), "student_model_type", LLAVA_NEXT)
+    )
+    runtime_args = type("Args", (), {"student_model_type": student_model_type})()
+    device = next(model.parameters()).device
 
     for item in tqdm(dataset_with_images, desc="ScienceQA Eval"):
         question = item.get("question", "")
         choices = item.get("choices", [])
-        answer_idx = item.get("answer", 0)
+        answer_idx = resolve_eval_answer_idx(item, dataset_name=dataset_name)
+        if answer_idx < 0 or answer_idx >= len(choices):
+            raise RuntimeError(
+                f"answer_idx 越界。dataset_name={dataset_name}, split={split}, "
+                f"answer_idx={answer_idx}, num_choices={len(choices)}"
+            )
         hint = item.get("hint", "")
         image = item.get("image")
 
-        prompt = build_prompt(processor, question, choices, hint)
-        inputs = processor(
-            text=prompt,
-            images=image,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
-        )
+        if student_model_type == LLAVA_NEXT:
+            prompt = build_prompt(processor, question, choices, hint)
+            inputs = processor(
+                text=prompt,
+                images=image,
+                return_tensors="pt",
+                padding="longest",
+                truncation=False,
+            )
+        else:
+            instruction_text = build_legacy_instruction(question, choices, hint)
+            inputs = encode_multimodal(
+                processor,
+                student_model_type,
+                instruction_text=instruction_text,
+                image=image,
+                add_generation_prompt=True,
+            )
 
-        input_ids = inputs["input_ids"].to(model.device)
-        attention_mask = inputs["attention_mask"].to(model.device)
-        pixel_values = inputs["pixel_values"].to(model.device)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+        pixel_values = inputs["pixel_values"].to(device)
         image_sizes = inputs.get("image_sizes")
         if image_sizes is not None:
-            image_sizes = image_sizes.to(model.device)
+            image_sizes = image_sizes.to(device)
+        image_grid_thw = inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.to(device)
 
         output_text = ""
         pred_idx = None
 
         if answer_mode in ("generate", "hybrid"):
             with torch.no_grad():
-                generated = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=1,
-                    do_sample=False,
-                    pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
-                    eos_token_id=processor.tokenizer.eos_token_id,
-                )
+                if student_model_type == LLAVA_NEXT:
+                    generated = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=1,
+                        do_sample=False,
+                        pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id,
+                    )
+                else:
+                    generated = student_generate(
+                        model,
+                        runtime_args,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        image_grid_thw=image_grid_thw,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=1,
+                        do_sample=False,
+                        pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id,
+                    )
 
             # 仅解码新生成部分，避免把整段 prompt 回显当成答案解析。
             prompt_len = input_ids.shape[-1]
@@ -495,6 +637,8 @@ def run_eval(
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
                 num_choices=len(choices),
+                student_model_type=student_model_type,
+                image_grid_thw=image_grid_thw,
             )
             if answer_mode == "logits":
                 output_text = "[logits_mode]"
@@ -539,7 +683,9 @@ def run_eval(
 def parse_args():
     parser = argparse.ArgumentParser(description="ScienceQA 多模态验证脚本（旧 Stage3 prompt 口径）")
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
+    parser.add_argument("--student_model_type", type=str, default="llava_next", choices=["llava_next", "qwen2_vl"], help="学生模型后端类型")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
+    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa"], help="评测数据集名称")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="validation", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")
@@ -570,12 +716,15 @@ def main():
         args.vq_codebook_size,
         args.freeze_vision_tower,
         args.vq_codebook_path,
+        args.student_model_type,
     )
     run_config = {
         "model_path": args.model_path,
+        "student_model_type": args.student_model_type,
         "adapter_path": args.adapter_path,
         "adapter_loaded": load_info.get("adapter_loaded", False),
         "adapter_fingerprint": load_info.get("adapter_fingerprint"),
+        "dataset_name": args.dataset_name,
         "scienceqa_path": args.scienceqa_path,
         "split": args.split,
         "max_samples": args.max_samples,
@@ -597,6 +746,7 @@ def main():
     run_eval(
         model=model,
         processor=processor,
+        dataset_name=args.dataset_name,
         scienceqa_path=args.scienceqa_path,
         split=args.split,
         max_samples=args.max_samples,

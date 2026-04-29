@@ -25,11 +25,12 @@ import math
 import time
 import re
 import sys
+from datetime import timedelta
 from dataclasses import dataclass
 import torch
 import argparse
 from collections import defaultdict
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 from pprint import pprint
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -63,6 +64,20 @@ from data_collector2 import (
     VQLORDDataset,
     VisualQAItem,
     ImageDescriptionItem,
+)
+from textvqa_mcq import build_textvqa_mcq_samples, materialize_textvqa_image
+from student_models import (
+    LLAVA_NEXT,
+    add_vq_to_student_model,
+    encode_multimodal,
+    get_image_token_id as get_student_image_token_id,
+    is_projector_param,
+    is_vision_param,
+    load_student_model_and_processor,
+    lora_target_modules,
+    normalize_student_model_type,
+    student_forward,
+    student_generate,
 )
 
 import torch.nn.functional as F
@@ -145,8 +160,19 @@ def init_distributed_mode(args):
     args.local_rank = int(os.environ["LOCAL_RANK"])
     args.device = f"cuda:{args.local_rank}"
     torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend="nccl")
+    ddp_timeout_sec = int(os.environ.get("TORCH_DDP_TIMEOUT_SEC", "1800"))
+    if ddp_timeout_sec <= 0:
+        ddp_timeout_sec = 1800
+    dist.init_process_group(
+        backend="nccl",
+        timeout=timedelta(seconds=ddp_timeout_sec),
+    )
     args.is_main_process = bool(args.rank == 0)
+    if args.is_main_process:
+        print(
+            f"[DDP] backend=nccl, world_size={args.world_size}, "
+            f"timeout={ddp_timeout_sec}s"
+        )
     return args
 
 
@@ -155,12 +181,62 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+HF_MULTICHOICE_DATASET_NAMES = ("scienceqa", "aokvqa", "textvqa")
+
+
+def _normalize_dataset_name(dataset_name: str) -> str:
+    name = str(dataset_name or "").strip().lower()
+    if not name:
+        return "scienceqa"
+    return name
+
+
+def _is_hf_multichoice_dataset(dataset_name: str) -> bool:
+    return _normalize_dataset_name(dataset_name) in HF_MULTICHOICE_DATASET_NAMES
+
+
+def _resolve_dataset_answer_idx_for_eval(item: dict, dataset_name: str) -> int:
+    dataset_name = _normalize_dataset_name(dataset_name)
+    if dataset_name == "aokvqa":
+        field_candidates = ("correct_choice_idx", "answer")
+    else:
+        field_candidates = ("answer", "correct_choice_idx")
+
+    for field in field_candidates:
+        raw_value = item.get(field)
+        if raw_value is None:
+            continue
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            continue
+
+    available = ",".join(sorted(item.keys()))
+    raise RuntimeError(
+        f"评估样本缺少有效答案字段。dataset_name={dataset_name}, "
+        f"expected_fields={field_candidates}, available_fields={available}"
+    )
+
+
 def build_scienceqa_samples(
     scienceqa_path: str,
     split: str,
     train_num: int,
     seed: int,
+    dataset_name: str = "scienceqa",
+    allowed_source_indices: Optional[Set[int]] = None,
+    include_dataset_answer: bool = False,
 ) -> List[dict]:
+    dataset_name = _normalize_dataset_name(dataset_name)
+    if dataset_name == "textvqa":
+        return build_textvqa_mcq_samples(
+            dataset_path=scienceqa_path,
+            split=split,
+            train_num=train_num,
+            seed=seed,
+            allowed_source_indices=allowed_source_indices,
+        )
+
     try:
         dataset = load_dataset(scienceqa_path, split=split)
     except Exception as exc:
@@ -174,7 +250,13 @@ def build_scienceqa_samples(
         ) from exc
     dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
-    all_indices = list(range(len(dataset_with_images)))
+    if allowed_source_indices is not None:
+        all_indices = [
+            idx for idx in sorted(allowed_source_indices)
+            if 0 <= int(idx) < len(dataset_with_images)
+        ]
+    else:
+        all_indices = list(range(len(dataset_with_images)))
     random.seed(seed)
     random.shuffle(all_indices)
     if train_num > 0 and len(all_indices) > train_num:
@@ -185,13 +267,18 @@ def build_scienceqa_samples(
         item = dataset_with_images[dataset_idx]
         question = item.get("question", "")
         choices = item.get("choices", [])
+        if not isinstance(choices, list):
+            raise RuntimeError(
+                f"样本 choices 不是 list。dataset_name={dataset_name}, split={split}, source_index={dataset_idx}"
+            )
+        if not choices:
+            raise RuntimeError(
+                f"样本 choices 为空。dataset_name={dataset_name}, split={split}, source_index={dataset_idx}"
+            )
         choices_text = ""
         for choice_idx, choice in enumerate(choices):
             choices_text += f"({chr(65 + choice_idx)}) {choice}\n"
 
-        answer_idx = int(item.get("answer", 0))
-        answer = choices[answer_idx] if choices and answer_idx < len(choices) else ""
-        answer_letter = chr(65 + answer_idx) if 0 <= answer_idx < 26 else "A"
         hint = item.get("hint", "")
         lecture = item.get("lecture", "")
         solution = item.get("solution", "")
@@ -199,26 +286,79 @@ def build_scienceqa_samples(
         hint_block = f"Hint: {hint}\n" if hint else ""
         instruction = f"<image>\nQuestion: {question}\n{hint_block}Options:\n{choices_text}Answer:"
         if lecture:
-            response = f"Explanation: {lecture}\nSolution: {solution}\nAnswer: {answer}"
+            response = f"Explanation: {lecture}\nSolution: {solution}"
         else:
-            response = f"Solution: {solution}\nAnswer: {answer}"
+            response = f"Solution: {solution}"
 
-        samples.append({
+        sample = {
             "sample_id": sampled_pos,
             "source_index": dataset_idx,
             "split": split,
+            "dataset_name": dataset_name,
             "image": item.get("image"),
             "question": question,
             "hint": hint,
             "choices": choices,
-            "answer_idx": answer_idx,
-            "answer_letter": answer_letter,
-            "answer_text": answer,
             "instruction": instruction,
             "response": response,
-        })
+        }
+        if include_dataset_answer:
+            answer_idx = _resolve_dataset_answer_idx_for_eval(item, dataset_name=dataset_name)
+            if answer_idx < 0 or answer_idx >= len(choices):
+                raise RuntimeError(
+                    f"评估样本 answer_idx 越界。dataset_name={dataset_name}, split={split}, "
+                    f"source_index={dataset_idx}, answer_idx={answer_idx}, num_choices={len(choices)}"
+                )
+            sample["answer_idx"] = int(answer_idx)
+            sample["answer_letter"] = chr(ord("A") + int(answer_idx))
+            sample["answer_text"] = str(choices[int(answer_idx)])
+
+        samples.append(sample)
 
     return samples
+
+
+def _load_cached_teacher_source_indices(
+    cache_path: str,
+    dataset_name: str,
+    split: str,
+) -> Set[int]:
+    if not cache_path:
+        raise RuntimeError("sample_only_cached_teacher=1 时必须提供 teacher_cache_path")
+    if not os.path.exists(cache_path):
+        raise RuntimeError(f"teacher_cache_path 不存在: {cache_path}")
+
+    with open(cache_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    cache_samples = payload.get("samples")
+    if not isinstance(cache_samples, dict):
+        raise RuntimeError(f"教师缓存 samples 字段无效: {cache_path}")
+
+    dataset_prefix = _normalize_dataset_name(dataset_name)
+    stable_prefix = f"{dataset_prefix}::{split}::"
+
+    allowed: Set[int] = set()
+    for cache_key, teacher_payload in cache_samples.items():
+        if not isinstance(cache_key, str) or not cache_key.startswith(stable_prefix):
+            continue
+        suffix = cache_key[len(stable_prefix):]
+        try:
+            source_index = int(suffix)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(teacher_payload, dict):
+            continue
+        valid = True
+        for field in TEACHER_REQUIRED_FIELDS:
+            value = teacher_payload.get(field)
+            if not isinstance(value, str) or len(value.strip()) == 0:
+                valid = False
+                break
+        if valid:
+            allowed.add(source_index)
+
+    return allowed
 
 
 def _safe_name(text: str) -> str:
@@ -235,7 +375,8 @@ def _sample_key(sample: dict) -> str:
     source_index = sample.get("source_index")
     if source_index is not None:
         split_name = str(sample.get("split") or "unknown")
-        return f"scienceqa::{split_name}::{int(source_index)}"
+        dataset_prefix = _normalize_dataset_name(sample.get("dataset_name", "scienceqa"))
+        return f"{dataset_prefix}::{split_name}::{int(source_index)}"
 
     instruction = sample.get("instruction", "")
     response = sample.get("response", "")
@@ -263,6 +404,79 @@ def _strip_image_tokens(text: str) -> str:
     text = text.replace("< image >", "")
     text = text.replace("<Image>", "")
     return text.strip()
+
+
+def _normalize_choice_text_for_match(text: str) -> str:
+    text = _strip_image_tokens(text)
+    text = text.lower().strip()
+    text = re.sub(r"^\(?\s*[a-z]\s*\)?[\.\):：、-]\s*", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^[\"'`“”‘’]+|[\"'`“”‘’]+$", "", text)
+    text = re.sub(r"[.;,!?。！？；，]+$", "", text).strip()
+    return text
+
+
+def _resolve_teacher_answer_idx(sample: dict) -> int:
+    choices = sample.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(
+            f"教师答案映射失败：样本 choices 非法。sample_id={sample.get('sample_id')}, "
+            f"source_index={sample.get('source_index')}"
+        )
+
+    ann = sample.get("teacher_annotation")
+    if not isinstance(ann, dict):
+        raise RuntimeError(
+            f"教师答案映射失败：缺失 teacher_annotation。sample_id={sample.get('sample_id')}, "
+            f"source_index={sample.get('source_index')}"
+        )
+    raw_answer = ann.get("answer")
+    if not isinstance(raw_answer, str) or not raw_answer.strip():
+        raise RuntimeError(
+            f"教师答案映射失败：teacher_annotation.answer 为空。sample_id={sample.get('sample_id')}, "
+            f"source_index={sample.get('source_index')}"
+        )
+
+    answer = _strip_image_tokens(raw_answer)
+    option_patterns = (
+        r"^\s*\(?\s*([A-Za-z])\s*\)?\s*(?:[\.\):：、-]|$)",
+        r"(?:answer|option|答案|选项)\s*(?:is|为|是)?\s*[:：]?\s*\(?\s*([A-Za-z])\s*\)?",
+    )
+    for pattern in option_patterns:
+        match = re.search(pattern, answer, flags=re.IGNORECASE)
+        if not match:
+            continue
+        idx = ord(match.group(1).upper()) - ord("A")
+        if 0 <= idx < len(choices):
+            return idx
+        raise RuntimeError(
+            f"教师答案映射失败：选项字母越界。sample_id={sample.get('sample_id')}, "
+            f"source_index={sample.get('source_index')}, answer={raw_answer!r}, "
+            f"num_choices={len(choices)}"
+        )
+
+    normalized_answer = _normalize_choice_text_for_match(answer)
+    matches = [
+        idx for idx, choice in enumerate(choices)
+        if _normalize_choice_text_for_match(str(choice)) == normalized_answer
+    ]
+    if len(matches) == 1:
+        return int(matches[0])
+
+    raise RuntimeError(
+        f"教师答案映射失败：无法唯一映射到选项。sample_id={sample.get('sample_id')}, "
+        f"source_index={sample.get('source_index')}, answer={raw_answer!r}, "
+        f"choices={choices!r}, matches={matches}"
+    )
+
+
+def _apply_teacher_answer_labels(samples: List[dict]) -> None:
+    for sample in samples:
+        answer_idx = _resolve_teacher_answer_idx(sample)
+        choices = sample["choices"]
+        sample["answer_idx"] = int(answer_idx)
+        sample["answer_letter"] = chr(ord("A") + int(answer_idx))
+        sample["answer_text"] = str(choices[int(answer_idx)])
 
 
 def _truncate_text_by_budget_estimate(text: str, max_tokens: int) -> str:
@@ -370,8 +584,9 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
     cache_path = args.teacher_cache_path
     if not cache_path:
         victim_tag = _safe_name(args.victim_model)
+        dataset_prefix = _normalize_dataset_name(getattr(args, "dataset_name", "scienceqa"))
         cache_name = (
-            f"scienceqa_teacher_{victim_tag}_{args.scienceqa_split}_"
+            f"{dataset_prefix}_teacher_{victim_tag}_{args.scienceqa_split}_"
             f"n{args.train_num}_seed{args.scienceqa_seed}_new.json"
         )
         cache_path = os.path.join(args.data_dir, cache_name)
@@ -391,7 +606,8 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
         raw_cache_data = payload.get("samples", {})
         if not isinstance(raw_cache_data, dict):
             raise RuntimeError(f"教师缓存 samples 字段无效: {cache_path}")
-        stable_prefix = f"scienceqa::{args.scienceqa_split}::"
+        dataset_prefix = _normalize_dataset_name(getattr(args, "dataset_name", "scienceqa"))
+        stable_prefix = f"{dataset_prefix}::{args.scienceqa_split}::"
         for cache_key, cache_value in raw_cache_data.items():
             if not isinstance(cache_key, str) or not cache_key.startswith(stable_prefix):
                 raise RuntimeError(f"教师缓存 key 非稳定格式: {cache_key}")
@@ -473,6 +689,7 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
                             {
                                 "format_version": TEACHER_SCHEMA_VERSION,
                                 "victim_model": args.victim_model,
+                                "dataset_name": _normalize_dataset_name(getattr(args, "dataset_name", "scienceqa")),
                                 "scienceqa_split": args.scienceqa_split,
                                 "train_num": args.train_num,
                                 "scienceqa_seed": args.scienceqa_seed,
@@ -505,6 +722,9 @@ def attach_gpt4v_teacher_responses(samples: List[dict], args) -> List[dict]:
             "请提供完整 *_new.json 或开启采集补齐。"
         )
 
+    _apply_teacher_answer_labels(samples)
+    print("教师答案标签已应用：answer_idx/answer_letter/answer_text 均来自 teacher_annotation.answer")
+
     return samples
 
 
@@ -515,6 +735,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
         self,
         processor,
         scienceqa_path: str = "ScienceQA",
+        dataset_name: str = "scienceqa",
         split: str = "train",
         train_num: int = 500,
         max_length: int = 512,
@@ -529,7 +750,11 @@ class ScienceQADataset(torch.utils.data.Dataset):
         require_teacher_annotation: bool = False,
     ):
         self.processor = processor
+        self.student_model_type = normalize_student_model_type(
+            getattr(processor, "student_model_type", LLAVA_NEXT)
+        )
         self.max_length = max_length
+        self.dataset_name = _normalize_dataset_name(dataset_name)
         self.teacher_lang = teacher_lang
         self.teacher_observed_max_tokens = int(teacher_observed_max_tokens)
         self.teacher_context_max_tokens = int(teacher_context_max_tokens)
@@ -541,6 +766,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
         if samples is None:
             samples = build_scienceqa_samples(
                 scienceqa_path=scienceqa_path,
+                dataset_name=self.dataset_name,
                 split=split,
                 train_num=train_num,
                 seed=seed,
@@ -587,10 +813,18 @@ class ScienceQADataset(torch.utils.data.Dataset):
         return answer_target, False
 
     def _build_targets(self, item: dict, instruction_text: str) -> tuple[str, str, str, bool]:
-        answer_letter = item.get("answer_letter", "A")
-        if not isinstance(answer_letter, str) or len(answer_letter) == 0:
-            answer_letter = "A"
+        answer_letter = item.get("answer_letter")
+        if not isinstance(answer_letter, str) or len(answer_letter.strip()) == 0:
+            raise RuntimeError(
+                f"样本缺失 answer_letter，无法构造选择题训练目标。sample_id={item.get('sample_id')}, "
+                f"source_index={item.get('source_index')}"
+            )
         answer_letter = answer_letter.strip().upper()[0]
+        if answer_letter < "A" or answer_letter > "Z":
+            raise RuntimeError(
+                f"样本 answer_letter 非法，无法构造选择题训练目标。sample_id={item.get('sample_id')}, "
+                f"source_index={item.get('source_index')}, answer_letter={answer_letter!r}"
+            )
 
         # 固定答案锚点，确保 Stage2/Stage3 指标口径一致。
         answer_target = f"Answer: {answer_letter}"
@@ -658,67 +892,36 @@ class ScienceQADataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = self.samples[idx]
-        image = item["image"]
+        image = materialize_textvqa_image(item["image"])
         image_sizes_default = torch.tensor([image.height, image.width], dtype=torch.long)
 
         instruction = item.get("instruction", "")
         instruction_text = instruction.replace("<image>", "").replace("< image >", "").replace("<Image>", "").strip()
         answer_target, rationale_target, _, has_rationale = self._build_targets(item, instruction_text)
 
-        if hasattr(self.processor, "apply_chat_template"):
-            prompt_conv = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": instruction_text},
-                        {"type": "image"},
-                    ],
-                }
-            ]
-            full_conv = prompt_conv + [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": rationale_target},
-                    ],
-                }
-            ]
-            answer_conv = prompt_conv + [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": answer_target},
-                    ],
-                }
-            ]
-            prompt_text = self.processor.apply_chat_template(prompt_conv, add_generation_prompt=True)
-            full_text = self.processor.apply_chat_template(full_conv, add_generation_prompt=False)
-            answer_text = self.processor.apply_chat_template(answer_conv, add_generation_prompt=False)
-        else:
-            prompt_text = f"<image>\n{instruction_text}"
-            full_text = f"{prompt_text}\n{rationale_target}"
-            answer_text = f"{prompt_text}\n{answer_target}"
-
-        prompt_inputs = self.processor(
-            text=prompt_text,
-            images=image,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
+        prompt_inputs = encode_multimodal(
+            self.processor,
+            self.student_model_type,
+            instruction_text=instruction_text,
+            image=image,
+            target_text=None,
+            add_generation_prompt=True,
         )
-        full_inputs = self.processor(
-            text=full_text,
-            images=image,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
+        full_inputs = encode_multimodal(
+            self.processor,
+            self.student_model_type,
+            instruction_text=instruction_text,
+            image=image,
+            target_text=rationale_target,
+            add_generation_prompt=False,
         )
-        answer_inputs = self.processor(
-            text=answer_text,
-            images=image,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
+        answer_inputs = encode_multimodal(
+            self.processor,
+            self.student_model_type,
+            instruction_text=instruction_text,
+            image=image,
+            target_text=answer_target,
+            add_generation_prompt=False,
         )
 
         image_sizes = image_sizes_default
@@ -735,9 +938,21 @@ class ScienceQADataset(torch.utils.data.Dataset):
 
         full_labels = full_labels.masked_fill(full_labels == pad_id, -100)
         answer_labels = answer_labels.masked_fill(answer_labels == pad_id, -100)
-        answer_letter = str(item.get("answer_letter", "A") or "A").strip().upper()[0]
+        answer_letter = str(item.get("answer_letter") or "").strip().upper()[:1]
+        if len(answer_letter) != 1 or answer_letter < "A" or answer_letter > "Z":
+            raise RuntimeError(
+                f"样本 answer_letter 非法，无法构造训练 batch。sample_id={item.get('sample_id')}, "
+                f"source_index={item.get('source_index')}, answer_letter={item.get('answer_letter')!r}"
+            )
+        try:
+            answer_idx = int(item["answer_idx"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"样本 answer_idx 非法，无法构造训练 batch。sample_id={item.get('sample_id')}, "
+                f"source_index={item.get('source_index')}, answer_idx={item.get('answer_idx')!r}"
+            ) from exc
 
-        return {
+        sample = {
             # 兼容 Stage3/旧逻辑
             "input_ids": full_inputs["input_ids"].squeeze(0),
             "attention_mask": full_inputs["attention_mask"].squeeze(0),
@@ -754,10 +969,16 @@ class ScienceQADataset(torch.utils.data.Dataset):
             "pixel_values": full_inputs["pixel_values"].squeeze(0),
             "image_sizes": image_sizes,
             "has_rationale": int(has_rationale),
-            "answer_idx": int(item.get("answer_idx", 0)),
+            "answer_idx": answer_idx,
             "answer_letter": answer_letter,
             "data_type": "scienceqa",
         }
+        for prefix, inputs in (("prompt", prompt_inputs), ("full", full_inputs), ("answer", answer_inputs)):
+            if "image_grid_thw" in inputs:
+                sample[f"{prefix}_image_grid_thw"] = inputs["image_grid_thw"].squeeze(0)
+        if "image_grid_thw" in full_inputs:
+            sample["image_grid_thw"] = full_inputs["image_grid_thw"].squeeze(0)
+        return sample
 
 
 class ScienceQABucketBatchSampler(torch.utils.data.Sampler):
@@ -970,6 +1191,8 @@ def load_scienceqa_preprocessed_buckets(preprocessed_path: str, expected_len: in
     preprocess_split = config.get("split")
     preprocess_train_num = int(config.get("train_num", -1)) if config.get("train_num") is not None else -1
     preprocess_seed = int(config.get("seed", -1)) if config.get("seed") is not None else -1
+    preprocess_dataset_name = str(config.get("dataset_name", "") or "").strip().lower()
+    expected_dataset_name = _normalize_dataset_name(getattr(args, "dataset_name", "scienceqa"))
     if preprocess_split not in (None, args.scienceqa_split):
         raise RuntimeError(
             f"预处理 split={preprocess_split} 与训练 split={args.scienceqa_split} 不一致"
@@ -982,9 +1205,13 @@ def load_scienceqa_preprocessed_buckets(preprocessed_path: str, expected_len: in
         raise RuntimeError(
             f"预处理 seed={preprocess_seed} 与训练 seed={args.scienceqa_seed} 不一致"
         )
+    if preprocess_dataset_name and preprocess_dataset_name != expected_dataset_name:
+        raise RuntimeError(
+            f"预处理 dataset_name={preprocess_dataset_name} 与训练 dataset_name={expected_dataset_name} 不一致"
+        )
 
     print(
-        f"已加载 ScienceQA 预处理文件: {preprocessed_path}, "
+        f"已加载预处理文件: {preprocessed_path}, "
         f"bucket_by={config.get('bucket_by')}, batch_size={config.get('bucket_batch_size')}"
     )
 
@@ -1101,17 +1328,12 @@ def sanitize_image_sizes(image_sizes: Optional[torch.Tensor], batch_size: int) -
 
 
 def _get_image_token_id(model) -> int:
-    """从 model.config 获取 image_token_index（已在 load_model_and_processor 中统一设置）。"""
+    """从学生后端获取 image token id。"""
     model = unwrap_model(model)
-    cfg = getattr(model, "config", None)
-    if cfg is None:
-        # PeftModel: 穿透到 base model
-        base = getattr(model, "get_base_model", lambda: None)()
-        cfg = getattr(base, "config", None) if base is not None else None
-    val = getattr(cfg, "image_token_index", None)
-    if val is None:
-        raise RuntimeError("model.config 中未找到 image_token_index，请检查模型加载")
-    return int(val)
+    return get_student_image_token_id(
+        model,
+        backend=getattr(getattr(model, "config", None), "student_model_type", LLAVA_NEXT),
+    )
 
 
 def _resolve_torch_dtype(dtype_name: str) -> torch.dtype:
@@ -1187,6 +1409,7 @@ def _iter_gradient_checkpointing_targets(model):
     _add(getattr(model, "model", None))
     _add(getattr(model, "language_model", None))
     _add(getattr(model, "vision_tower", None))
+    _add(getattr(model, "visual", None))
 
     get_base_model = getattr(model, "get_base_model", None)
     if callable(get_base_model):
@@ -1195,9 +1418,11 @@ def _iter_gradient_checkpointing_targets(model):
         _add(getattr(base_model, "model", None))
         _add(getattr(base_model, "language_model", None))
         _add(getattr(base_model, "vision_tower", None))
+        _add(getattr(base_model, "visual", None))
         inner_model = getattr(base_model, "model", None)
         _add(getattr(inner_model, "language_model", None))
         _add(getattr(inner_model, "vision_tower", None))
+        _add(getattr(inner_model, "visual", None))
 
     return targets
 
@@ -1351,13 +1576,19 @@ def _move_optimizer_state_to_device_(optimizer, device: str):
                 state[key] = value.to(device)
 
 
-def save_stage3_checkpoint(model, save_dir: str):
+def save_stage3_checkpoint(
+    model,
+    save_dir: str,
+    remove_vq_codebook: bool = False,
+    student_model_type: str = "llava_next",
+):
     model = unwrap_model(model)
     os.makedirs(save_dir, exist_ok=True)
     model.save_pretrained(save_dir, safe_serialization=False)
 
-    save_vq_codebook(model, os.path.join(save_dir, "vq_codebook.pt"))
-    _save_projector_state(model, os.path.join(save_dir, "projector.pt"))
+    if not remove_vq_codebook:
+        save_vq_codebook(model, os.path.join(save_dir, "vq_codebook.pt"))
+    _save_projector_state(model, os.path.join(save_dir, "projector.pt"), student_model_type)
     torch.save(
         _get_trainable_parameter_state(model),
         os.path.join(save_dir, "trainable_model_state.pt")
@@ -1373,6 +1604,9 @@ def setup_args():
     parser.add_argument("--model_path", type=str, 
                        default="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/downloads/models/llama3-llava-next-8b-hf",
                        help="LLaVA 模型路径")
+    parser.add_argument("--student_model_type", type=str, default="llava_next",
+                       choices=["llava_next", "qwen2_vl"],
+                       help="学生模型后端类型")
     parser.add_argument("--victim_model", type=str,
                        default="gpt-4-vision-preview",
                        help="教师模型 (API)")
@@ -1394,6 +1628,8 @@ def setup_args():
                        help="每隔多少 step 尝试重置 dead code；<=0 表示关闭")
     parser.add_argument("--vq_legacy_loss", type=int, default=0,
                        help="是否使用 taming 的 legacy VQ loss（1=legacy,0=修正版）")
+    parser.add_argument("--remove_vq_codebook", type=int, default=0,
+                       help="移除 VQ/codebook，使用学生模型原生视觉链路")
     parser.add_argument("--freeze_vision_tower", type=int, default=0,
                        help="是否冻结原始 vision tower")
     
@@ -1521,8 +1757,8 @@ def setup_args():
     parser.add_argument("--train_num", type=int, default=500,
                        help="训练样本数")
     parser.add_argument("--dataset_name", type=str, default="vq_lord",
-                       choices=["vq_lord", "scienceqa"],
-                       help="训练数据来源 (vq_lord 或 scienceqa)")
+                       choices=["vq_lord", "scienceqa", "aokvqa", "textvqa"],
+                       help="训练数据来源 (vq_lord / scienceqa / aokvqa / textvqa)")
     parser.add_argument("--scienceqa_split", type=str, default="train",
                        help="ScienceQA 数据集 split")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA",
@@ -1531,6 +1767,8 @@ def setup_args():
                        help="ScienceQA 划分随机种子")
     parser.add_argument("--teacher_cache_path", type=str, default="",
                        help="ScienceQA 教师四字段缓存路径 (json, 建议 *_new.json)")
+    parser.add_argument("--sample_only_cached_teacher", type=int, default=0,
+                       help="仅从教师缓存中已具备四字段标注的样本抽样 (1=启用,0=关闭)")
     parser.add_argument("--collect_teacher_data", type=int, default=1,
                        help="是否自动采集缺失的教师四字段标注")
     parser.add_argument("--strict_teacher_distill", type=int, default=1,
@@ -1601,102 +1839,27 @@ def setup_args():
 
 
 def load_model_and_processor(args):
-    """加载模型和处理器"""
+    """加载模型和处理器。"""
+    args.student_model_type = normalize_student_model_type(
+        getattr(args, "student_model_type", LLAVA_NEXT)
+    )
     if is_main_process():
         print(f"加载模型: {args.model_path}")
-    
-    # 量化配置
-    if args.use_4bit:
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-        )
-        device_map = {"": args.local_rank} if getattr(args, "distributed", False) else "auto"
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            args.model_path,
-            device_map=device_map,
-            quantization_config=quantization_config,
-            trust_remote_code=True,
-        )
-    else:
-        model_dtype = _resolve_torch_dtype(args.model_dtype)
-        if is_main_process():
-            print(f"[Load] use_4bit=0，使用非量化训练路径，dtype={model_dtype}, device={args.device}")
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            args.model_path,
-            device_map=None,
-            low_cpu_mem_usage=True,
-            torch_dtype=model_dtype,
-            trust_remote_code=True,
-        )
-        model.to(args.device)
-    
-    processor = LlavaNextProcessor.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-    )
-    
-    if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-
-    # 确认 model.config.image_token_index 与 tokenizer 一致
-    tok_img_id = processor.tokenizer.convert_tokens_to_ids("<image>")
-    cfg_img_id = getattr(model.config, "image_token_index", None)
-    if cfg_img_id != tok_img_id:
-        print(f"[Info] 对齐 image_token_index: config={cfg_img_id} -> tokenizer={tok_img_id}")
-        model.config.image_token_index = int(tok_img_id)
-
-    # 训练场景下关闭 KV cache，避免与梯度检查点冲突
-    model.config.use_cache = False
-
-    # 显式设置 gradient checkpointing 的 use_reentrant，消除警告
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-    
+        print(f"学生模型后端: {args.student_model_type}")
+    model, processor = load_student_model_and_processor(args)
+    processor.student_model_type = args.student_model_type
     return model, processor
 
 
 def add_vq_to_model(model, args):
-    """
-    为模型添加 VQ 层
-    
-    关键：使用 VQVisionEncoder 直接包装 vision tower，
-    将视觉编码与 VQ codebook 量化串成统一前向链路
-    """
+    """为学生模型添加 VQ 层。"""
     print("添加 VQ 离散化层...")
-    
-    # 获取 vision tower
-    original_vision_tower = model.vision_tower
-    
-    # 创建 VQ Vision Encoder
-    vq_vision_encoder = VQVisionEncoder(
-        vision_tower=original_vision_tower,
-        num_embeddings=args.vq_codebook_size,
-        commitment_cost=args.vq_commitment_cost,
-        legacy=bool(args.vq_legacy_loss),
-        dead_code_threshold=args.vq_dead_code_threshold,
-        usage_decay=args.vq_usage_decay,
-        dead_code_reset_interval=args.vq_dead_code_reset_interval,
-        freeze_vision_tower=bool(args.freeze_vision_tower),
-    )
-
-    vision_device = next(original_vision_tower.parameters()).device
-    vq_vision_encoder.to(vision_device)
-    
-    # 保存到模型，并以包装器替换原始 vision tower
-    model.vq_vision_encoder = vq_vision_encoder
-    model.vision_tower = vq_vision_encoder
-    model._vq_loss_container = vq_vision_encoder.vq_cache
-    model._vq_hook_handle = None
-    
+    model = add_vq_to_student_model(model, args)
     print(
         f"VQ 层已添加，codebook 大小: {args.vq_codebook_size}, "
         f"quantizer=VectorQuantizer2(legacy={bool(args.vq_legacy_loss)}), "
         f"dead_code_threshold={args.vq_dead_code_threshold}, "
-        f"reset_interval={args.vq_dead_code_reset_interval}, chain=vision_tower->vq_codebook"
+        f"reset_interval={args.vq_dead_code_reset_interval}"
     )
     return model
 
@@ -1715,14 +1878,7 @@ def apply_lora(model, args):
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=0.0,
-        target_modules=[
-            # 语言模型层
-            "q_proj", "v_proj", "k_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-            # 多模态投影层 (如果需要训练)
-            # "multi_modal_projector.linear_1",
-            # "multi_modal_projector.linear_2",
-        ],
+        target_modules=lora_target_modules(getattr(args, "student_model_type", LLAVA_NEXT)),
     )
     
     model = get_peft_model(model, lora_config)
@@ -1771,22 +1927,17 @@ def load_vq_codebook(model, codebook_path: str):
     print(f"已加载 VQ codebook: {codebook_path}")
 
 
-def _is_projector_param_name(name: str) -> bool:
-    name_l = str(name).lower()
-    return ("projector" in name_l) or ("multi_modal_projector" in name_l)
-
-
-def _extract_projector_state(model) -> dict:
+def _extract_projector_state(model, student_model_type: str) -> dict:
     model = unwrap_model(model)
     projector_state = {}
     for name, tensor in model.state_dict().items():
-        if _is_projector_param_name(name):
+        if is_projector_param(name, student_model_type):
             projector_state[name] = tensor.detach().cpu()
     return projector_state
 
 
-def _save_projector_state(model, projector_path: str) -> int:
-    projector_state = _extract_projector_state(model)
+def _save_projector_state(model, projector_path: str, student_model_type: str) -> int:
+    projector_state = _extract_projector_state(model, student_model_type)
     if not projector_state:
         print(f"[Warn] 未找到 projector 参数，跳过保存: {projector_path}")
         return 0
@@ -1816,11 +1967,17 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
     """保存 Stage2 检查点（包括 VQ codebook 和 LoRA 权重）"""
     model = unwrap_model(model)
     os.makedirs(ckpt_path, exist_ok=True)
-    
-    save_vq_codebook(model, os.path.join(ckpt_path, "vq_codebook.pt"))
+
+    remove_vq_codebook = bool(getattr(args, "remove_vq_codebook", 0))
+    if not remove_vq_codebook:
+        save_vq_codebook(model, os.path.join(ckpt_path, "vq_codebook.pt"))
 
     projector_path = os.path.join(ckpt_path, "projector.pt")
-    projector_param_count = _save_projector_state(model, projector_path)
+    projector_param_count = _save_projector_state(
+        model,
+        projector_path,
+        str(getattr(args, "student_model_type", "llava_next")),
+    )
     
     # 保存 LoRA 适配器
     model.save_pretrained(ckpt_path, safe_serialization=False)
@@ -1829,6 +1986,9 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
     import json
     config_info = {
         "vq_codebook_size": args.vq_codebook_size,
+        "remove_vq_codebook": int(remove_vq_codebook),
+        "student_model_type": str(getattr(args, "student_model_type", "llava_next")),
+        "model_path": str(getattr(args, "model_path", "")),
         "freeze_vision_tower": args.freeze_vision_tower,
         "beta": args.beta,
         "stage": 2,
@@ -1846,11 +2006,11 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
     print(f"Stage2 检查点已保存至 {ckpt_path}")
 
 
-def load_stage2_checkpoint(model, ckpt_path: str):
+def load_stage2_checkpoint(model, ckpt_path: str, remove_vq_codebook: bool = False):
     """加载 Stage2 检查点"""
     model = unwrap_model(model)
     vq_path = os.path.join(ckpt_path, "vq_codebook.pt")
-    if os.path.exists(vq_path):
+    if not remove_vq_codebook and os.path.exists(vq_path):
         load_vq_codebook(model, vq_path)
     
     # 加载 LoRA 适配器
@@ -1893,13 +2053,14 @@ def load_stage2_checkpoint(model, ckpt_path: str):
     return model
 
 
-def _stage2_contract_missing_files(ckpt_path: str) -> List[str]:
+def _stage2_contract_missing_files(ckpt_path: str, require_vq: bool = True) -> List[str]:
     required_files = [
-        "vq_codebook.pt",
         "projector.pt",
         "stage2_config.json",
         "adapter_config.json",
     ]
+    if require_vq:
+        required_files.insert(0, "vq_codebook.pt")
     missing = []
     for rel in required_files:
         if not os.path.exists(os.path.join(ckpt_path, rel)):
@@ -1998,7 +2159,12 @@ def main():
     init_distributed_mode(args)
 
     try:
-        if args.distributed and args.stage >= 1 and not bool(args.reuse_vq_codebook):
+        if (
+            args.distributed
+            and args.stage >= 1
+            and not bool(args.reuse_vq_codebook)
+            and not bool(args.remove_vq_codebook)
+        ):
             raise RuntimeError("当前未实现 Stage1 多卡训练；请先单卡准备 Stage1 codebook，再用多卡执行 Stage2/Stage3。")
 
         if is_main_process():
@@ -2007,6 +2173,8 @@ def main():
             print("=" * 60)
             pprint(vars(args))
             print("=" * 60)
+            if args.remove_vq_codebook:
+                print("[Info] remove_vq_codebook=1，使用学生模型原生视觉链路并跳过 Stage1。")
             if args.reuse_vq_codebook:
                 print("[Info] reuse_vq_codebook=1，若存在 stage1 codebook 将跳过 Stage1。")
             if args.reuse_stage2:
@@ -2020,20 +2188,38 @@ def main():
 
         train_samples = None
         train_bucket_meta = None
-        if args.dataset_name == "scienceqa":
+        if _is_hf_multichoice_dataset(args.dataset_name):
+            allowed_source_indices = None
+            if bool(int(args.sample_only_cached_teacher)):
+                allowed_source_indices = _load_cached_teacher_source_indices(
+                    cache_path=args.teacher_cache_path,
+                    dataset_name=args.dataset_name,
+                    split=args.scienceqa_split,
+                )
+                if is_main_process():
+                    print(
+                        f"[SampleFilter] sample_only_cached_teacher=1, "
+                        f"cached_valid_source_indices={len(allowed_source_indices)}"
+                    )
+                if len(allowed_source_indices) == 0:
+                    raise RuntimeError(
+                        "sample_only_cached_teacher=1，但缓存中没有可用四字段样本"
+                    )
             if is_main_process():
-                print("\n加载 ScienceQA 样本（预加载阶段，不加载学生模型）...")
+                print(f"\n加载 {args.dataset_name} 样本（预加载阶段，不加载学生模型）...")
             train_samples = build_scienceqa_samples(
                 scienceqa_path=args.scienceqa_path,
                 split=args.scienceqa_split,
                 train_num=args.train_num,
                 seed=args.scienceqa_seed,
+                dataset_name=args.dataset_name,
+                allowed_source_indices=allowed_source_indices,
             )
 
             if int(args.stage) >= 2:
                 if args.distributed:
                     if is_main_process():
-                        print("加载 ScienceQA 教师回答（stage>=2, rank0 负责补齐缓存）...")
+                        print(f"加载 {args.dataset_name} 教师回答（stage>=2, rank0 负责补齐缓存）...")
                         train_samples = attach_gpt4v_teacher_responses(train_samples, args)
                     barrier_if_distributed()
                     if not is_main_process():
@@ -2043,7 +2229,7 @@ def main():
                         args.collect_teacher_data = original_collect
                 else:
                     if is_main_process():
-                        print("加载 ScienceQA 教师回答（stage>=2）...")
+                        print(f"加载 {args.dataset_name} 教师回答（stage>=2）...")
                     train_samples = attach_gpt4v_teacher_responses(train_samples, args)
             elif is_main_process():
                 print("stage<2，跳过教师回答采集/补齐")
@@ -2055,16 +2241,20 @@ def main():
             )
 
         model, processor = load_model_and_processor(args)
-        model = add_vq_to_model(model, args)
+        model._runtime_args = args
+        if not bool(args.remove_vq_codebook):
+            model = add_vq_to_model(model, args)
+        model._runtime_args = args
         if args.use_lora:
             model = apply_lora(model, args)
 
         if is_main_process():
             print("\n加载训练数据...")
-        if args.dataset_name == "scienceqa":
+        if _is_hf_multichoice_dataset(args.dataset_name):
             train_dataset = ScienceQADataset(
                 processor=processor,
                 scienceqa_path=args.scienceqa_path,
+                dataset_name=args.dataset_name,
                 max_length=args.max_length,
                 samples=train_samples,
                 seed=args.scienceqa_seed,
@@ -2170,7 +2360,7 @@ def main():
 
         def build_train_dataloader(stage_id: int):
             use_bucket = (
-                args.dataset_name == "scienceqa"
+                _is_hf_multichoice_dataset(args.dataset_name)
                 and train_bucket_meta is not None
                 and not (stage_id == 3 and bool(args.disable_bucket_for_stage3))
             )
@@ -2261,7 +2451,7 @@ def main():
         if is_main_process():
             print(f"训练数据量: {len(train_dataset)}")
 
-        if args.stage >= 1:
+        if args.stage >= 1 and not bool(args.remove_vq_codebook):
             stage1_dataloader = build_train_dataloader(stage_id=1)
             if args.distributed and not os.path.exists(args.vq_codebook_path):
                 raise RuntimeError(
@@ -2295,10 +2485,21 @@ def main():
                     save_stage2_checkpoint(model, args, args.stage2_ckpt_path)
                     save_checkpoint(model, args, "stage2_vision")
                 barrier_if_distributed()
-            elif args.reuse_stage2 and os.path.exists(args.stage2_ckpt_path) and os.path.exists(os.path.join(args.stage2_ckpt_path, "vq_codebook.pt")):
+            elif (
+                args.reuse_stage2
+                and os.path.exists(args.stage2_ckpt_path)
+                and (
+                    bool(args.remove_vq_codebook)
+                    or os.path.exists(os.path.join(args.stage2_ckpt_path, "vq_codebook.pt"))
+                )
+            ):
                 if is_main_process():
                     print(f"检测到Stage2检查点，跳过Stage2并加载: {args.stage2_ckpt_path}")
-                model = load_stage2_checkpoint(model, args.stage2_ckpt_path)
+                model = load_stage2_checkpoint(
+                    model,
+                    args.stage2_ckpt_path,
+                    remove_vq_codebook=bool(args.remove_vq_codebook),
+                )
             else:
                 model = wrap_model_for_stage2_ddp(model, args)
                 model = train_stage2_vision(model, stage2_dataloader, args, tb_writer)
@@ -2314,7 +2515,10 @@ def main():
                 args.stage2_ckpt_path = os.path.join(args.save_path, "stage2_vision")
             if not os.path.isdir(args.stage2_ckpt_path):
                 raise RuntimeError(f"Stage3 需要可用的 Stage2 checkpoint 目录: {args.stage2_ckpt_path}")
-            missing_stage2_files = _stage2_contract_missing_files(args.stage2_ckpt_path)
+            missing_stage2_files = _stage2_contract_missing_files(
+                args.stage2_ckpt_path,
+                require_vq=not bool(args.remove_vq_codebook),
+            )
             if missing_stage2_files:
                 raise RuntimeError(
                     "Stage3 启动前 Stage2 工件不完整，缺失: "
@@ -2325,7 +2529,12 @@ def main():
             model = unwrap_model(model)
             barrier_if_distributed()
             if is_main_process():
-                save_stage3_checkpoint(model, os.path.join(args.save_path, "stage3_lord_final"))
+                save_stage3_checkpoint(
+                    model,
+                    os.path.join(args.save_path, "stage3_lord_final"),
+                    remove_vq_codebook=bool(args.remove_vq_codebook),
+                    student_model_type=str(getattr(args, "student_model_type", "llava_next")),
+                )
             barrier_if_distributed()
 
         if is_main_process():

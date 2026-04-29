@@ -11,8 +11,8 @@ align_vq_ensure_runtime_dirs
 align_vq_setup_logging "test_vq_lord_stage2_parallel"
 
 # Evaluation
-EVAL_SPLIT="${EVAL_SPLIT:-test}"
-EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
+EVAL_SPLIT="${EVAL_SPLIT:-validation}"
+EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-2017}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-128}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-logits}"
 USE_4BIT="${USE_4BIT:-0}"
@@ -33,7 +33,8 @@ RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWE
 align_vq_print_header "Stage2 产物并行评测"
 echo "ROOT_DIR: ${ROOT_DIR}"
 echo "MODEL_PATH: ${MODEL_PATH}"
-echo "SCIENCEQA_PATH: ${SCIENCEQA_PATH}"
+echo "DATASET_NAME: ${DATASET_NAME}"
+echo "DATASET_PATH: ${DATASET_PATH}"
 echo "EVAL_ENTRY: ${EVAL_ENTRY}"
 echo "STAGE2_CKPT_PATH: ${STAGE2_CKPT_PATH}"
 echo "NUM_SHARDS: ${NUM_SHARDS}"
@@ -45,7 +46,7 @@ echo "LOG_FILE: ${LOG_FILE}"
 
 align_vq_require_file "${EVAL_ENTRY}" "并行评测入口"
 align_vq_require_stage2_artifacts "${STAGE2_CKPT_PATH}"
-align_vq_assert_scienceqa_path
+align_vq_assert_dataset_path
 
 mkdir -p "${SHARD_RESULT_DIR}" "$(dirname "${RESULT_PATH}")"
 
@@ -69,8 +70,10 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
         export CUDA_VISIBLE_DEVICES="${gpu_id}"
         "${PYTHON_BIN}" "${EVAL_ENTRY}" \
             --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
             --adapter_path="${STAGE2_CKPT_PATH}" \
-            --scienceqa_path="${SCIENCEQA_PATH}" \
+            --dataset_name="${DATASET_NAME}" \
+            --scienceqa_path="${DATASET_PATH}" \
             --split="${EVAL_SPLIT}" \
             --max_samples="${EVAL_MAX_SAMPLES}" \
             --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
@@ -106,8 +109,10 @@ fi
 
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --adapter_path="${STAGE2_CKPT_PATH}" \
-    --scienceqa_path="${SCIENCEQA_PATH}" \
+    --dataset_name="${DATASET_NAME}" \
+    --scienceqa_path="${DATASET_PATH}" \
     --split="${EVAL_SPLIT}" \
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \

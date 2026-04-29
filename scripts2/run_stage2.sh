@@ -9,6 +9,9 @@ source "${SCRIPT_SOURCE_DIR}/common.sh"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 DDP_NPROC="${DDP_NPROC:-4}"
 
+# CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+# DDP_NPROC="${DDP_NPROC:-2}"
+
 align_vq_init_paths
 align_vq_setup_env
 align_vq_setup_distributed_env
@@ -18,7 +21,7 @@ align_vq_setup_logging "run_stage2"
 # Paths
 TRAIN_ENTRY="${ROOT_DIR}/vq_lord3/train_vq_lord3.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process.py"
-SAVE_PATH="${CKPT_DIR}/stage2"
+SAVE_PATH="${SAVE_PATH:-${CKPT_DIR}/stage2}"
 STAGE1_CODEBOOK_PATH="${STAGE1_CODEBOOK_PATH:-${CKPT_DIR}/stage3_sub1_period7_1/vq_codebook.pt}"
 STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2_vision}"
 STAGE2_RESUME_PATH="${STAGE2_RESUME_PATH:-}"
@@ -27,15 +30,7 @@ STAGE2_RESUME_SAVE_OPTIMIZER="${STAGE2_RESUME_SAVE_OPTIMIZER:-1}"
 STAGE2_RESUME_SAVE_INTERVAL="${STAGE2_RESUME_SAVE_INTERVAL:-1}"
 
 # Data
-DATASET_NAME="scienceqa"
-SCIENCEQA_SPLIT="${SCIENCEQA_SPLIT:-train}"
-TRAIN_NUM="${TRAIN_NUM:-0}"
-SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
-BUCKET_BY="${BUCKET_BY:-patches}"
-STAGE3_BUCKET_BATCH_SIZE="${STAGE3_BUCKET_BATCH_SIZE:-4}"
-BUCKET_DROP_LAST="${BUCKET_DROP_LAST:-0}"
-DISABLE_BUCKET_FOR_STAGE3="${DISABLE_BUCKET_FOR_STAGE3:-0}"
-SCIENCEQA_PREPROCESSED_PATH="${SCIENCEQA_PREPROCESSED_PATH:-${PREPROCESS_DIR}/scienceqa_${SCIENCEQA_SPLIT}_n${TRAIN_NUM}_seed${SCIENCEQA_SEED}_${BUCKET_BY}_bs${PREPROCESS_BUCKET_BATCH_SIZE}.json}"
+STAGE3_BUCKET_BATCH_SIZE="4"
 
 # Stage2 4x H200 config
 # 保持与原 1 卡配置近似的有效 batch：8 * 4(accum) -> 8 * 4卡 * 1(accum)
@@ -60,6 +55,7 @@ STAGE2_VISION_LR_SCALE="${STAGE2_VISION_LR_SCALE:-0.2}"
 STAGE2_GRAD_CLIP="${STAGE2_GRAD_CLIP:-1.0}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
+align_vq_set_dataset_preprocessed_path "${PREPROCESS_BUCKET_BATCH_SIZE}"
 
 # VQ / model
 VQ_CODEBOOK_SIZE="${VQ_CODEBOOK_SIZE:-1024}"
@@ -79,21 +75,17 @@ USE_4BIT="${USE_4BIT:-0}"
 MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 
 # Distillation / reuse
-COLLECT_TEACHER_DATA="${COLLECT_TEACHER_DATA:-0}"
-STRICT_TEACHER_DISTILL="${STRICT_TEACHER_DISTILL:-0}"
-TEACHER_LANG="${TEACHER_LANG:-en}"
-REUSE_VQ_CODEBOOK="${REUSE_VQ_CODEBOOK:-1}"
-REUSE_STAGE2="${REUSE_STAGE2:-0}"
+REUSE_STAGE2="0"
 
 # Evaluation
 EVAL_SPLIT="${EVAL_SPLIT:-validation}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-500}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-64}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-logits}"
-RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage2_validation_logits.json}"
+RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/${DATASET_TAG}_stage2_validation_logits.json}"
 
 # Logging / save
-LOG_STEP="${LOG_STEP:-50}"
+LOG_STEP="${LOG_STEP:-1000000}"
 SAVE_STEP="${SAVE_STEP:-100}"
 SAVE_EACH_EPOCH="${SAVE_EACH_EPOCH:-1}"
 
@@ -102,12 +94,18 @@ echo "ROOT_DIR: ${ROOT_DIR}"
 echo "TRAIN_ENTRY: ${TRAIN_ENTRY}"
 echo "EVAL_ENTRY: ${EVAL_ENTRY}"
 echo "MODEL_PATH: ${MODEL_PATH}"
-echo "SCIENCEQA_PATH: ${SCIENCEQA_PATH}"
-echo "SCIENCEQA_PREPROCESSED_PATH: ${SCIENCEQA_PREPROCESSED_PATH}"
+echo "DATASET_NAME: ${DATASET_NAME}"
+echo "DATASET_TAG: ${DATASET_TAG}"
+echo "TRAIN_DATASET_NAME: ${TRAIN_DATASET_NAME}"
+echo "DATASET_PATH: ${DATASET_PATH}"
+echo "DATASET_PREPROCESSED_PATH: ${DATASET_PREPROCESSED_PATH}"
 echo "STAGE1_CODEBOOK_PATH: ${STAGE1_CODEBOOK_PATH}"
 echo "STAGE2_CKPT_PATH: ${STAGE2_CKPT_PATH}"
 echo "STAGE2_RESUME_PATH: ${STAGE2_RESUME_PATH:-<empty>}"
 echo "STAGE2_RESUME_SAVE_PATH: ${STAGE2_RESUME_SAVE_PATH}"
+echo "REMOVE_VQ_CODEBOOK: ${REMOVE_VQ_CODEBOOK}"
+echo "TEACHER_CACHE_PATH: ${TEACHER_CACHE_PATH:-<empty>}"
+echo "SAMPLE_ONLY_CACHED_TEACHER: ${SAMPLE_ONLY_CACHED_TEACHER}"
 echo "RESULT_PATH: ${RESULT_PATH}"
 echo "EPOCHS: ${EPOCHS}"
 echo "LR: ${LR}"
@@ -115,19 +113,27 @@ echo "BATCH_SIZE: ${BATCH_SIZE}"
 echo "GRAD_ACCUM/STAGE2_GRAD_ACCUM: ${GRAD_ACCUM}/${STAGE2_GRAD_ACCUM}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "DDP_NPROC: ${DDP_NPROC}"
+echo "ALIGN_VQ_NCCL_DEBUG: ${ALIGN_VQ_NCCL_DEBUG:-0}"
+echo "TORCH_DDP_TIMEOUT_SEC: ${TORCH_DDP_TIMEOUT_SEC:-<unset>}"
+echo "TORCH_DISTRIBUTED_DEBUG: ${TORCH_DISTRIBUTED_DEBUG:-<unset>}"
+echo "NCCL_DEBUG: ${NCCL_DEBUG:-<unset>}"
+echo "NCCL_DEBUG_SUBSYS: ${NCCL_DEBUG_SUBSYS:-<unset>}"
+echo "NCCL_BLOCKING_WAIT/TORCH_NCCL_BLOCKING_WAIT: ${NCCL_BLOCKING_WAIT:-<unset>}/${TORCH_NCCL_BLOCKING_WAIT:-<unset>}"
 echo "LOG_FILE: ${LOG_FILE}"
 
 align_vq_require_file "${TRAIN_ENTRY}" "Stage2 训练入口"
 align_vq_require_file "${EVAL_ENTRY}" "Stage2 评测入口"
-align_vq_require_stage1_artifacts "${STAGE1_CODEBOOK_PATH}"
+if [ "${REMOVE_VQ_CODEBOOK}" != "1" ]; then
+    align_vq_require_stage1_artifacts "${STAGE1_CODEBOOK_PATH}"
+fi
 if [ -n "${STAGE2_RESUME_PATH}" ]; then
     align_vq_require_file "${STAGE2_RESUME_PATH}/stage2_resume_state.pt" "Stage2 resume state"
 fi
-align_vq_prepare_scienceqa_preprocess \
-    "${SCIENCEQA_PREPROCESSED_PATH}" \
-    "${SCIENCEQA_SPLIT}" \
+align_vq_prepare_dataset_preprocess \
+    "${DATASET_PREPROCESSED_PATH}" \
+    "${DATASET_SPLIT}" \
     "${TRAIN_NUM}" \
-    "${SCIENCEQA_SEED}" \
+    "${DATASET_SEED}" \
     "${BUCKET_BY}" \
     "${PREPROCESS_BUCKET_BATCH_SIZE}" \
     "${BUCKET_DROP_LAST}" \
@@ -142,6 +148,7 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
 
 "${TRAIN_LAUNCHER[@]}" "${TRAIN_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --victim_model="${VICTIM_MODEL}" \
     --teacher_api_base="${TEACHER_API_BASE}" \
     --teacher_api_key="${TEACHER_API_KEY}" \
@@ -151,6 +158,7 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
     --vq_usage_decay="${VQ_USAGE_DECAY}" \
     --vq_dead_code_reset_interval="${VQ_DEAD_CODE_RESET_INTERVAL}" \
     --vq_legacy_loss="${VQ_LEGACY_LOSS}" \
+    --remove_vq_codebook="${REMOVE_VQ_CODEBOOK}" \
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --beta="${BETA}" \
     --temperature="${TEMPERATURE}" \
@@ -183,17 +191,19 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
     --max_new_tokens="${MAX_NEW_TOKENS}" \
     --data_dir="${DATA_DIR}" \
     --train_num="${TRAIN_NUM}" \
-    --dataset_name="${DATASET_NAME}" \
-    --scienceqa_path="${SCIENCEQA_PATH}" \
-    --scienceqa_split="${SCIENCEQA_SPLIT}" \
-    --scienceqa_seed="${SCIENCEQA_SEED}" \
-    --scienceqa_preprocessed_path="${SCIENCEQA_PREPROCESSED_PATH}" \
+    --dataset_name="${TRAIN_DATASET_NAME}" \
+    --scienceqa_path="${DATASET_PATH}" \
+    --scienceqa_split="${DATASET_SPLIT}" \
+    --scienceqa_seed="${DATASET_SEED}" \
+    --scienceqa_preprocessed_path="${DATASET_PREPROCESSED_PATH}" \
     --bucket_batch_size="${BUCKET_BATCH_SIZE}" \
     --stage3_bucket_batch_size="${STAGE3_BUCKET_BATCH_SIZE}" \
     --disable_bucket_for_stage3="${DISABLE_BUCKET_FOR_STAGE3}" \
     --collect_teacher_data="${COLLECT_TEACHER_DATA}" \
     --strict_teacher_distill="${STRICT_TEACHER_DISTILL}" \
     --teacher_lang="${TEACHER_LANG}" \
+    --teacher_cache_path="${TEACHER_CACHE_PATH}" \
+    --sample_only_cached_teacher="${SAMPLE_ONLY_CACHED_TEACHER}" \
     --reuse_vq_codebook="${REUSE_VQ_CODEBOOK}" \
     --reuse_stage2="${REUSE_STAGE2}" \
     --vq_codebook_path="${STAGE1_CODEBOOK_PATH}" \
@@ -209,17 +219,26 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
     --device="cuda"
 
 align_vq_require_stage2_artifacts "${STAGE2_CKPT_PATH}"
+
+
 mkdir -p "$(dirname "${RESULT_PATH}")"
+
+EVAL_USE_VQ=1
+if [ "${REMOVE_VQ_CODEBOOK}" = "1" ]; then
+    EVAL_USE_VQ=0
+fi
 
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
+    --student_model_type="${STUDENT_MODEL_TYPE}" \
     --adapter_path="${STAGE2_CKPT_PATH}" \
-    --scienceqa_path="${SCIENCEQA_PATH}" \
+    --dataset_name="${DATASET_NAME}" \
+    --scienceqa_path="${DATASET_PATH}" \
     --split="${EVAL_SPLIT}" \
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
     --use_4bit="${USE_4BIT}" \
-    --use_vq=1 \
+    --use_vq="${EVAL_USE_VQ}" \
     --vq_codebook_size="${VQ_CODEBOOK_SIZE}" \
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --vq_codebook_path="${STAGE2_CKPT_PATH}/vq_codebook.pt" \
