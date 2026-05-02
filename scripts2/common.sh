@@ -10,8 +10,10 @@ ROOT_DEFAULT="/home/songxinhao/workspace/vq_lord"
 PYTHON_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/miniconda3/envs/lord/bin/python"
 MODEL_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/models/llama3-llava-next-8b-hf"
 QWEN2_VL_MODEL_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/models/Qwen2-VL-7B-Instruct"
-STUDENT_MODEL_TYPE_DEFAULT="qwen2_vl"
+STUDENT_MODEL_TYPE_DEFAULT="llava_next"
+# STUDENT_MODEL_TYPE_DEFAULT="qwen2_vl"
 DATASET_NAME_DEFAULT="scienceqa"
+# DATASET_NAME_DEFAULT="aokvqa"
 DATASET_PATH_DEFAULT_SCIENCEQA="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/ScienceQA"
 DATASET_PATH_DEFAULT_AOKVQA="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/A-OKVQA"
 DATASET_PATH_DEFAULT_TEXTVQA="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/textvqa"
@@ -21,6 +23,7 @@ TRAIN_NUM_DEFAULT_SCIENCEQA="0"
 TRAIN_NUM_DEFAULT_AOKVQA="6200"
 TRAIN_NUM_DEFAULT_TEXTVQA="6200"
 VICTIM_MODEL_DEFAULT_SCIENCEQA="qwen3.5-flash-2026-02-23"
+# VICTIM_MODEL_DEFAULT_SCIENCEQA="gpt-4.1-mini"
 VICTIM_MODEL_DEFAULT_AOKVQA="qwen3.5-flash-2026-02-23"
 VICTIM_MODEL_DEFAULT_TEXTVQA="qwen3.5-flash-2026-02-23"
 SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_SCIENCEQA="0"
@@ -40,7 +43,7 @@ align_vq_apply_dataset_profile() {
             dataset_path_default="${DATASET_PATH_DEFAULT_SCIENCEQA}"
             train_num_default="${TRAIN_NUM_DEFAULT_SCIENCEQA}"
             victim_model_default="${VICTIM_MODEL_DEFAULT_SCIENCEQA}"
-            teacher_cache_default="${DATA_DIR}/scienceqa_teacher_${VICTIM_MODEL_DEFAULT_SCIENCEQA}_train_n0_seed20240306_new.json"
+            teacher_cache_default="${DATA_DIR}/scienceqa_teacher_${VICTIM_MODEL_DEFAULT_SCIENCEQA}_train_n${TRAIN_NUM_DEFAULT_SCIENCEQA}_seed20240306_new.json"
             sample_only_cached_default="${SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_SCIENCEQA}"
             ;;
         aokvqa)
@@ -132,7 +135,6 @@ align_vq_setup_env() {
     export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
     export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
     export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
-    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
     if ! [[ "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
         export OMP_NUM_THREADS=8
@@ -182,7 +184,6 @@ align_vq_setup_distributed_env() {
         fi
 
         # DDP / NCCL 诊断与稳态配置（可通过环境变量覆盖）
-        export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
         export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
         if [ "${ALIGN_VQ_NCCL_DEBUG}" = "1" ]; then
@@ -371,7 +372,7 @@ with open(path, "r", encoding="utf-8") as f:
     payload = json.load(f)
 
 metrics = payload.get("metrics", {})
-acc = float(metrics.get("accuracy", 0.0))
+acc = float(metrics.get("answer_accuracy", metrics.get("accuracy", 0.0)))
 results = payload.get("results", [])
 
 pat = re.compile(r"(?:answer|答案)\s*[:：]\s*\(?\s*([A-D])\s*\)?", re.IGNORECASE)
@@ -384,7 +385,7 @@ for item in results:
         fmt_hits += 1
 
 total = max(1, len(results))
-fmt_rate = fmt_hits / total
+fmt_rate = float(metrics.get("format_rate", fmt_hits / total))
 
 print(f"ACCURACY={acc:.6f}")
 print(f"FORMAT_RATE={fmt_rate:.6f}")

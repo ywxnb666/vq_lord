@@ -94,6 +94,40 @@ def _compute_stage2_token_loss_sum(
     return loss_sum, valid_count
 
 
+def _compute_stage2_weighted_token_loss_sum(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    token_weights: torch.Tensor,
+    ignore_index: int = -100,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if logits is None or labels is None or token_weights is None:
+        raise ValueError("Stage2 weighted token loss 计算需要 logits、labels 和 token_weights")
+    if logits.dim() != 3 or labels.dim() != 2 or token_weights.dim() != 2:
+        raise ValueError(
+            f"Stage2 weighted loss 输入维度错误: logits={tuple(logits.shape)}, "
+            f"labels={tuple(labels.shape)}, weights={tuple(token_weights.shape)}"
+        )
+    shift_logits = logits[..., :-1, :].contiguous().float()
+    shift_labels = labels[..., 1:].contiguous()
+    shift_weights = token_weights[..., 1:].contiguous().to(device=logits.device, dtype=torch.float32)
+    valid_mask = shift_labels.ne(ignore_index)
+    weight = shift_weights * valid_mask.float()
+    weight_sum = weight.sum()
+    if float(weight_sum.detach().item()) <= 0.0:
+        return logits.sum() * 0.0, weight_sum
+
+    vocab = shift_logits.size(-1)
+    flat_labels = shift_labels.view(-1)
+    ce = F.cross_entropy(
+        shift_logits.view(-1, vocab),
+        flat_labels,
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view_as(shift_labels)
+    loss_sum = (ce * weight).sum()
+    return loss_sum, weight_sum
+
+
 def _stage2_global_mean_from_local_sum(
     local_loss_sum: torch.Tensor,
     local_weight: torch.Tensor,
@@ -137,6 +171,11 @@ def _stage2_resume_config(args) -> dict:
         "beta": float(args.beta),
         "stage2_answer_weight": float(args.stage2_answer_weight),
         "stage2_rationale_weight": float(args.stage2_rationale_weight),
+        "stage2_field_weight_observed": float(getattr(args, "stage2_field_weight_observed", 1.0)),
+        "stage2_field_weight_context": float(getattr(args, "stage2_field_weight_context", 1.0)),
+        "stage2_field_weight_reasoning": float(getattr(args, "stage2_field_weight_reasoning", 0.5)),
+        "stage2_field_weight_answer": float(getattr(args, "stage2_field_weight_answer", 6.0)),
+        "stage2_answer_prefix_weight": float(getattr(args, "stage2_answer_prefix_weight", 12.0)),
         "stage2_prepost_lr_scale": float(args.stage2_prepost_lr_scale),
         "stage2_vision_lr_scale": float(args.stage2_vision_lr_scale),
         "stage2_grad_clip": float(args.stage2_grad_clip),
@@ -204,6 +243,11 @@ def _validate_stage2_resume_config(resume_config: dict, args):
         "beta",
         "stage2_answer_weight",
         "stage2_rationale_weight",
+        "stage2_field_weight_observed",
+        "stage2_field_weight_context",
+        "stage2_field_weight_reasoning",
+        "stage2_field_weight_answer",
+        "stage2_answer_prefix_weight",
         "stage2_prepost_lr_scale",
         "stage2_vision_lr_scale",
         "stage2_grad_clip",
@@ -431,7 +475,11 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
     if is_main_process():
         print(
             f"[Stage2] grad_accum={grad_accum}, "
-            f"answer_w={args.stage2_answer_weight}, rationale_w={args.stage2_rationale_weight}, "
+            f"field_w=({float(getattr(args, 'stage2_field_weight_observed', 1.0)):.2f},"
+            f"{float(getattr(args, 'stage2_field_weight_context', 1.0)):.2f},"
+            f"{float(getattr(args, 'stage2_field_weight_reasoning', 0.5)):.2f},"
+            f"{float(getattr(args, 'stage2_field_weight_answer', 6.0)):.2f}), "
+            f"answer_prefix_w={float(getattr(args, 'stage2_answer_prefix_weight', 12.0)):.2f}, "
             f"prepost_lr_scale={args.stage2_prepost_lr_scale}, "
             f"vision_lr_scale={args.stage2_vision_lr_scale}, grad_clip={args.stage2_grad_clip}"
         )
@@ -492,16 +540,30 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
             pixel_values = batch["pixel_values"].to(args.device)
             image_sizes = sanitize_image_sizes(batch.get("image_sizes"), batch_size=pixel_values.shape[0])
 
-            answer_input_ids = batch["answer_input_ids"].to(args.device)
-            answer_attention_mask = batch["answer_attention_mask"].to(args.device)
-            answer_labels = batch["answer_labels"].to(args.device)
-
             full_input_ids = batch["full_input_ids"].to(args.device)
             full_attention_mask = batch["full_attention_mask"].to(args.device)
             full_labels = batch["full_labels"].to(args.device)
-            has_rationale = batch["has_rationale"].to(args.device).bool()
-            rationale_labels = full_labels.masked_fill(~has_rationale.unsqueeze(1), -100)
-            has_any_rationale = bool(has_rationale.any().item())
+            field_masks = {
+                "observed": batch["field_mask_observed"].to(args.device).float(),
+                "context": batch["field_mask_context"].to(args.device).float(),
+                "reasoning": batch["field_mask_reasoning"].to(args.device).float(),
+                "answer": batch["field_mask_answer"].to(args.device).float(),
+            }
+            answer_prefix_mask = batch["field_mask_answer_prefix"].to(args.device).float()
+            field_weights = {
+                "observed": float(getattr(args, "stage2_field_weight_observed", 1.0)),
+                "context": float(getattr(args, "stage2_field_weight_context", 1.0)),
+                "reasoning": float(getattr(args, "stage2_field_weight_reasoning", 0.5)),
+                "answer": float(getattr(args, "stage2_field_weight_answer", 6.0)),
+            }
+            answer_prefix_weight = float(getattr(args, "stage2_answer_prefix_weight", field_weights["answer"]))
+            token_weights = (
+                field_weights["observed"] * field_masks["observed"]
+                + field_weights["context"] * field_masks["context"]
+                + field_weights["reasoning"] * field_masks["reasoning"]
+                + field_weights["answer"] * field_masks["answer"]
+                + max(0.0, answer_prefix_weight - field_weights["answer"]) * answer_prefix_mask
+            ).masked_fill(full_labels.eq(-100), 0.0)
 
             if global_step == 1:
                 n_img = (full_input_ids == image_token_id).sum(dim=1)
@@ -510,50 +572,35 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
                         f"首个 batch 缺少 image token: counts={n_img.tolist()}, id={image_token_id}"
                     )
 
-            outputs_answer = student_forward(
+            outputs_full = student_forward(
                 model=model,
                 args=args,
-                input_ids=answer_input_ids,
-                attention_mask=answer_attention_mask,
+                input_ids=full_input_ids,
+                attention_mask=full_attention_mask,
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
-                image_grid_thw=batch.get("answer_image_grid_thw", batch.get("image_grid_thw")),
-                labels=answer_labels,
+                image_grid_thw=batch.get("full_image_grid_thw", batch.get("image_grid_thw")),
+                labels=full_labels,
             )
-            answer_loss_sum, answer_token_count = _compute_stage2_token_loss_sum(
-                outputs_answer.logits,
-                answer_labels,
+            readable_loss_sum, readable_weight = _compute_stage2_weighted_token_loss_sum(
+                outputs_full.logits,
+                full_labels,
+                token_weights,
             )
-            answer_loss, answer_loss_val = _stage2_global_mean_from_local_sum(
-                answer_loss_sum,
-                answer_token_count,
+            readable_loss, readable_loss_val = _stage2_global_mean_from_local_sum(
+                readable_loss_sum,
+                readable_weight,
             )
-            answer_vq_loss = _get_stage2_vq_loss(model, args.device, outputs_answer.logits.dtype)
-
-            if has_any_rationale:
-                outputs_full = student_forward(
-                    model=model,
-                    args=args,
-                    input_ids=full_input_ids,
-                    attention_mask=full_attention_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    image_grid_thw=batch.get("full_image_grid_thw", batch.get("image_grid_thw")),
-                    labels=rationale_labels,
-                )
-                rationale_loss_sum, rationale_token_count = _compute_stage2_token_loss_sum(
+            vq_loss_raw = _get_stage2_vq_loss(model, args.device, outputs_full.logits.dtype)
+            field_loss_vals = {}
+            for field_name, field_mask in field_masks.items():
+                field_sum, field_count = _compute_stage2_weighted_token_loss_sum(
                     outputs_full.logits,
-                    rationale_labels,
+                    full_labels,
+                    field_mask,
                 )
-                rationale_loss, rationale_loss_val = _stage2_global_mean_from_local_sum(
-                    rationale_loss_sum,
-                    rationale_token_count,
-                )
-                vq_loss_raw = _get_stage2_vq_loss(model, args.device, outputs_answer.logits.dtype)
-            else:
-                rationale_loss = torch.zeros((), device=args.device, dtype=answer_loss.dtype)
-                rationale_loss_val = 0.0
-                vq_loss_raw = answer_vq_loss
+                _, field_loss_val = _stage2_global_mean_from_local_sum(field_sum, field_count)
+                field_loss_vals[field_name] = field_loss_val
 
             local_batch_weight = torch.tensor(
                 float(pixel_values.shape[0]),
@@ -565,11 +612,7 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
                 local_batch_weight,
             )
 
-            total_loss = (
-                float(args.stage2_answer_weight) * answer_loss
-                + float(args.stage2_rationale_weight) * rationale_loss
-                + args.beta * vq_loss
-            )
+            total_loss = readable_loss + args.beta * vq_loss
 
             skip_tensor = torch.tensor(
                 0.0 if torch.isfinite(total_loss) else 1.0,
@@ -612,17 +655,13 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            total_loss_val = (
-                float(args.stage2_answer_weight) * answer_loss_val
-                + float(args.stage2_rationale_weight) * rationale_loss_val
-                + float(args.beta) * vq_loss_val
-            )
-            weighted_vq_ratio = float(args.beta) * vq_loss_val / max(answer_loss_val, 1e-8)
+            total_loss_val = readable_loss_val + float(args.beta) * vq_loss_val
+            weighted_vq_ratio = float(args.beta) * vq_loss_val / max(readable_loss_val, 1e-8)
             perplexity_val, dead_code_resets, dead_code_count = _get_stage2_vq_stats(model)
 
             epoch_total += total_loss_val
-            epoch_answer += answer_loss_val
-            epoch_rationale += rationale_loss_val
+            epoch_answer += field_loss_vals["answer"]
+            epoch_rationale += readable_loss_val
             epoch_vq += vq_loss_val
             epoch_vq_ratio += weighted_vq_ratio
             epoch_vq_perplexity += perplexity_val
@@ -631,16 +670,24 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
             if global_step % args.log_step == 0 and is_main_process():
                 print(
                     f"Step {global_step}, Total: {total_loss_val:.4f}, "
-                    f"Answer: {answer_loss_val:.4f}, Rationale: {rationale_loss_val:.4f}, "
-                    f"VQ: {vq_loss_val:.4f}, VQ/Answer: {weighted_vq_ratio:.4f}, "
+                    f"ReadableLoss: {readable_loss_val:.4f}, "
+                    f"ObservedLoss: {field_loss_vals['observed']:.4f}, "
+                    f"ContextLoss: {field_loss_vals['context']:.4f}, "
+                    f"ReasoningLoss: {field_loss_vals['reasoning']:.4f}, "
+                    f"AnswerLoss: {field_loss_vals['answer']:.4f}, "
+                    f"AnswerTokenWeight: {field_weights['answer']:.2f}, "
+                    f"VQ: {vq_loss_val:.4f}, VQ/Readable: {weighted_vq_ratio:.4f}, "
                     f"PPL: {perplexity_val:.2f}, Dead: {dead_code_count}"
                 )
                 if tb_writer is not None:
                     tb_writer.add_scalar("stage2/total_loss", total_loss_val, global_step)
-                    tb_writer.add_scalar("stage2/answer_loss", answer_loss_val, global_step)
-                    tb_writer.add_scalar("stage2/rationale_loss", rationale_loss_val, global_step)
+                    tb_writer.add_scalar("stage2/readable_loss", readable_loss_val, global_step)
+                    tb_writer.add_scalar("stage2/observed_loss", field_loss_vals["observed"], global_step)
+                    tb_writer.add_scalar("stage2/context_loss", field_loss_vals["context"], global_step)
+                    tb_writer.add_scalar("stage2/reasoning_loss", field_loss_vals["reasoning"], global_step)
+                    tb_writer.add_scalar("stage2/answer_loss", field_loss_vals["answer"], global_step)
                     tb_writer.add_scalar("stage2/vq_loss", vq_loss_val, global_step)
-                    tb_writer.add_scalar("stage2/vq_answer_ratio", weighted_vq_ratio, global_step)
+                    tb_writer.add_scalar("stage2/vq_readable_ratio", weighted_vq_ratio, global_step)
                     tb_writer.add_scalar("stage2/vq_perplexity", perplexity_val, global_step)
                     tb_writer.add_scalar("stage2/dead_code_resets", dead_code_resets, global_step)
                     tb_writer.add_scalar("stage2/dead_code_count", dead_code_count, global_step)
@@ -660,7 +707,7 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
         denom = max(1.0, reduced_epoch["epoch_count"])
         avg_total = reduced_epoch["epoch_total"] / denom
         avg_answer = reduced_epoch["epoch_answer"] / denom
-        avg_rationale = reduced_epoch["epoch_rationale"] / denom
+        avg_readable = reduced_epoch["epoch_rationale"] / denom
         avg_vq = reduced_epoch["epoch_vq"] / denom
         avg_vq_ratio = reduced_epoch["epoch_vq_ratio"] / denom
         avg_vq_perplexity = reduced_epoch["epoch_vq_perplexity"] / denom
@@ -668,16 +715,16 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
         if is_main_process():
             print(
                 f"Epoch {epoch+1} 平均损失: Total={avg_total:.4f}, "
-                f"Answer={avg_answer:.4f}, Rationale={avg_rationale:.4f}, "
-                f"VQ={avg_vq:.4f}, VQ/Answer={avg_vq_ratio:.4f}, "
+                f"Readable={avg_readable:.4f}, Answer={avg_answer:.4f}, "
+                f"VQ={avg_vq:.4f}, VQ/Readable={avg_vq_ratio:.4f}, "
                 f"PPL={avg_vq_perplexity:.2f}"
             )
             if tb_writer is not None:
                 tb_writer.add_scalar("stage2_epoch/total_loss", avg_total, epoch + 1)
+                tb_writer.add_scalar("stage2_epoch/readable_loss", avg_readable, epoch + 1)
                 tb_writer.add_scalar("stage2_epoch/answer_loss", avg_answer, epoch + 1)
-                tb_writer.add_scalar("stage2_epoch/rationale_loss", avg_rationale, epoch + 1)
                 tb_writer.add_scalar("stage2_epoch/vq_loss", avg_vq, epoch + 1)
-                tb_writer.add_scalar("stage2_epoch/vq_answer_ratio", avg_vq_ratio, epoch + 1)
+                tb_writer.add_scalar("stage2_epoch/vq_readable_ratio", avg_vq_ratio, epoch + 1)
                 tb_writer.add_scalar("stage2_epoch/vq_perplexity", avg_vq_perplexity, epoch + 1)
 
         progress_payload = {

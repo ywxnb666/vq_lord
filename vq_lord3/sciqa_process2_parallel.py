@@ -23,11 +23,36 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from sciqa_process2 import (
+    build_readable_instruction,
     build_prompt,
+    build_readable_prompt,
     extract_choice_from_output,
     load_model_and_processor,
     normalize_dataset_name,
+    parse_readable_fields,
     resolve_eval_answer_idx,
+)
+from student_models import (
+    LLAVA_NEXT,
+    encode_multimodal,
+    normalize_student_model_type,
+    student_forward,
+    student_generate,
+)
+from train_vq_lord3 import (
+    ScienceQADataset,
+    build_scienceqa_samples,
+    sanitize_image_sizes,
+)
+from vq_lord_stage3 import (
+    _build_stage3_choice_token_map,
+    _build_stage3_sample_cache,
+    _compute_choice_scores_from_prompt_batch,
+    _pad_1d_tensor,
+    _predict_choice_from_choice_scores,
+    _stack_optional_image_grid_thw,
+    _stack_optional_image_sizes,
+    _stack_padded_pixel_values,
 )
 
 
@@ -226,21 +251,170 @@ def shard_batches(batch_plan: List[dict], num_shards: int, shard_id: int) -> Lis
     return [batch for batch in batch_plan if int(batch["batch_id"]) % num_shards == shard_id]
 
 
+def run_stage3_aligned_logits_shard(
+    model,
+    processor,
+    bucket_payload: dict,
+    shard_plan: List[dict],
+    dataset_name: str,
+    scienceqa_path: str,
+    split: str,
+    max_samples: int,
+    save_path: str,
+    runtime_args,
+    run_config: Optional[dict] = None,
+):
+    cfg = bucket_payload.get("config", {})
+    seed = int(cfg.get("seed", 20240306) or 20240306)
+    eval_samples = build_scienceqa_samples(
+        scienceqa_path=scienceqa_path,
+        dataset_name=dataset_name,
+        split=split,
+        train_num=max_samples,
+        seed=seed,
+        include_dataset_answer=True,
+    )
+    eval_dataset = ScienceQADataset(
+        processor=processor,
+        scienceqa_path=scienceqa_path,
+        dataset_name=dataset_name,
+        split=split,
+        train_num=max_samples,
+        max_length=512,
+        samples=eval_samples,
+        seed=seed,
+        teacher_lang="zh",
+        stage3_vic_include_context=False,
+        require_teacher_annotation=False,
+    )
+    sample_cache = _build_stage3_sample_cache(eval_dataset)
+    tokenizer = processor.tokenizer
+    choice_token_map = _build_stage3_choice_token_map(tokenizer, max_choices=26)
+    pad_token_id = model.config.pad_token_id or tokenizer.pad_token_id or model.config.eos_token_id or 0
+    device = next(model.parameters()).device
+
+    results = []
+    correct = 0
+    total = 0
+    format_hits = 0
+    answer_parse_hits = 0
+    field_nonempty = {"observed_facts": 0, "context": 0, "reasoning": 0, "answer": 0}
+    field_token_totals = {key: 0 for key in field_nonempty}
+    model.eval()
+
+    for batch in tqdm(shard_plan, desc="ScienceQA Stage3-Aligned Logits Eval"):
+        sample_ids = [int(x) for x in batch.get("sample_ids", [])]
+        batch_samples = [sample_cache[sample_id] for sample_id in sample_ids]
+        if not batch_samples:
+            continue
+
+        max_prompt_len = max(int(sample.prompt_ids.shape[0]) for sample in batch_samples)
+        prompt_ids = torch.stack(
+            [
+                _pad_1d_tensor(sample.prompt_ids.long(), max_prompt_len, pad_token_id)
+                for sample in batch_samples
+            ],
+            dim=0,
+        ).to(device)
+        prompt_mask = torch.stack(
+            [
+                _pad_1d_tensor(sample.prompt_mask.long(), max_prompt_len, 0)
+                for sample in batch_samples
+            ],
+            dim=0,
+        ).to(device)
+        pixel_values = _stack_padded_pixel_values([sample.pixel_values for sample in batch_samples]).to(device)
+        image_sizes = sanitize_image_sizes(
+            _stack_optional_image_sizes([sample.image_sizes for sample in batch_samples]),
+            batch_size=len(batch_samples),
+        )
+        image_grid_thw = _stack_optional_image_grid_thw([sample.image_grid_thw for sample in batch_samples])
+        num_choices = torch.tensor(
+            [int(sample.num_choices) for sample in batch_samples],
+            device=device,
+            dtype=torch.long,
+        )
+
+        with torch.no_grad():
+            choice_scores, valid_rows = _compute_choice_scores_from_prompt_batch(
+                model=model,
+                args=runtime_args,
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                num_choices=num_choices,
+                choice_token_map=choice_token_map,
+                image_grid_thw=image_grid_thw,
+            )
+        pred_indices = _predict_choice_from_choice_scores(choice_scores, num_choices, valid_rows)
+
+        for local_idx, sample_id in enumerate(sample_ids):
+            raw_item = eval_samples[sample_id]
+            pred_idx = pred_indices[local_idx]
+            answer_idx = int(raw_item["answer_idx"])
+            is_correct = pred_idx == answer_idx
+            total += 1
+            if is_correct:
+                correct += 1
+            pred_text = "" if pred_idx is None else f"Answer: {chr(65 + int(pred_idx))}"
+            results.append(
+                {
+                    "sample_id": int(sample_id),
+                    "source_index": int(raw_item["source_index"]),
+                    "question": raw_item["question"],
+                    "choices": raw_item["choices"],
+                    "answer_idx": answer_idx,
+                    "pred_idx": pred_idx,
+                    "output": pred_text,
+                    "first_pass_output": pred_text,
+                    "second_pass_output": "",
+                    "first_pass_answer": pred_text,
+                    "correct": is_correct,
+                    "patch_count": int(batch_samples[local_idx].pixel_values.shape[0]),
+                    "bucket_key": str(batch.get("bucket_key", "")),
+                }
+            )
+
+    results.sort(key=lambda item: int(item["sample_id"]))
+    accuracy = correct / total if total else 0.0
+    metrics = {
+        "accuracy": accuracy,
+        "total": total,
+        "correct": correct,
+        "format_rate": 1.0 if total else 0.0,
+        "eval_impl": "stage3_aligned_logits",
+    }
+
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump({"metrics": metrics, "run_config": run_config or {}, "results": results}, f, ensure_ascii=False, indent=2)
+    print(f"[Stage3-Aligned Shard] Accuracy: {accuracy:.4f} ({correct}/{total})")
+    print(f"[Stage3-Aligned Shard] Results saved to: {save_path}")
+
+
 def predict_choices_with_next_token_logits_batch(
     model,
+    runtime_args,
     tokenizer,
     input_ids,
     attention_mask,
     pixel_values,
     image_sizes,
+    image_grid_thw,
     num_choices_list: List[int],
 ) -> List[Optional[int]]:
     with torch.no_grad():
-        outputs = model(
+        outputs = student_forward(
+            model=model,
+            args=runtime_args,
             input_ids=input_ids,
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_sizes=image_sizes,
+            image_grid_thw=image_grid_thw,
             use_cache=False,
         )
 
@@ -302,9 +476,12 @@ def run_eval_shard(
     answer_mode: str,
     num_shards: int,
     shard_id: int,
+    student_model_type: str,
     run_config: Optional[dict] = None,
 ):
     dataset_name = normalize_dataset_name(dataset_name)
+    student_model_type = normalize_student_model_type(student_model_type)
+    runtime_args = type("Args", (), {"student_model_type": student_model_type})()
     bucket_payload = load_bucket_payload(bucket_plan_path)
     validate_bucket_payload(
         bucket_payload,
@@ -314,9 +491,25 @@ def run_eval_shard(
         dataset_name=dataset_name,
     )
 
-    sample_map = build_eval_sample_map(scienceqa_path, split, bucket_payload, dataset_name=dataset_name)
     batch_plan = bucket_payload.get("batch_plan", [])
     shard_plan = shard_batches(batch_plan, num_shards=num_shards, shard_id=shard_id)
+    if answer_mode == "logits":
+        run_stage3_aligned_logits_shard(
+            model=model,
+            processor=processor,
+            bucket_payload=bucket_payload,
+            shard_plan=shard_plan,
+            dataset_name=dataset_name,
+            scienceqa_path=scienceqa_path,
+            split=split,
+            max_samples=max_samples,
+            save_path=save_path,
+            runtime_args=runtime_args,
+            run_config=run_config,
+        )
+        return
+
+    sample_map = build_eval_sample_map(scienceqa_path, split, bucket_payload, dataset_name=dataset_name)
 
     # Batched generation for decoder-only models is much more stable with left padding.
     if hasattr(processor, "tokenizer") and getattr(processor.tokenizer, "padding_side", None) != "left":
@@ -325,154 +518,233 @@ def run_eval_shard(
     results = []
     correct = 0
     total = 0
+    format_hits = 0
+    answer_parse_hits = 0
+    field_nonempty = {"observed_facts": 0, "context": 0, "reasoning": 0, "answer": 0}
+    field_token_totals = {key: 0 for key in field_nonempty}
+    if student_model_type != LLAVA_NEXT and answer_mode != "generate_readable":
+        raise RuntimeError("Qwen2-VL parallel eval 只支持新规范 generate_readable。")
+    device = next(model.parameters()).device
 
     for batch in tqdm(shard_plan, desc=f"ScienceQA Eval Bucket Shard {shard_id}/{num_shards}"):
         sample_ids = [int(x) for x in batch.get("sample_ids", [])]
         batch_samples = [sample_map[sample_id] for sample_id in sample_ids]
-
-        prompts = [
-            build_prompt(processor, item["question"], item["choices"], item["hint"])
-            for item in batch_samples
-        ]
-        images = [item["image"] for item in batch_samples]
-
-        inputs = processor(
-            text=prompts,
-            images=images,
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
-        )
-
-        input_ids = inputs["input_ids"].to(model.device)
-        attention_mask = inputs["attention_mask"].to(model.device)
-        pixel_values = inputs["pixel_values"].to(model.device)
-        image_sizes = inputs.get("image_sizes")
-        if image_sizes is not None:
-            image_sizes = image_sizes.to(model.device)
 
         batch_output_texts = [""] * len(batch_samples)
         batch_first_pass_output_texts = [""] * len(batch_samples)
         batch_second_pass_output_texts = [""] * len(batch_samples)
         batch_first_pass_answer_texts = [""] * len(batch_samples)
         batch_pred_idx: List[Optional[int]] = [None] * len(batch_samples)
+        batch_readable_format_ok = [False] * len(batch_samples)
+        batch_readable_fields = [{} for _ in batch_samples]
 
-        if answer_mode in ("generate", "hybrid"):
-            with torch.no_grad():
-                generated = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=1,
-                    do_sample=False,
-                    pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
-                    eos_token_id=processor.tokenizer.eos_token_id,
-                )
-
-            prompt_len = input_ids.shape[1]
+        if student_model_type != LLAVA_NEXT:
             for row_idx, item in enumerate(batch_samples):
-                gen_tokens = generated[row_idx][prompt_len:]
-                output_text = processor.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
-                if not output_text:
-                    output_text = "[empty_generation]"
-                batch_first_pass_output_texts[row_idx] = output_text
-                batch_pred_idx[row_idx] = extract_choice_from_output(output_text, item["choices"])
-                batch_first_pass_answer_texts[row_idx] = build_canonical_answer_text(
-                    batch_pred_idx[row_idx],
-                    item["choices"],
+                print(
+                    f"[Shard {shard_id}] batch={int(batch['batch_id'])} "
+                    f"sample={row_idx + 1}/{len(batch_samples)} "
+                    f"sample_id={int(item['sample_id'])} patch_count={int(item['patch_count'])}",
+                    flush=True,
                 )
-
-            if answer_mode == "generate" and int(enable_second_pass) == 1:
-                struct_prompts = [
-                    build_two_pass_structured_prompt(
-                        processor=processor,
-                        question=item["question"],
-                        choices=item["choices"],
-                        hint=item["hint"],
-                        first_pass_answer=batch_first_pass_answer_texts[row_idx],
-                        first_pass_output=batch_first_pass_output_texts[row_idx],
-                    )
-                    for row_idx, item in enumerate(batch_samples)
-                ]
-                struct_inputs = processor(
-                    text=struct_prompts,
-                    images=images,
-                    return_tensors="pt",
-                    padding="longest",
-                    truncation=False,
+                instruction_text = build_readable_instruction(item["question"], item["choices"], item["hint"])
+                inputs = encode_multimodal(
+                    processor,
+                    student_model_type,
+                    instruction_text=instruction_text,
+                    image=item["image"],
+                    add_generation_prompt=True,
                 )
-                struct_input_ids = struct_inputs["input_ids"].to(model.device)
-                struct_attention_mask = struct_inputs["attention_mask"].to(model.device)
-                struct_pixel_values = struct_inputs["pixel_values"].to(model.device)
-                struct_image_sizes = struct_inputs.get("image_sizes")
-                if struct_image_sizes is not None:
-                    struct_image_sizes = struct_image_sizes.to(model.device)
+                input_ids = inputs["input_ids"].to(device)
+                attention_mask = inputs["attention_mask"].to(device)
+                pixel_values = inputs["pixel_values"].to(device)
+                image_grid_thw = inputs.get("image_grid_thw")
+                if image_grid_thw is not None:
+                    image_grid_thw = image_grid_thw.to(device)
 
                 with torch.no_grad():
-                    struct_generated = model.generate(
-                        input_ids=struct_input_ids,
-                        attention_mask=struct_attention_mask,
-                        pixel_values=struct_pixel_values,
-                        image_sizes=struct_image_sizes,
-                        max_new_tokens=second_pass_max_new_tokens,
-                        min_new_tokens=1,
+                    generated = student_generate(
+                        model,
+                        runtime_args,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=16,
+                        use_cache=True,
                         do_sample=False,
                         pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
                         eos_token_id=processor.tokenizer.eos_token_id,
                     )
 
-                struct_prompt_len = struct_input_ids.shape[1]
-                for row_idx, item in enumerate(batch_samples):
-                    struct_gen_tokens = struct_generated[row_idx][struct_prompt_len:]
-                    struct_output_text = processor.tokenizer.decode(
-                        struct_gen_tokens, skip_special_tokens=True
-                    ).strip()
-                    if not struct_output_text:
-                        struct_output_text = "[empty_generation]"
-                    batch_second_pass_output_texts[row_idx] = struct_output_text
-                    batch_output_texts[row_idx] = struct_output_text
-                    if batch_pred_idx[row_idx] is None:
-                        batch_pred_idx[row_idx] = extract_choice_from_structured_output(
-                            struct_output_text, item["choices"]
-                        )
-            else:
-                batch_output_texts = list(batch_first_pass_output_texts)
+                gen_tokens = generated[0][input_ids.shape[-1]:]
+                output_text = processor.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+                if not output_text:
+                    output_text = "[empty_generation]"
+                batch_first_pass_output_texts[row_idx] = output_text
+                batch_output_texts[row_idx] = output_text
 
-        if answer_mode in ("logits", "hybrid"):
-            unresolved_rows = [
-                row_idx for row_idx, pred_idx in enumerate(batch_pred_idx)
-                if pred_idx is None
-            ] if answer_mode == "hybrid" else list(range(len(batch_samples)))
-
-            if unresolved_rows:
-                row_input_ids = input_ids[unresolved_rows]
-                row_attention_mask = attention_mask[unresolved_rows]
-                row_pixel_values = pixel_values[unresolved_rows]
-                row_image_sizes = image_sizes[unresolved_rows] if image_sizes is not None else None
-                row_num_choices = [len(batch_samples[row_idx]["choices"]) for row_idx in unresolved_rows]
-
-                row_predictions = predict_choices_with_next_token_logits_batch(
-                    model=model,
-                    tokenizer=processor.tokenizer,
-                    input_ids=row_input_ids,
-                    attention_mask=row_attention_mask,
-                    pixel_values=row_pixel_values,
-                    image_sizes=row_image_sizes,
-                    num_choices_list=row_num_choices,
+                readable_ok, fields = parse_readable_fields(output_text)
+                batch_readable_format_ok[row_idx] = readable_ok
+                batch_readable_fields[row_idx] = fields
+                if readable_ok:
+                    batch_pred_idx[row_idx] = extract_choice_from_output(fields.get("answer", ""), item["choices"])
+                print(
+                    f"[Shard {shard_id}] progress_done "
+                    f"batch={int(batch['batch_id'])} "
+                    f"sample={row_idx + 1}/{len(batch_samples)} "
+                    f"sample_id={int(item['sample_id'])}",
+                    flush=True,
                 )
 
-                for local_idx, row_idx in enumerate(unresolved_rows):
-                    batch_pred_idx[row_idx] = row_predictions[local_idx]
-                    if answer_mode == "logits":
-                        batch_output_texts[row_idx] = "[logits_mode]"
-                    elif not batch_output_texts[row_idx]:
-                        batch_output_texts[row_idx] = "[hybrid_fallback_to_logits]"
+        else:
+            prompts = [
+                (
+                    build_readable_prompt(processor, item["question"], item["choices"], item["hint"])
+                    if answer_mode == "generate_readable"
+                    else build_prompt(processor, item["question"], item["choices"], item["hint"])
+                )
+                for item in batch_samples
+            ]
+            images = [item["image"] for item in batch_samples]
+
+            inputs = processor(
+                text=prompts,
+                images=images,
+                return_tensors="pt",
+                padding="longest",
+                truncation=False,
+            )
+
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs["attention_mask"].to(device)
+            pixel_values = inputs["pixel_values"].to(device)
+            image_sizes = inputs.get("image_sizes")
+            if image_sizes is not None:
+                image_sizes = image_sizes.to(device)
+            image_grid_thw = inputs.get("image_grid_thw")
+            if image_grid_thw is not None:
+                image_grid_thw = image_grid_thw.to(device)
+
+            if answer_mode in ("generate", "hybrid", "generate_readable"):
+                with torch.no_grad():
+                    generated = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=16 if answer_mode == "generate_readable" else 1,
+                        do_sample=False,
+                        pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id,
+                    )
+
+                prompt_len = input_ids.shape[1]
+                for row_idx, item in enumerate(batch_samples):
+                    gen_tokens = generated[row_idx][prompt_len:]
+                    output_text = processor.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+                    if not output_text:
+                        output_text = "[empty_generation]"
+                    batch_first_pass_output_texts[row_idx] = output_text
+                    if answer_mode == "generate_readable":
+                        readable_ok, fields = parse_readable_fields(output_text)
+                        batch_readable_format_ok[row_idx] = readable_ok
+                        batch_readable_fields[row_idx] = fields
+                        if readable_ok:
+                            batch_pred_idx[row_idx] = extract_choice_from_output(fields.get("answer", ""), item["choices"])
                     else:
-                        batch_output_texts[row_idx] = (
-                            f"{batch_output_texts[row_idx]}\n[hybrid_fallback_to_logits]"
+                        batch_pred_idx[row_idx] = extract_choice_from_output(output_text, item["choices"])
+                        batch_first_pass_answer_texts[row_idx] = build_canonical_answer_text(
+                            batch_pred_idx[row_idx],
+                            item["choices"],
                         )
+
+                if answer_mode == "generate" and int(enable_second_pass) == 1:
+                    struct_prompts = [
+                        build_two_pass_structured_prompt(
+                            processor=processor,
+                            question=item["question"],
+                            choices=item["choices"],
+                            hint=item["hint"],
+                            first_pass_answer=batch_first_pass_answer_texts[row_idx],
+                            first_pass_output=batch_first_pass_output_texts[row_idx],
+                        )
+                        for row_idx, item in enumerate(batch_samples)
+                    ]
+                    struct_inputs = processor(
+                        text=struct_prompts,
+                        images=images,
+                        return_tensors="pt",
+                        padding="longest",
+                        truncation=False,
+                    )
+                    struct_input_ids = struct_inputs["input_ids"].to(device)
+                    struct_attention_mask = struct_inputs["attention_mask"].to(device)
+                    struct_pixel_values = struct_inputs["pixel_values"].to(device)
+                    struct_image_sizes = struct_inputs.get("image_sizes")
+                    if struct_image_sizes is not None:
+                        struct_image_sizes = struct_image_sizes.to(device)
+
+                    with torch.no_grad():
+                        struct_generated = model.generate(
+                            input_ids=struct_input_ids,
+                            attention_mask=struct_attention_mask,
+                            pixel_values=struct_pixel_values,
+                            image_sizes=struct_image_sizes,
+                            max_new_tokens=second_pass_max_new_tokens,
+                            min_new_tokens=1,
+                            do_sample=False,
+                            pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
+                            eos_token_id=processor.tokenizer.eos_token_id,
+                        )
+
+                    struct_prompt_len = struct_input_ids.shape[1]
+                    for row_idx, item in enumerate(batch_samples):
+                        struct_gen_tokens = struct_generated[row_idx][struct_prompt_len:]
+                        struct_output_text = processor.tokenizer.decode(
+                            struct_gen_tokens, skip_special_tokens=True
+                        ).strip()
+                        if not struct_output_text:
+                            struct_output_text = "[empty_generation]"
+                        batch_second_pass_output_texts[row_idx] = struct_output_text
+                        batch_output_texts[row_idx] = struct_output_text
+                        if batch_pred_idx[row_idx] is None:
+                            batch_pred_idx[row_idx] = extract_choice_from_structured_output(
+                                struct_output_text, item["choices"]
+                            )
+                else:
+                    batch_output_texts = list(batch_first_pass_output_texts)
+
+            if answer_mode in ("logits", "hybrid"):
+                unresolved_rows = [
+                    row_idx for row_idx, pred_idx in enumerate(batch_pred_idx)
+                    if pred_idx is None
+                ] if answer_mode == "hybrid" else list(range(len(batch_samples)))
+
+                if unresolved_rows:
+                    batch_predictions = predict_choices_with_next_token_logits_batch(
+                        model=model,
+                        runtime_args=runtime_args,
+                        tokenizer=processor.tokenizer,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        image_grid_thw=image_grid_thw,
+                        num_choices_list=[len(item["choices"]) for item in batch_samples],
+                    )
+
+                    for row_idx in unresolved_rows:
+                        batch_pred_idx[row_idx] = batch_predictions[row_idx]
+                        if answer_mode == "logits":
+                            batch_output_texts[row_idx] = "[logits_mode]"
+                        elif not batch_output_texts[row_idx]:
+                            batch_output_texts[row_idx] = "[hybrid_fallback_to_logits]"
+                        else:
+                            batch_output_texts[row_idx] = (
+                                f"{batch_output_texts[row_idx]}\n[hybrid_fallback_to_logits]"
+                            )
 
         for row_idx, item in enumerate(batch_samples):
             pred_idx = batch_pred_idx[row_idx]
@@ -484,6 +756,16 @@ def run_eval_shard(
                 )
             is_correct = pred_idx == item["answer_idx"]
             total += 1
+            if answer_mode == "generate_readable":
+                if batch_readable_format_ok[row_idx]:
+                    format_hits += 1
+                    for field_name in field_nonempty:
+                        value = str(batch_readable_fields[row_idx].get(field_name, "") or "")
+                        if value:
+                            field_nonempty[field_name] += 1
+                            field_token_totals[field_name] += len(value.split())
+                    if pred_idx is not None:
+                        answer_parse_hits += 1
             if is_correct:
                 correct += 1
 
@@ -495,6 +777,8 @@ def run_eval_shard(
                 "answer_idx": item["answer_idx"],
                 "pred_idx": pred_idx,
                 "output": batch_output_texts[row_idx],
+                "readable_format_ok": batch_readable_format_ok[row_idx],
+                "readable_fields": batch_readable_fields[row_idx],
                 "first_pass_output": batch_first_pass_output_texts[row_idx],
                 "second_pass_output": batch_second_pass_output_texts[row_idx],
                 "first_pass_answer": batch_first_pass_answer_texts[row_idx],
@@ -502,6 +786,14 @@ def run_eval_shard(
                 "patch_count": int(item["patch_count"]),
                 "bucket_key": item["bucket_key"],
             })
+            if student_model_type == LLAVA_NEXT:
+                print(
+                    f"[Shard {shard_id}] progress_done "
+                    f"batch={int(batch['batch_id'])} "
+                    f"sample={row_idx + 1}/{len(batch_samples)} "
+                    f"sample_id={int(item['sample_id'])}",
+                    flush=True,
+                )
 
     results.sort(key=lambda item: int(item["sample_id"]))
 
@@ -511,6 +803,20 @@ def run_eval_shard(
         "total": total,
         "correct": correct,
     }
+    if answer_mode == "generate_readable":
+        metrics.update({
+            "format_rate": format_hits / total if total else 0.0,
+            "answer_parse_rate": answer_parse_hits / total if total else 0.0,
+            "answer_accuracy": accuracy,
+            "field_nonempty_rate": {
+                key: field_nonempty[key] / total if total else 0.0
+                for key in field_nonempty
+            },
+            "avg_field_tokens": {
+                key: field_token_totals[key] / max(1, field_nonempty[key])
+                for key in field_token_totals
+            },
+        })
 
     save_dir = os.path.dirname(save_path)
     if save_dir:
@@ -559,6 +865,36 @@ def merge_shard_results(
         "total": total,
         "correct": correct,
     }
+    if (run_config or {}).get("answer_mode") == "generate_readable":
+        format_hits = sum(1 for item in merged_results if item.get("readable_format_ok"))
+        answer_parse_hits = sum(
+            1
+            for item in merged_results
+            if item.get("readable_format_ok") and item.get("pred_idx") is not None
+        )
+        field_names = ("observed_facts", "context", "reasoning", "answer")
+        field_nonempty = {key: 0 for key in field_names}
+        field_token_totals = {key: 0 for key in field_names}
+        for item in merged_results:
+            fields = item.get("readable_fields") or {}
+            for key in field_names:
+                value = str(fields.get(key, "") or "")
+                if value:
+                    field_nonempty[key] += 1
+                    field_token_totals[key] += len(value.split())
+        metrics.update({
+            "format_rate": format_hits / total if total else 0.0,
+            "answer_parse_rate": answer_parse_hits / total if total else 0.0,
+            "answer_accuracy": accuracy,
+            "field_nonempty_rate": {
+                key: field_nonempty[key] / total if total else 0.0
+                for key in field_names
+            },
+            "avg_field_tokens": {
+                key: field_token_totals[key] / max(1, field_nonempty[key])
+                for key in field_names
+            },
+        })
 
     save_dir = os.path.dirname(save_path)
     if save_dir:
@@ -596,9 +932,9 @@ def parse_args():
     parser.add_argument(
         "--answer_mode",
         type=str,
-        default="generate",
-        choices=["generate", "logits", "hybrid"],
-        help="答案获取方式：generate=仅生成解析, logits=仅下一token打分, hybrid=生成失败时回退logits",
+        default="generate_readable",
+        choices=["generate", "logits", "hybrid", "generate_readable"],
+        help="答案获取方式：generate_readable=四字段生成严格解析, generate=仅生成解析, logits=仅下一token打分, hybrid=生成失败时回退logits",
     )
     parser.add_argument("--bucket_plan_path", type=str, required=True, help="预处理分桶 JSON 路径")
     parser.add_argument("--num_shards", type=int, default=4, help="总分片数")
@@ -615,6 +951,7 @@ def main():
     if int(args.merge_only) == 1:
         merge_run_config = {
             "model_path": args.model_path,
+            "student_model_type": args.student_model_type,
             "adapter_path": args.adapter_path,
             "dataset_name": args.dataset_name,
             "scienceqa_path": args.scienceqa_path,
@@ -629,7 +966,9 @@ def main():
             "vq_codebook_path": args.vq_codebook_path,
             "answer_mode": args.answer_mode,
             "prompt_style": (
-                "student_two_pass_legacy_then_structured_4field"
+                "readable_four_field"
+                if args.answer_mode == "generate_readable"
+                else "student_two_pass_legacy_then_structured_4field"
                 if args.answer_mode == "generate" and int(args.enable_second_pass) == 1
                 else "stage3_legacy"
             ),
@@ -659,6 +998,7 @@ def main():
     )
     run_config = {
         "model_path": args.model_path,
+        "student_model_type": args.student_model_type,
         "adapter_path": args.adapter_path,
         "adapter_loaded": load_info.get("adapter_loaded", False),
         "adapter_fingerprint": load_info.get("adapter_fingerprint"),
@@ -682,7 +1022,9 @@ def main():
         "trainable_state_skipped": load_info.get("trainable_state_skipped", 0),
         "answer_mode": args.answer_mode,
         "prompt_style": (
-            "student_two_pass_legacy_then_structured_4field"
+            "readable_four_field"
+            if args.answer_mode == "generate_readable"
+            else "student_two_pass_legacy_then_structured_4field"
             if args.answer_mode == "generate" and int(args.enable_second_pass) == 1
             else "stage3_legacy"
         ),
@@ -707,6 +1049,7 @@ def main():
         answer_mode=args.answer_mode,
         num_shards=int(args.num_shards),
         shard_id=int(args.shard_id),
+        student_model_type=args.student_model_type,
         run_config=run_config,
     )
 

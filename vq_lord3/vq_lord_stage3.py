@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -92,6 +93,16 @@ def _stage3_masked_mean_ddp(
     local_sum = (values * local_mask).sum()
     local_weight = local_mask.sum().to(dtype=torch.float32)
     return _stage3_global_mean_from_local_sum(local_sum, local_weight)
+
+
+def _stage3_prefix_mask_from_field_mask(field_mask: torch.Tensor, max_prefix_tokens: int = 4) -> torch.Tensor:
+    active = (field_mask > 0).to(dtype=field_mask.dtype)
+    prefix_pos = torch.cumsum(active, dim=1)
+    return active * (prefix_pos <= int(max_prefix_tokens)).to(dtype=field_mask.dtype)
+
+
+def _stage3_use_answer_correctness_pair(args) -> bool:
+    return str(getattr(args, "student_model_type", "")) == "llava_next"
 
 
 def _compute_token_log_probs(
@@ -228,6 +239,7 @@ def _stage3_resume_config(args) -> dict:
         "tau_delta": float(getattr(args, "tau_delta", 0.0)),
         "temperature": float(getattr(args, "temperature", 0.0)),
         "max_new_tokens": int(getattr(args, "max_new_tokens", 0)),
+        "stage3_eval_max_new_tokens": int(getattr(args, "stage3_eval_max_new_tokens", 0)),
         "stage3_train_projector": int(getattr(args, "stage3_train_projector", 0)),
         "stage3_field_weight_observed": float(getattr(args, "stage3_field_weight_observed", 0.0)),
         "stage3_field_weight_context": float(getattr(args, "stage3_field_weight_context", 0.0)),
@@ -235,7 +247,9 @@ def _stage3_resume_config(args) -> dict:
         "stage3_field_weight_answer": float(getattr(args, "stage3_field_weight_answer", 0.0)),
         "stage3_obj_weight": float(getattr(args, "stage3_obj_weight", 0.0)),
         "stage3_reg_weight": float(getattr(args, "stage3_reg_weight", 0.0)),
+        "stage3_readable_sft_weight": float(getattr(args, "stage3_readable_sft_weight", 1.0)),
         "stage3_answer_anchor_weight": float(getattr(args, "stage3_answer_anchor_weight", 0.0)),
+        "stage3_answer_prefix_weight": float(getattr(args, "stage3_answer_prefix_weight", 0.0)),
         "stage3_mc_weight": float(getattr(args, "stage3_mc_weight", 0.0)),
         "stage3_pair_use_answer_correctness": int(getattr(args, "stage3_pair_use_answer_correctness", 0)),
         "stage3_wrong_image_enable": int(getattr(args, "stage3_wrong_image_enable", 0)),
@@ -276,14 +290,13 @@ def _validate_stage3_resume_config(resume_config: dict, args):
         "teacher_reasoning_max_tokens",
         "teacher_answer_max_tokens",
         "stage3_vic_include_context",
-        "bucket_batch_size",
-        "stage3_bucket_batch_size",
         "disable_bucket_for_stage3",
         "sub_set_num",
         "tau1",
         "tau_delta",
         "temperature",
         "max_new_tokens",
+        "stage3_eval_max_new_tokens",
         "stage3_train_projector",
         "stage3_field_weight_observed",
         "stage3_field_weight_context",
@@ -291,21 +304,27 @@ def _validate_stage3_resume_config(resume_config: dict, args):
         "stage3_field_weight_answer",
         "stage3_obj_weight",
         "stage3_reg_weight",
+        "stage3_readable_sft_weight",
         "stage3_answer_anchor_weight",
+        "stage3_answer_prefix_weight",
         "stage3_mc_weight",
         "stage3_pair_use_answer_correctness",
         "stage3_wrong_image_enable",
         "stage3_wrong_image_weight",
         "stage3_wrong_image_margin",
         "stage3_force_cold_start_period0",
-        "scienceqa_preprocessed_path",
         "remove_vq_codebook",
         "stage2_ckpt_path",
     ]
     if not int(getattr(args, "remove_vq_codebook", 0)):
         strict_keys.append("vq_codebook_path")
     for key in strict_keys:
-        if key in resume_config and resume_config[key] != current[key]:
+        if key not in resume_config:
+            raise RuntimeError(
+                f"Stage3 resume 配置缺少必需字段: key={key}。"
+                "请使用新规范重新启动 Stage3，不兼容旧 resume。"
+            )
+        if resume_config[key] != current[key]:
             raise RuntimeError(
                 f"Stage3 resume 配置不一致: key={key}, "
                 f"resume={resume_config[key]!r}, current={current[key]!r}"
@@ -317,7 +336,6 @@ def _validate_stage3_resume_config(resume_config: dict, args):
         "stage3_grad_clip",
         "stage3_grad_accum",
         "grad_accum",
-        "batch_size",
         "sub_stage_num",
         "period_num",
         "stage3_sample_cache_path",
@@ -979,6 +997,7 @@ def _build_vic_field_masks(
         "Answer:": answer_mask,
     }
     cursor = 0
+    field_lines = []
     for raw_line in str(vic_target).splitlines():
         line = raw_line.strip()
         if not line:
@@ -986,6 +1005,7 @@ def _build_vic_field_masks(
         prefix = next((p for p in field_to_mask if line.startswith(p)), None)
         if prefix is None:
             continue
+        field_lines.append((prefix, line))
         line_tokens = tokenizer.encode(line, add_special_tokens=False)
         start = _find_token_subsequence(generated_ids, line_tokens, cursor)
         if start < 0:
@@ -1002,6 +1022,50 @@ def _build_vic_field_masks(
         max=1.0,
     )
     other_mask = torch.clamp(torch.ones((old_len,), dtype=torch.float32) - union_mask, min=0.0, max=1.0)
+    missing = []
+    for name, mask in (
+        ("observed", observed_mask),
+        ("context", context_mask),
+        ("reasoning", reasoning_mask),
+        ("answer", answer_mask),
+    ):
+        if float(mask.sum().item()) <= 0.0:
+            missing.append(name)
+    if missing:
+        if len(field_lines) != 4:
+            raise RuntimeError(f"Stage3 y_vic 字段 mask 构建失败: missing={missing}, target={vic_target!r}")
+        observed_mask.zero_()
+        context_mask.zero_()
+        reasoning_mask.zero_()
+        answer_mask.zero_()
+        max_target_len = max(0, old_len - max(0, int(prompt_len) - 1))
+        for idx, (prefix, _line) in enumerate(field_lines):
+            prefix_text = "\n".join(line for _prefix, line in field_lines[:idx])
+            cur_text = "\n".join(line for _prefix, line in field_lines[:idx + 1])
+            start_rel = 0 if idx == 0 else len(tokenizer.encode(prefix_text, add_special_tokens=False))
+            end_rel = len(tokenizer.encode(cur_text, add_special_tokens=False))
+            start_rel = min(max(0, start_rel), max_target_len)
+            end_rel = min(max(start_rel + 1, end_rel), max_target_len)
+            base = max(0, int(prompt_len) - 1 + start_rel)
+            end = min(old_len, max(base + 1, int(prompt_len) - 1 + end_rel))
+            field_to_mask[prefix][base:end] = 1.0
+        union_mask = torch.clamp(
+            observed_mask + context_mask + reasoning_mask + answer_mask,
+            min=0.0,
+            max=1.0,
+        )
+        other_mask = torch.clamp(torch.ones((old_len,), dtype=torch.float32) - union_mask, min=0.0, max=1.0)
+        still_missing = [
+            name for name, mask in (
+                ("observed", observed_mask),
+                ("context", context_mask),
+                ("reasoning", reasoning_mask),
+                ("answer", answer_mask),
+            )
+            if float(mask.sum().item()) <= 0.0
+        ]
+        if still_missing:
+            raise RuntimeError(f"Stage3 y_vic 字段 mask 构建失败: missing={still_missing}, target={vic_target!r}")
     return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
 
 
@@ -1020,34 +1084,8 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
         instruction_text = _strip_image_tokens(instruction)
         _, _, vic_target, _ = train_dataset._build_targets(raw_item, instruction_text)
 
-        prompt_conv = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": instruction_text},
-                    {"type": "image"},
-                ],
-            }
-        ]
-        vic_conv = prompt_conv + [
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": vic_target},
-                ],
-            }
-        ]
-        vic_text = processor.apply_chat_template(vic_conv, add_generation_prompt=False)
-
-        vic_inputs = processor(
-            text=vic_text,
-            images=raw_item["image"],
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
-        )
-        y_vic_ids = vic_inputs["input_ids"].squeeze(0)
-        y_vic_mask = vic_inputs["attention_mask"].squeeze(0)
+        y_vic_ids = sample["full_input_ids"]
+        y_vic_mask = sample["full_attention_mask"]
 
         prompt_len = int(prompt_ids.shape[0])
         pixel_values = sample["pixel_values"]
@@ -1155,8 +1193,37 @@ def _resolve_stage3_eval_sample_cache_path(
     return f"{root}.eval_{eval_split}_{eval_name}_n{int(eval_train_num)}{ext}"
 
 
-def _load_stage3_sample_cache(cache_path: str) -> Optional[List[Stage3SampleCacheItem]]:
+def _sanitize_stage3_cache_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("_")
+
+
+def _stage3_expected_cache_model_name(args) -> str:
+    model_path = str(getattr(args, "model_path", "") or "").rstrip("/")
+    model_name = os.path.basename(model_path)
+    model_name = _sanitize_stage3_cache_name(model_name)
+    if model_name:
+        return model_name
+    return _sanitize_stage3_cache_name(getattr(args, "student_model_type", ""))
+
+
+def _stage3_sample_cache_name_matches_model(args, cache_path: str) -> bool:
+    expected = _stage3_expected_cache_model_name(args)
+    if not expected:
+        return True
+    cache_name = os.path.basename(str(cache_path or ""))
+    if expected in cache_name:
+        return True
+    print(
+        f"[Stage3][Cache] sample cache 文件名不匹配当前学生模型，将重建: "
+        f"path={cache_path}, expected_model_name={expected}"
+    )
+    return False
+
+
+def _load_stage3_sample_cache(cache_path: str, args=None) -> Optional[List[Stage3SampleCacheItem]]:
     if not cache_path or not os.path.exists(cache_path):
+        return None
+    if args is not None and not _stage3_sample_cache_name_matches_model(args, cache_path):
         return None
     payload = torch.load(cache_path, map_location="cpu")
 
@@ -1168,7 +1235,17 @@ def _load_stage3_sample_cache(cache_path: str) -> Optional[List[Stage3SampleCach
         raise RuntimeError(f"[Stage3][Cache] sample cache 格式无效: {cache_path}")
     if cache_items:
         probe = cache_items[0]
-        for field_name in ("prompt_ids", "prompt_mask", "answer_letter", "answer_idx", "num_choices"):
+        for field_name in (
+            "prompt_ids",
+            "prompt_mask",
+            "y_vic_ids",
+            "y_vic_mask",
+            "vic_observed_mask",
+            "vic_context_mask",
+            "vic_reasoning_mask",
+            "vic_answer_mask",
+            "vic_other_mask",
+        ):
             if not hasattr(probe, field_name):
                 raise RuntimeError(
                     f"[Stage3][Cache] sample cache 缺少字段 {field_name}: {cache_path}"
@@ -1224,6 +1301,7 @@ def _generate_candidate_single(
     do_sample: bool = True,
     temperature: Optional[float] = None,
     generator: Optional[torch.Generator] = None,
+    max_new_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = args.device
     prompt_ids = sample.prompt_ids.unsqueeze(0).to(device)
@@ -1240,7 +1318,7 @@ def _generate_candidate_single(
         image_sizes=image_sizes,
         image_grid_thw=image_grid_thw,
         do_sample=bool(do_sample),
-        max_new_tokens=int(args.max_new_tokens),
+        max_new_tokens=int(args.max_new_tokens if max_new_tokens is None else max_new_tokens),
         bad_words_ids=[[int(image_token_id)]] if image_token_id is not None else None,
         pad_token_id=int(pad_token_id),
     )
@@ -1256,7 +1334,16 @@ def _generate_candidate_single(
             torch.cuda.manual_seed_all(seed)
     try:
         with torch.no_grad():
-            generated = student_generate(model, args, **gen_kwargs)
+            if do_sample:
+                generated = student_generate(model, args, **gen_kwargs)
+            else:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r"`do_sample` is set to `False`.*",
+                        category=UserWarning,
+                    )
+                    generated = student_generate(model, args, **gen_kwargs)
     finally:
         if rng_state is not None:
             _restore_rng_state(rng_state)
@@ -1268,7 +1355,7 @@ def _generate_candidate_single(
         replacement_token_id=eos_or_pad,
     )
     generated = generated.squeeze(0).detach().cpu().long()
-    generated_mask = (generated != int(pad_token_id)).long()
+    generated_mask = torch.ones_like(generated, dtype=torch.long)
     return generated, generated_mask
 
 
@@ -1330,7 +1417,16 @@ def _generate_candidate_batch(
             torch.cuda.manual_seed_all(seed)
     try:
         with torch.no_grad():
-            generated = student_generate(model, args, **gen_kwargs)
+            if do_sample:
+                generated = student_generate(model, args, **gen_kwargs)
+            else:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r"`do_sample` is set to `False`.*",
+                        category=UserWarning,
+                    )
+                    generated = student_generate(model, args, **gen_kwargs)
     finally:
         if rng_state is not None:
             _restore_rng_state(rng_state)
@@ -1344,10 +1440,13 @@ def _generate_candidate_batch(
             allowed_count=allowed_img_counts[row_idx],
             replacement_token_id=eos_or_pad,
         ).squeeze(0).detach().cpu().long()
+        left_pad_len = int(prompt_ids.shape[1]) - int(samples[row_idx].prompt_len)
+        if left_pad_len > 0:
+            row = row[left_pad_len:]
         non_pad = (row != int(pad_token_id)).nonzero(as_tuple=False).view(-1)
         keep_len = int(non_pad[-1].item()) + 1 if non_pad.numel() > 0 else 1
         row = row[:keep_len]
-        row_mask = (row != int(pad_token_id)).long()
+        row_mask = torch.ones_like(row, dtype=torch.long)
         outputs.append((row, row_mask))
     return outputs
 
@@ -1365,6 +1464,26 @@ def _extract_answer_letter(text: str) -> Optional[str]:
         if m:
             return str(m.group(1)).upper()
     return None
+
+
+def _parse_readable_answer_field(text: str) -> Tuple[bool, str]:
+    prefixes = ["Observed Facts:", "Context:", "Reasoning:", "Answer:"]
+    positions = []
+    for prefix in prefixes:
+        pos = str(text or "").find(prefix)
+        if pos < 0:
+            return False, ""
+        positions.append(pos)
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        return False, ""
+    fields = []
+    for idx, prefix in enumerate(prefixes):
+        start = positions[idx] + len(prefix)
+        end = positions[idx + 1] if idx + 1 < len(prefixes) else len(str(text or ""))
+        fields.append(str(text or "")[start:end].strip())
+    if not all(fields):
+        return False, ""
+    return True, fields[-1]
 
 
 def _decode_generated_text_from_ids(
@@ -1495,6 +1614,12 @@ def _evaluate_stage3_answer_metrics(
 
     model = unwrap_model(model)
     eval_mode = str(args.stage3_eval_answer_mode).strip().lower()
+    local_eval_indices = list(eval_indices)
+    if is_distributed():
+        local_eval_indices = [
+            idx for pos, idx in enumerate(eval_indices)
+            if (pos % get_world_size()) == get_rank()
+        ]
     model.eval()
     use_cache_states = _set_model_use_cache(model, True)
     gc_states = _set_model_gradient_checkpointing(model, False)
@@ -1504,7 +1629,7 @@ def _evaluate_stage3_answer_metrics(
         acc_hits = 0
         if eval_mode == "logits" and choice_token_map is not None:
             batch_size = max(1, int(args.batch_size))
-            sorted_indices = sorted(eval_indices, key=lambda idx: _stage3_static_sort_key(sample_cache[idx]))
+            sorted_indices = sorted(local_eval_indices, key=lambda idx: _stage3_static_sort_key(sample_cache[idx]))
             for start in range(0, len(sorted_indices), batch_size):
                 batch_indices = sorted_indices[start:start + batch_size]
                 batch_samples = [sample_cache[idx] for idx in batch_indices]
@@ -1548,7 +1673,7 @@ def _evaluate_stage3_answer_metrics(
                     if pred_idx is not None and gold is not None and pred_idx == (ord(gold) - 65):
                         acc_hits += 1
         else:
-            for idx in eval_indices:
+            for idx in local_eval_indices:
                 sample = sample_cache[idx]
                 ids, _ = _generate_candidate_single(
                     model=model,
@@ -1557,14 +1682,23 @@ def _evaluate_stage3_answer_metrics(
                     image_token_id=image_token_id,
                     pad_token_id=pad_token_id,
                     do_sample=False,
+                    max_new_tokens=int(args.stage3_eval_max_new_tokens),
                 )
                 prompt_len = int(sample.prompt_len)
                 gen_ids = ids[prompt_len:] if ids.shape[0] > prompt_len else ids
                 text = tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True)
-                pred = _extract_answer_letter(text)
+                if eval_mode == "generate_readable":
+                    readable_ok, answer_text = _parse_readable_answer_field(text)
+                    pred = _extract_answer_letter(answer_text) if readable_ok else None
+                else:
+                    readable_ok = False
+                    pred = _extract_answer_letter(text)
                 gold = answer_lookup.get(int(idx))
                 total += 1
-                if pred is not None:
+                if eval_mode == "generate_readable":
+                    if readable_ok:
+                        fmt_hits += 1
+                elif pred is not None:
                     fmt_hits += 1
                 if pred is not None and gold is not None and pred == gold:
                     acc_hits += 1
@@ -1572,8 +1706,16 @@ def _evaluate_stage3_answer_metrics(
         _restore_model_gradient_checkpointing(gc_states)
         _restore_model_use_cache(use_cache_states)
 
-    denom = max(1, total)
-    return float(acc_hits) / denom, float(fmt_hits) / denom, int(total)
+    stats = torch.tensor(
+        [float(acc_hits), float(fmt_hits), float(total)],
+        device=args.device,
+        dtype=torch.float64,
+    )
+    if is_distributed():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    total_all = int(stats[2].item())
+    denom = max(1, total_all)
+    return float(stats[0].item()) / denom, float(stats[1].item()) / denom, total_all
 
 
 def _score_sequences_no_grad_batch(
@@ -2025,7 +2167,7 @@ def _build_pairs_and_next_states_distributed(
                 if prob12 > prob11:
                     local_stats["swap_count"] += 1
 
-                if bool(int(args.stage3_pair_use_answer_correctness)) and tokenizer is not None:
+                if _stage3_use_answer_correctness_pair(args) and tokenizer is not None:
                     gold_letter = str(getattr(sample, "answer_letter", "") or "").strip().upper()[:1]
                     if len(gold_letter) == 1 and "A" <= gold_letter <= "Z":
                         cand_scored = []
@@ -2416,7 +2558,7 @@ def _build_pairs_and_next_states(
                 if prob12 > prob11:
                     swap_count += 1
 
-                if bool(int(args.stage3_pair_use_answer_correctness)) and tokenizer is not None:
+                if _stage3_use_answer_correctness_pair(args) and tokenizer is not None:
                     gold_letter = str(getattr(sample, "answer_letter", "") or "").strip().upper()[:1]
                     if len(gold_letter) == 1 and "A" <= gold_letter <= "Z":
                         cand_scored = []
@@ -2544,8 +2686,10 @@ def _run_one_period_train(
     wrong_image_margin = float(args.stage3_wrong_image_margin)
     obj_weight = float(args.stage3_obj_weight)
     reg_weight = float(args.stage3_reg_weight)
+    readable_sft_weight = float(getattr(args, "stage3_readable_sft_weight", 1.0))
     answer_anchor_weight = float(args.stage3_answer_anchor_weight)
-    mc_weight = float(args.stage3_mc_weight)
+    answer_prefix_weight = float(args.stage3_answer_prefix_weight)
+    mc_weight = 0.0
     field_weights = {
         "observed": float(args.stage3_field_weight_observed),
         "context": float(args.stage3_field_weight_context),
@@ -2708,6 +2852,10 @@ def _run_one_period_train(
         )
 
         loss_reg, loss_reg_val = _stage3_masked_mean_ddp(delta_vic, weighted_mask_vic)
+        loss_readable_sft, loss_readable_sft_val = _stage3_masked_mean_ddp(
+            -cur_lp_vic,
+            weighted_mask_vic,
+        )
         field_loss_vals = {}
         for name, field_mask in field_masks.items():
             _, field_loss_val = _stage3_masked_mean_ddp(delta_vic, field_mask)
@@ -2717,6 +2865,11 @@ def _run_one_period_train(
         loss_answer_anchor, loss_answer_anchor_val = _stage3_masked_mean_ddp(
             -cur_lp_vic,
             answer_anchor_mask,
+        )
+        answer_prefix_mask = _stage3_prefix_mask_from_field_mask(answer_anchor_mask)
+        loss_answer_prefix, loss_answer_prefix_val = _stage3_masked_mean_ddp(
+            -cur_lp_vic,
+            answer_prefix_mask,
         )
 
         loss_wrong = torch.zeros((), device=args.device, dtype=loss_reg.dtype)
@@ -2750,7 +2903,13 @@ def _run_one_period_train(
                 wrong_delta = F.relu(cur_lp_wrong_vic - cur_lp_vic + wrong_image_margin)
                 loss_wrong, loss_wrong_val = _stage3_masked_mean_ddp(wrong_delta, wrong_mask)
 
-        loss_vic_total = reg_weight * loss_reg + answer_anchor_weight * loss_answer_anchor + wrong_image_weight * loss_wrong
+        loss_vic_total = (
+            readable_sft_weight * loss_readable_sft
+            + reg_weight * loss_reg
+            + answer_anchor_weight * loss_answer_anchor
+            + answer_prefix_weight * loss_answer_prefix
+            + wrong_image_weight * loss_wrong
+        )
         if _sync_skip(
             not torch.isfinite(loss_vic_total).item(),
             f"[Stage3][Warn] step={global_step} 检测到非有限 vic loss，所有 rank 同步跳过该 batch。",
@@ -2782,7 +2941,7 @@ def _run_one_period_train(
         else:
             with sync_ctx:
                 (loss_vic_total / grad_accum).backward()
-        del cur_lp_vic, cur_mask_vic, mask_vic, delta_vic, loss_reg, loss_answer_anchor, loss_vic_total
+        del cur_lp_vic, cur_mask_vic, mask_vic, delta_vic, loss_reg, loss_readable_sft, loss_answer_anchor, loss_answer_prefix, loss_vic_total
         if cur_lp_wrong_vic is not None and cur_mask_wrong_vic is not None:
             del cur_lp_wrong_vic, cur_mask_wrong_vic, wrong_mask, wrong_delta
 
@@ -2811,8 +2970,10 @@ def _run_one_period_train(
         loss_val = (
             mc_weight * mc_val
             + obj_weight * obj_val
+            + readable_sft_weight * loss_readable_sft_val
             + reg_weight * reg_val
             + answer_anchor_weight * answer_anchor_val
+            + answer_prefix_weight * loss_answer_prefix_val
             + wrong_image_weight * wrong_val
         )
 
@@ -2849,24 +3010,15 @@ def _run_one_period_train(
         if global_step % args.log_step == 0 and is_main_process():
             print(
                 f"Step {global_step}, Total: {loss_val:.4f}, "
-                f"L_mc: {mc_val:.4f}, MCAcc: {mc_acc_proxy:.4f}, "
                 f"L_obj: {obj_val:.4f}, L_reg: {reg_val:.4f}, "
                 f"L_ans_anchor: {answer_anchor_val:.4f}, L_wrong: {wrong_val:.4f}"
             )
             if tb_writer is not None:
                 tb_writer.add_scalar("stage3/total_loss", loss_val, global_step)
-                tb_writer.add_scalar("stage3/L_mc", mc_val, global_step)
-                tb_writer.add_scalar("stage3/L_mc_weighted", mc_weight * mc_val, global_step)
-                tb_writer.add_scalar("stage3/mc_acc_proxy", mc_acc_proxy, global_step)
                 tb_writer.add_scalar("stage3/L_obj", obj_val, global_step)
                 tb_writer.add_scalar("stage3/L_reg", reg_val, global_step)
-                tb_writer.add_scalar("stage3/L_obj_weighted", obj_weight * obj_val, global_step)
-                tb_writer.add_scalar("stage3/L_reg_weighted", reg_weight * reg_val, global_step)
                 tb_writer.add_scalar("stage3/L_answer_anchor", answer_anchor_val, global_step)
                 tb_writer.add_scalar("stage3/L_wrong_image", wrong_val, global_step)
-                tb_writer.add_scalar("stage3/L_reg_observed", field_loss_vals["observed"], global_step)
-                tb_writer.add_scalar("stage3/L_reg_context", field_loss_vals["context"], global_step)
-                tb_writer.add_scalar("stage3/L_reg_reasoning", field_loss_vals["reasoning"], global_step)
                 tb_writer.add_scalar("stage3/L_reg_answer", field_loss_vals["answer"], global_step)
 
     reduced_epoch = reduce_numeric_dict(
@@ -2940,15 +3092,17 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
             f"lr={stage3_lr}, train_projector={int(bool(args.stage3_train_projector))}, "
             f"resume_opt={int(bool(args.stage3_resume_save_optimizer))}, "
             f"eval_max_samples={int(args.stage3_eval_max_samples)}, "
+            f"eval_max_new_tokens={int(args.stage3_eval_max_new_tokens)}, "
             f"field_w=({float(args.stage3_field_weight_observed):.2f},"
             f"{float(args.stage3_field_weight_context):.2f},"
             f"{float(args.stage3_field_weight_reasoning):.2f},"
             f"{float(args.stage3_field_weight_answer):.2f}), "
-            f"mc_w={float(args.stage3_mc_weight):.2f}, "
             f"obj_w={float(args.stage3_obj_weight):.2f}, "
+            f"readable_sft_w={float(getattr(args, 'stage3_readable_sft_weight', 1.0)):.2f}, "
             f"reg_w={float(args.stage3_reg_weight):.2f}, "
             f"ans_anchor_w={float(args.stage3_answer_anchor_weight):.2f}, "
-            f"pair_by_answer={int(bool(args.stage3_pair_use_answer_correctness))}, "
+            f"ans_prefix_w={float(args.stage3_answer_prefix_weight):.2f}, "
+            f"pair_by_answer={int(_stage3_use_answer_correctness_pair(args))}, "
             f"wrong_image={int(bool(args.stage3_wrong_image_enable))}, "
             f"force_cold_start_p0={int(bool(args.stage3_force_cold_start_period0))}, "
             f"phaseA_batch_size={stage3_phase_a_batch_size}, static_bucket={int(stage3_use_static_bucket)}, "
@@ -2964,7 +3118,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
     optimizer = torch.optim.AdamW(trainable_params, lr=stage3_lr)
 
     stage3_sample_cache_path = _resolve_stage3_sample_cache_path(args)
-    sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path)
+    sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
     if sample_cache is None:
         if is_distributed():
             if is_main_process():
@@ -2972,7 +3126,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                 _save_stage3_sample_cache(stage3_sample_cache_path, sample_cache)
             barrier_if_distributed()
             if not is_main_process():
-                sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path)
+                sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
         else:
             sample_cache = _build_stage3_sample_cache(train_dataset)
             _save_stage3_sample_cache(stage3_sample_cache_path, sample_cache)
@@ -2982,7 +3136,6 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
     tokenizer = train_dataset.processor.tokenizer
     choice_token_map: Optional[Dict[int, List[int]]] = None
     answer_lookup: Dict[int, str] = {}
-    choice_token_map = _build_stage3_choice_token_map(tokenizer, max_choices=26)
     raw_samples = train_dataset.samples
     for idx, sample in enumerate(raw_samples):
         answer_letter = str(sample.get("answer_letter", "") or "").strip().upper()[:1]
@@ -3033,7 +3186,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
             stage3_vic_include_context=bool(int(args.stage3_vic_include_context)),
             require_teacher_annotation=False,
         )
-        eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path)
+        eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
         if eval_sample_cache is None:
             if is_distributed():
                 if is_main_process():
@@ -3041,7 +3194,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                     _save_stage3_sample_cache(stage3_eval_sample_cache_path, eval_sample_cache)
                 barrier_if_distributed()
                 if not is_main_process():
-                    eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path)
+                    eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
             else:
                 eval_sample_cache = _build_stage3_sample_cache(eval_dataset)
                 _save_stage3_sample_cache(stage3_eval_sample_cache_path, eval_sample_cache)
@@ -3226,16 +3379,10 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
             if is_main_process():
                 print(
                     f"[Stage3][S{sub_stage_idx+1}P{period_idx+1}] "
-                    f"loss={avg_total:.4f}, L_mc={avg_mc:.4f}, MCAcc={avg_mc_acc:.4f}, "
+                    f"loss={avg_total:.4f}, "
                     f"L_obj={avg_obj:.4f}, L_reg={avg_reg:.4f}, "
-                    f"L_mc_w={avg_mc_weighted:.4f}, "
-                    f"L_obj_w={avg_obj_weighted:.4f}, L_reg_w={avg_reg_weighted:.4f}, "
                     f"L_ans_anchor={avg_answer_anchor:.4f}, "
-                    f"L_ans_anchor_w={avg_answer_anchor_weighted:.4f}, "
-                    f"L_wrong={avg_wrong:.4f}, L_wrong_w={avg_wrong_weighted:.4f}, "
-                    f"L_obs={avg_field_losses['observed']:.4f}, "
-                    f"L_ctx={avg_field_losses['context']:.4f}, "
-                    f"L_reason={avg_field_losses['reasoning']:.4f}, "
+                    f"L_wrong={avg_wrong:.4f}, "
                     f"L_ans={avg_field_losses['answer']:.4f}, "
                     f"cold_start_ratio={cold_ratio:.4f}, swap_ratio={swap_ratio:.4f}, "
                     f"avg_lp_plus={avg_lp_plus:.4f}, avg_lp_minus={avg_lp_minus:.4f}, "
@@ -3243,28 +3390,15 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                 )
                 if tb_writer is not None:
                     tb_writer.add_scalar("stage3_epoch/total_loss", avg_total, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_mc", avg_mc, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_mc_weighted", avg_mc_weighted, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/mc_acc_proxy", avg_mc_acc, period_counter)
                     tb_writer.add_scalar("stage3_epoch/L_obj", avg_obj, period_counter)
                     tb_writer.add_scalar("stage3_epoch/L_reg", avg_reg, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_obj_weighted", avg_obj_weighted, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_reg_weighted", avg_reg_weighted, period_counter)
                     tb_writer.add_scalar("stage3_epoch/L_answer_anchor", avg_answer_anchor, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_answer_anchor_weighted", avg_answer_anchor_weighted, period_counter)
                     tb_writer.add_scalar("stage3_epoch/L_wrong_image", avg_wrong, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_wrong_image_weighted", avg_wrong_weighted, period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_reg_observed", avg_field_losses["observed"], period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_reg_context", avg_field_losses["context"], period_counter)
-                    tb_writer.add_scalar("stage3_epoch/L_reg_reasoning", avg_field_losses["reasoning"], period_counter)
                     tb_writer.add_scalar("stage3_epoch/L_reg_answer", avg_field_losses["answer"], period_counter)
                     tb_writer.add_scalar("stage3/cold_start_ratio", cold_ratio, period_counter)
                     tb_writer.add_scalar("stage3/swap_ratio", swap_ratio, period_counter)
                     tb_writer.add_scalar("stage3/avg_lp_plus", avg_lp_plus, period_counter)
                     tb_writer.add_scalar("stage3/avg_lp_minus", avg_lp_minus, period_counter)
-                    tb_writer.add_scalar("stage3/phase_a_seconds", phase_a_seconds, period_counter)
-                    tb_writer.add_scalar("stage3/period", period_idx + 1, period_counter)
-                    tb_writer.add_scalar("stage3/sub_stage", sub_stage_idx + 1, period_counter)
 
             if (
                 stage3_eval_max_samples > 0
@@ -3294,29 +3428,26 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                     eval_indices = sorted(rng_eval.sample(metrics_indices_pool, eval_k))
                 else:
                     eval_indices = list(metrics_indices_pool)
+                val_acc, val_fmt, val_n = _evaluate_stage3_answer_metrics(
+                    model=base_model,
+                    sample_cache=metrics_sample_cache,
+                    eval_indices=eval_indices,
+                    args=args,
+                    image_token_id=image_token_id,
+                    pad_token_id=pad_token_id,
+                    tokenizer=tokenizer,
+                    answer_lookup=metrics_answer_lookup,
+                    choice_token_map=choice_token_map,
+                )
                 if is_main_process():
-                    val_acc, val_fmt, val_n = _evaluate_stage3_answer_metrics(
-                        model=base_model,
-                        sample_cache=metrics_sample_cache,
-                        eval_indices=eval_indices,
-                        args=args,
-                        image_token_id=image_token_id,
-                        pad_token_id=pad_token_id,
-                        tokenizer=tokenizer,
-                        answer_lookup=metrics_answer_lookup,
-                        choice_token_map=choice_token_map,
-                    )
                     print(
                         f"[Stage3][Eval][S{sub_stage_idx+1}P{period_idx+1}] "
                         f"val_answer_acc={val_acc:.4f}, format_rate={val_fmt:.4f}, "
                         f"mode={stage3_eval_answer_mode}, n={val_n}"
                     )
                     if tb_writer is not None:
-                        tb_writer.add_scalar("stage3/val_answer_acc", val_acc, period_counter)
-                        tb_writer.add_scalar("stage3/format_rate", val_fmt, period_counter)
                         tb_writer.add_scalar("stage3_eval/val_answer_acc", val_acc, period_counter)
                         tb_writer.add_scalar("stage3_eval/format_rate", val_fmt, period_counter)
-                        tb_writer.add_scalar("stage3_eval/val_samples", float(val_n), period_counter)
                 if is_distributed():
                     barrier_if_distributed()
 

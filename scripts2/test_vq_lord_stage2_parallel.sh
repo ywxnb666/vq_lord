@@ -12,43 +12,72 @@ align_vq_setup_logging "test_vq_lord_stage2_parallel"
 
 # Evaluation
 EVAL_SPLIT="${EVAL_SPLIT:-validation}"
-EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-2017}"
-EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-128}"
-EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-logits}"
+EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-400}"
+# EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-2017}"
+EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
+EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate_readable}"
 USE_4BIT="${USE_4BIT:-0}"
 USE_VQ="${USE_VQ:-0}"
 VQ_CODEBOOK_SIZE="${VQ_CODEBOOK_SIZE:-1024}"
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-0}"
+
+# Stable conservative batching
+SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
+EVAL_BUCKET_BATCH_SIZE="${EVAL_BUCKET_BATCH_SIZE:-4}"
+PREPROCESS_SHUFFLE="${PREPROCESS_SHUFFLE:-1}"
 
 # Parallel
 NUM_SHARDS="${NUM_SHARDS:-4}"
 GPU_IDS="${GPU_IDS:-0 1 2 3}"
 
 # Paths
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process_parallel.py"
+PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
 STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch13}"
-SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_parallel_shards}"
-RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_parallel.json}"
+BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/scienceqa_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
+SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_shards}"
+RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_parallel.json}"
 
 align_vq_print_header "Stage2 产物并行评测"
 echo "ROOT_DIR: ${ROOT_DIR}"
 echo "MODEL_PATH: ${MODEL_PATH}"
 echo "DATASET_NAME: ${DATASET_NAME}"
 echo "DATASET_PATH: ${DATASET_PATH}"
+echo "PREPROCESS_ENTRY: ${PREPROCESS_ENTRY}"
 echo "EVAL_ENTRY: ${EVAL_ENTRY}"
 echo "STAGE2_CKPT_PATH: ${STAGE2_CKPT_PATH}"
+echo "BUCKET_PLAN_PATH: ${BUCKET_PLAN_PATH}"
 echo "NUM_SHARDS: ${NUM_SHARDS}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "EVAL_MAX_NEW_TOKENS: ${EVAL_MAX_NEW_TOKENS}"
+echo "EVAL_BUCKET_BATCH_SIZE: ${EVAL_BUCKET_BATCH_SIZE}"
 echo "SHARD_RESULT_DIR: ${SHARD_RESULT_DIR}"
 echo "RESULT_PATH: ${RESULT_PATH}"
 echo "LOG_FILE: ${LOG_FILE}"
 
+align_vq_require_file "${PREPROCESS_ENTRY}" "预处理分桶入口"
 align_vq_require_file "${EVAL_ENTRY}" "并行评测入口"
 align_vq_require_stage2_artifacts "${STAGE2_CKPT_PATH}"
 align_vq_assert_dataset_path
 
-mkdir -p "${SHARD_RESULT_DIR}" "$(dirname "${RESULT_PATH}")"
+mkdir -p "${PREPROCESS_DIR}" "${SHARD_RESULT_DIR}" "$(dirname "${RESULT_PATH}")"
+
+if [ ! -f "${BUCKET_PLAN_PATH}" ]; then
+    echo "[Info] 未找到 eval split 分桶文件，开始生成: ${BUCKET_PLAN_PATH}"
+    "${PYTHON_BIN}" "${PREPROCESS_ENTRY}" \
+        --dataset-path="${DATASET_PATH}" \
+        --model-path="${MODEL_PATH}" \
+        --split="${EVAL_SPLIT}" \
+        --train-num="${EVAL_MAX_SAMPLES}" \
+        --seed="${SCIENCEQA_SEED}" \
+        --bucket-by="patches" \
+        --bucket-batch-size="${EVAL_BUCKET_BATCH_SIZE}" \
+        --bucket-drop-last="0" \
+        --shuffle="${PREPROCESS_SHUFFLE}" \
+        --save-json="${BUCKET_PLAN_PATH}"
+fi
+
+align_vq_require_file "${BUCKET_PLAN_PATH}" "评测分桶文件"
 
 read -r -a GPU_ID_ARR <<< "${GPU_IDS}"
 if [ "${#GPU_ID_ARR[@]}" -lt "${NUM_SHARDS}" ]; then
@@ -83,6 +112,7 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
             --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
             --vq_codebook_path="${STAGE2_CKPT_PATH}/vq_codebook.pt" \
             --answer_mode="${EVAL_ANSWER_MODE}" \
+            --bucket_plan_path="${BUCKET_PLAN_PATH}" \
             --num_shards="${NUM_SHARDS}" \
             --shard_id="${shard_id}" \
             --save_path="${shard_result_path}"
@@ -122,6 +152,7 @@ fi
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --vq_codebook_path="${STAGE2_CKPT_PATH}/vq_codebook.pt" \
     --answer_mode="${EVAL_ANSWER_MODE}" \
+    --bucket_plan_path="${BUCKET_PLAN_PATH}" \
     --num_shards="${NUM_SHARDS}" \
     --shard_result_dir="${SHARD_RESULT_DIR}" \
     --merge_only=1 \
@@ -134,5 +165,6 @@ align_vq_print_header "Stage2 产物并行评测完成"
 echo "ACCURACY=${ACCURACY}"
 echo "FORMAT_RATE=${FORMAT_RATE}"
 echo "N=${N}"
+echo "Bucket 文件: ${BUCKET_PLAN_PATH}"
 echo "Shard 目录: ${SHARD_RESULT_DIR}"
 echo "结果文件: ${RESULT_PATH}"

@@ -31,7 +31,7 @@ import torch
 import argparse
 from collections import defaultdict
 from typing import Optional, List, Dict, Tuple, Set
-from pprint import pprint
+# from pprint import pprint
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import torch.distributed as dist
@@ -283,8 +283,7 @@ def build_scienceqa_samples(
         lecture = item.get("lecture", "")
         solution = item.get("solution", "")
 
-        hint_block = f"Hint: {hint}\n" if hint else ""
-        instruction = f"<image>\nQuestion: {question}\n{hint_block}Options:\n{choices_text}Answer:"
+        instruction = "<image>\n" + build_readable_instruction(question, choices, hint)
         if lecture:
             response = f"Explanation: {lecture}\nSolution: {solution}"
         else:
@@ -396,6 +395,26 @@ TEACHER_REQUIRED_FIELDS = (
     "answer",
 )
 
+READABLE_FIELD_PREFIXES = (
+    "Observed Facts:",
+    "Context:",
+    "Reasoning:",
+    "Answer:",
+)
+FINAL_ANSWER_CUE_RE = re.compile(
+    r"(?is)"
+    r"(?:^|[\n。.!?]\s*)"
+    r"(?:therefore|thus|so|hence|overall|in conclusion|最终|因此|所以|综上)[^。\n.!?]*"
+    r"(?:answer|答案|correct answer|正确答案|option\s*\(?[A-Z]\)?|选项\s*[A-Z])"
+    r"[^。\n.!?]*(?:[。.!?]|$)"
+)
+ANSWER_CUE_RE = re.compile(
+    r"(?is)"
+    r"(?:^|[\n。.!?]\s*)"
+    r"[^。\n.!?]*(?:the\s+answer\s+is|answer\s*:|答案是|答案为|correct\s+answer\s+is|正确答案是)"
+    r"[^。\n.!?]*(?:[。.!?]|$)"
+)
+
 
 def _strip_image_tokens(text: str) -> str:
     if not isinstance(text, str):
@@ -404,6 +423,59 @@ def _strip_image_tokens(text: str) -> str:
     text = text.replace("< image >", "")
     text = text.replace("<Image>", "")
     return text.strip()
+
+
+def _normalize_reasoning_without_final_answer(text: str) -> str:
+    reasoning = _strip_image_tokens(text)
+    if not reasoning:
+        return reasoning
+    reasoning = FINAL_ANSWER_CUE_RE.sub(" ", reasoning)
+    reasoning = ANSWER_CUE_RE.sub(" ", reasoning)
+    return re.sub(r"\s+", " ", reasoning).strip()
+
+
+def build_readable_instruction(question: str, choices: List[str], hint: str = "") -> str:
+    choices_text = ""
+    for idx, choice in enumerate(choices or []):
+        choices_text += f"({chr(65 + idx)}) {choice}\n"
+    hint_block = f"Hint: {hint}\n" if hint else ""
+    return (
+        f"Question: {question}\n"
+        f"{hint_block}"
+        "Options:\n"
+        f"{choices_text}"
+        "\n"
+        "Generate exactly four fields in this order:\n"
+        "Observed Facts: describe only image-observable evidence.\n"
+        "Context: restate relevant textual conditions from question, hint, and options.\n"
+        "Reasoning: compare options briefly, but do not state the final answer here.\n"
+        "Answer: give only the final option and answer, for example '(A) answer text'."
+    )
+
+
+def _build_readable_target_from_annotation(ann: dict) -> str:
+    if not isinstance(ann, dict):
+        raise RuntimeError("teacher_annotation 必须是 dict，无法构造四字段目标。")
+
+    values = {}
+    for field in TEACHER_REQUIRED_FIELDS:
+        value = ann.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"teacher_annotation.{field} 缺失或为空，无法构造四字段目标。")
+        values[field] = _strip_image_tokens(value)
+
+    target = "\n".join(
+        [
+            f"Observed Facts: {values['observed_facts_visual']}",
+            f"Context: {values['context_textual']}",
+            f"Reasoning: {_normalize_reasoning_without_final_answer(values['reasoning'])}",
+            f"Answer: {values['answer']}",
+        ]
+    )
+    for prefix in READABLE_FIELD_PREFIXES:
+        if prefix not in target:
+            raise RuntimeError(f"四字段目标缺少固定前缀: {prefix}")
+    return target
 
 
 def _normalize_choice_text_for_match(text: str) -> str:
@@ -472,8 +544,15 @@ def _resolve_teacher_answer_idx(sample: dict) -> int:
 
 def _apply_teacher_answer_labels(samples: List[dict]) -> None:
     for sample in samples:
-        answer_idx = _resolve_teacher_answer_idx(sample)
         choices = sample["choices"]
+        try:
+            answer_idx = _resolve_teacher_answer_idx(sample)
+        except RuntimeError as exc:
+            sample["answer_idx"] = -1
+            sample["answer_letter"] = ""
+            sample["answer_text"] = ""
+            sample["answer_parse_error"] = str(exc)
+            continue
         sample["answer_idx"] = int(answer_idx)
         sample["answer_letter"] = chr(ord("A") + int(answer_idx))
         sample["answer_text"] = str(choices[int(answer_idx)])
@@ -742,9 +821,9 @@ class ScienceQADataset(torch.utils.data.Dataset):
         samples: Optional[List[dict]] = None,
         seed: int = 20240306,
         teacher_lang: str = "zh",
-        teacher_observed_max_tokens: int = 256,
-        teacher_context_max_tokens: int = 192,
-        teacher_reasoning_max_tokens: int = 256,
+        teacher_observed_max_tokens: int = 192,
+        teacher_context_max_tokens: int = 160,
+        teacher_reasoning_max_tokens: int = 96,
         teacher_answer_max_tokens: int = 64,
         stage3_vic_include_context: bool = False,
         require_teacher_annotation: bool = False,
@@ -813,21 +892,6 @@ class ScienceQADataset(torch.utils.data.Dataset):
         return answer_target, False
 
     def _build_targets(self, item: dict, instruction_text: str) -> tuple[str, str, str, bool]:
-        answer_letter = item.get("answer_letter")
-        if not isinstance(answer_letter, str) or len(answer_letter.strip()) == 0:
-            raise RuntimeError(
-                f"样本缺失 answer_letter，无法构造选择题训练目标。sample_id={item.get('sample_id')}, "
-                f"source_index={item.get('source_index')}"
-            )
-        answer_letter = answer_letter.strip().upper()[0]
-        if answer_letter < "A" or answer_letter > "Z":
-            raise RuntimeError(
-                f"样本 answer_letter 非法，无法构造选择题训练目标。sample_id={item.get('sample_id')}, "
-                f"source_index={item.get('source_index')}, answer_letter={answer_letter!r}"
-            )
-
-        # 固定答案锚点，确保 Stage2/Stage3 指标口径一致。
-        answer_target = f"Answer: {answer_letter}"
         ann = item.get("teacher_annotation")
         if not isinstance(ann, dict):
             if self.require_teacher_annotation:
@@ -836,13 +900,18 @@ class ScienceQADataset(torch.utils.data.Dataset):
                     f"sample_id={sample_id} 缺失 teacher_annotation(v2)。"
                     "Stage2/3 训练要求四字段教师标注全覆盖。"
                 )
-            rationale_target = answer_target
-            rationale_target, has_rationale = self._clip_target_by_budget(
-                instruction_text=instruction_text,
-                target_text=rationale_target,
-                answer_target=answer_target,
+            answer_letter = str(item.get("answer_letter") or "").strip().upper()[:1]
+            if len(answer_letter) == 1 and "A" <= answer_letter <= "Z":
+                fallback_target = (
+                    "Observed Facts: unavailable\n"
+                    "Context: unavailable\n"
+                    "Reasoning: unavailable\n"
+                    f"Answer: {answer_letter}"
+                )
+                return fallback_target, fallback_target, fallback_target, True
+            raise RuntimeError(
+                f"sample_id={item.get('sample_id')} 缺失 teacher_annotation，且没有可用答案兜底。"
             )
-            return answer_target, rationale_target, rationale_target, has_rationale
 
         observed = self._truncate_field_with_tokenizer(
             ann.get("observed_facts_visual", ""),
@@ -853,7 +922,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
             self.teacher_context_max_tokens,
         )
         reasoning = self._truncate_field_with_tokenizer(
-            ann.get("reasoning", ""),
+            _normalize_reasoning_without_final_answer(ann.get("reasoning", "")),
             self.teacher_reasoning_max_tokens,
         )
         answer_field = self._truncate_field_with_tokenizer(
@@ -864,31 +933,110 @@ class ScienceQADataset(torch.utils.data.Dataset):
         if not observed or not context or not reasoning or not answer_field:
             raise RuntimeError("teacher_annotation 四字段存在空值，无法构造训练目标。")
 
-        rationale_lines = [
+        readable_lines = [
             f"Observed Facts: {observed}",
+            f"Context: {context}",
             f"Reasoning: {reasoning}",
-            answer_target,
+            f"Answer: {answer_field}",
         ]
-        rationale_target = "\n".join(rationale_lines)
-        rationale_target, has_rationale = self._clip_target_by_budget(
-            instruction_text=instruction_text,
-            target_text=rationale_target,
-            answer_target=answer_target,
-        )
+        readable_target = "\n".join(readable_lines)
+        for prefix in READABLE_FIELD_PREFIXES:
+            if prefix not in readable_target:
+                raise RuntimeError(f"四字段目标缺少固定前缀: {prefix}")
+        return readable_target, readable_target, readable_target, True
 
-        vic_lines = [f"Observed Facts: {observed}"]
-        if self.stage3_vic_include_context:
-            vic_lines.append(f"Context: {context}")
-        vic_lines.append(f"Reasoning: {reasoning}")
-        vic_lines.append(answer_target)
-        vic_target = "\n".join(vic_lines)
-        vic_target, _ = self._clip_target_by_budget(
-            instruction_text=instruction_text,
-            target_text=vic_target,
-            answer_target=answer_target,
-        )
-
-        return answer_target, rationale_target, vic_target, has_rationale
+    def _build_label_field_masks(
+        self,
+        full_input_ids: torch.Tensor,
+        prompt_len: int,
+        target_text: str,
+    ) -> Dict[str, torch.Tensor]:
+        seq_len = int(full_input_ids.shape[0])
+        masks = {
+            "observed": torch.zeros((seq_len,), dtype=torch.float32),
+            "context": torch.zeros((seq_len,), dtype=torch.float32),
+            "reasoning": torch.zeros((seq_len,), dtype=torch.float32),
+            "answer": torch.zeros((seq_len,), dtype=torch.float32),
+            "answer_prefix": torch.zeros((seq_len,), dtype=torch.float32),
+        }
+        generated_ids = full_input_ids[int(prompt_len):].tolist()
+        cursor = 0
+        prefix_to_name = {
+            "Observed Facts:": "observed",
+            "Context:": "context",
+            "Reasoning:": "reasoning",
+            "Answer:": "answer",
+        }
+        matched_all = True
+        for raw_line in str(target_text).splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            prefix = next((p for p in prefix_to_name if line.startswith(p)), None)
+            if prefix is None:
+                continue
+            line_tokens = self.processor.tokenizer.encode(line, add_special_tokens=False)
+            if not line_tokens:
+                continue
+            start = -1
+            max_start = len(generated_ids) - len(line_tokens)
+            for pos in range(max(0, cursor), max_start + 1):
+                if generated_ids[pos:pos + len(line_tokens)] == line_tokens:
+                    start = pos
+                    break
+            if start < 0:
+                matched_all = False
+                break
+            abs_start = int(prompt_len) + start
+            abs_end = min(seq_len, abs_start + len(line_tokens))
+            masks[prefix_to_name[prefix]][abs_start:abs_end] = 1.0
+            if prefix == "Answer:":
+                prefix_tokens = self.processor.tokenizer.encode(prefix, add_special_tokens=False)
+                prefix_end = min(abs_end, abs_start + len(prefix_tokens))
+                masks["answer_prefix"][abs_start:prefix_end] = 1.0
+            cursor = start + len(line_tokens)
+        if not matched_all or any(float(mask.sum().item()) <= 0.0 for mask in masks.values()):
+            # Chat templates can merge the first target token with assistant markers or
+            # newline context, so exact line-token subsequence matching is not reliable.
+            # Fall back to deterministic field spans from cumulative target-only tokens.
+            masks = {
+                "observed": torch.zeros((seq_len,), dtype=torch.float32),
+                "context": torch.zeros((seq_len,), dtype=torch.float32),
+                "reasoning": torch.zeros((seq_len,), dtype=torch.float32),
+                "answer": torch.zeros((seq_len,), dtype=torch.float32),
+                "answer_prefix": torch.zeros((seq_len,), dtype=torch.float32),
+            }
+            field_lines = []
+            for raw_line in str(target_text).splitlines():
+                line = raw_line.strip()
+                prefix = next((p for p in prefix_to_name if line.startswith(p)), None)
+                if prefix is not None:
+                    field_lines.append((prefix_to_name[prefix], line))
+            if len(field_lines) != 4:
+                raise RuntimeError(f"字段 mask 构建失败，四字段行数量异常: {len(field_lines)}")
+            prev_len = 0
+            max_target_len = max(0, seq_len - int(prompt_len))
+            for idx, (name, _line) in enumerate(field_lines):
+                prefix_text = "\n".join(line for _name, line in field_lines[:idx])
+                cur_text = "\n".join(line for _name, line in field_lines[:idx + 1])
+                start_rel = 0 if idx == 0 else len(
+                    self.processor.tokenizer.encode(prefix_text, add_special_tokens=False)
+                )
+                end_rel = len(self.processor.tokenizer.encode(cur_text, add_special_tokens=False))
+                start_rel = min(max(0, start_rel), max_target_len)
+                end_rel = min(max(start_rel + 1, end_rel), max_target_len)
+                if end_rel > start_rel:
+                    masks[name][int(prompt_len) + start_rel:int(prompt_len) + end_rel] = 1.0
+                    if name == "answer":
+                        prefix_len = len(self.processor.tokenizer.encode("Answer:", add_special_tokens=False))
+                        prefix_end_rel = min(end_rel, start_rel + prefix_len)
+                        masks["answer_prefix"][
+                            int(prompt_len) + start_rel:int(prompt_len) + prefix_end_rel
+                        ] = 1.0
+        for name, mask in masks.items():
+            if float(mask.sum().item()) <= 0.0:
+                raise RuntimeError(f"字段 mask 构建失败，字段为空或无法定位: {name}")
+        return masks
 
     def __getitem__(self, idx):
         item = self.samples[idx]
@@ -897,7 +1045,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
 
         instruction = item.get("instruction", "")
         instruction_text = instruction.replace("<image>", "").replace("< image >", "").replace("<Image>", "").strip()
-        answer_target, rationale_target, _, has_rationale = self._build_targets(item, instruction_text)
+        _, readable_target, _, _ = self._build_targets(item, instruction_text)
 
         prompt_inputs = encode_multimodal(
             self.processor,
@@ -912,15 +1060,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
             self.student_model_type,
             instruction_text=instruction_text,
             image=image,
-            target_text=rationale_target,
-            add_generation_prompt=False,
-        )
-        answer_inputs = encode_multimodal(
-            self.processor,
-            self.student_model_type,
-            instruction_text=instruction_text,
-            image=image,
-            target_text=answer_target,
+            target_text=readable_target,
             add_generation_prompt=False,
         )
 
@@ -928,52 +1068,47 @@ class ScienceQADataset(torch.utils.data.Dataset):
         pad_id = self.processor.tokenizer.pad_token_id
 
         full_labels = full_inputs["input_ids"].squeeze(0).clone()
-        answer_labels = answer_inputs["input_ids"].squeeze(0).clone()
 
         prompt_len = prompt_inputs["input_ids"].shape[1]
-        prompt_len = min(prompt_len, full_labels.shape[0], answer_labels.shape[0])
+        prompt_len = min(prompt_len, full_labels.shape[0])
 
         full_labels[:prompt_len] = -100
-        answer_labels[:prompt_len] = -100
 
         full_labels = full_labels.masked_fill(full_labels == pad_id, -100)
-        answer_labels = answer_labels.masked_fill(answer_labels == pad_id, -100)
+        field_masks = self._build_label_field_masks(
+            full_inputs["input_ids"].squeeze(0),
+            prompt_len,
+            readable_target,
+        )
         answer_letter = str(item.get("answer_letter") or "").strip().upper()[:1]
-        if len(answer_letter) != 1 or answer_letter < "A" or answer_letter > "Z":
-            raise RuntimeError(
-                f"样本 answer_letter 非法，无法构造训练 batch。sample_id={item.get('sample_id')}, "
-                f"source_index={item.get('source_index')}, answer_letter={item.get('answer_letter')!r}"
-            )
         try:
             answer_idx = int(item["answer_idx"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"样本 answer_idx 非法，无法构造训练 batch。sample_id={item.get('sample_id')}, "
-                f"source_index={item.get('source_index')}, answer_idx={item.get('answer_idx')!r}"
-            ) from exc
+            answer_idx = -1
 
         sample = {
             # 兼容 Stage3/旧逻辑
             "input_ids": full_inputs["input_ids"].squeeze(0),
             "attention_mask": full_inputs["attention_mask"].squeeze(0),
             "labels": full_labels,
-            # Stage2 双监督
+            # Stage2/3 四字段生成监督
             "prompt_input_ids": prompt_inputs["input_ids"].squeeze(0),
             "prompt_attention_mask": prompt_inputs["attention_mask"].squeeze(0),
             "full_input_ids": full_inputs["input_ids"].squeeze(0),
             "full_attention_mask": full_inputs["attention_mask"].squeeze(0),
             "full_labels": full_labels,
-            "answer_input_ids": answer_inputs["input_ids"].squeeze(0),
-            "answer_attention_mask": answer_inputs["attention_mask"].squeeze(0),
-            "answer_labels": answer_labels,
+            "field_mask_observed": field_masks["observed"],
+            "field_mask_context": field_masks["context"],
+            "field_mask_reasoning": field_masks["reasoning"],
+            "field_mask_answer": field_masks["answer"],
+            "field_mask_answer_prefix": field_masks["answer_prefix"],
             "pixel_values": full_inputs["pixel_values"].squeeze(0),
             "image_sizes": image_sizes,
-            "has_rationale": int(has_rationale),
             "answer_idx": answer_idx,
             "answer_letter": answer_letter,
             "data_type": "scienceqa",
         }
-        for prefix, inputs in (("prompt", prompt_inputs), ("full", full_inputs), ("answer", answer_inputs)):
+        for prefix, inputs in (("prompt", prompt_inputs), ("full", full_inputs)):
             if "image_grid_thw" in inputs:
                 sample[f"{prefix}_image_grid_thw"] = inputs["image_grid_thw"].squeeze(0)
         if "image_grid_thw" in full_inputs:
@@ -1676,6 +1811,16 @@ def setup_args():
                        help="Stage2 答案监督权重")
     parser.add_argument("--stage2_rationale_weight", type=float, default=0.3,
                        help="Stage2 解释监督权重")
+    parser.add_argument("--stage2_field_weight_observed", type=float, default=1.0,
+                       help="Stage2 四字段 Observed Facts token 权重")
+    parser.add_argument("--stage2_field_weight_context", type=float, default=1.0,
+                       help="Stage2 四字段 Context token 权重")
+    parser.add_argument("--stage2_field_weight_reasoning", type=float, default=0.5,
+                       help="Stage2 四字段 Reasoning token 权重")
+    parser.add_argument("--stage2_field_weight_answer", type=float, default=6.0,
+                       help="Stage2 四字段 Answer token 权重")
+    parser.add_argument("--stage2_answer_prefix_weight", type=float, default=12.0,
+                       help="Stage2 Answer: 字段名前缀 token 权重")
     parser.add_argument("--stage2_prepost_lr_scale", type=float, default=0.5,
                        help="Stage2 pre/post quant 学习率缩放")
     parser.add_argument("--stage2_vision_lr_scale", type=float, default=0.2,
@@ -1700,32 +1845,38 @@ def setup_args():
                        help="Stage3 每个 period 评估样本数；<=0 关闭 period 评估")
     parser.add_argument("--stage3_eval_every_period", type=int, default=1,
                        help="Stage3 每隔多少个 period 做一次评估")
+    parser.add_argument("--stage3_eval_max_new_tokens", type=int, default=512,
+                       help="Stage3 内置 generate_readable 评估最大生成 token 数")
     parser.add_argument("--stage3_eval_scienceqa_split", type=str, default="validation",
                        help="Stage3 独立评估使用的 ScienceQA split（默认 validation）")
     parser.add_argument("--stage3_eval_scienceqa_path", type=str, default="",
                        help="Stage3 独立评估使用的数据集路径（为空则复用 scienceqa_path）")
     parser.add_argument("--stage3_eval_train_num", type=int, default=0,
                        help="Stage3 独立评估样本数上限（0=该 split 全量）")
-    parser.add_argument("--stage3_eval_answer_mode", type=str, default="logits",
-                       choices=["generate", "logits"],
-                       help="Stage3 内置评估口径：generate 或 logits；准确率优先时建议 logits")
+    parser.add_argument("--stage3_eval_answer_mode", type=str, default="generate_readable",
+                       choices=["generate", "logits", "generate_readable"],
+                       help="Stage3 内置评估口径：generate_readable 为四字段生成主评测")
     parser.add_argument("--stage3_field_weight_observed", type=float, default=1.0,
                        help="Stage3 教师正则中 observed_facts_visual 的 token 权重")
     parser.add_argument("--stage3_field_weight_context", type=float, default=1.0,
                        help="Stage3 教师正则中 context_textual 的 token 权重")
-    parser.add_argument("--stage3_field_weight_reasoning", type=float, default=1.0,
+    parser.add_argument("--stage3_field_weight_reasoning", type=float, default=1.2,
                        help="Stage3 教师正则中 reasoning 的 token 权重")
-    parser.add_argument("--stage3_field_weight_answer", type=float, default=1.0,
+    parser.add_argument("--stage3_field_weight_answer", type=float, default=2.0,
                        help="Stage3 教师正则中 answer 的 token 权重")
-    parser.add_argument("--stage3_obj_weight", type=float, default=1.0,
+    parser.add_argument("--stage3_obj_weight", type=float, default=0.1,
                        help="Stage3 偏好目标 L_obj 的总权重")
-    parser.add_argument("--stage3_reg_weight", type=float, default=1.0,
+    parser.add_argument("--stage3_reg_weight", type=float, default=0.3,
                        help="Stage3 教师正则 L_reg 的总权重")
+    parser.add_argument("--stage3_readable_sft_weight", type=float, default=1.0,
+                       help="Stage3 y_vic 四字段显式 SFT anchor 权重")
     parser.add_argument("--stage3_answer_anchor_weight", type=float, default=1.0,
                        help="Stage3 answer token 直接锚定损失权重（基于 y_vic 的 Answer: X token NLL）")
-    parser.add_argument("--stage3_mc_weight", type=float, default=1.0,
+    parser.add_argument("--stage3_answer_prefix_weight", type=float, default=1.0,
+                       help="Stage3 Answer 字段开头 token 直接 SFT 监督权重")
+    parser.add_argument("--stage3_mc_weight", type=float, default=0.0,
                        help="Stage3 选择题主损失权重（基于 Answer: 后下一 token logits 的多选 CE）")
-    parser.add_argument("--stage3_pair_use_answer_correctness", type=int, default=1,
+    parser.add_argument("--stage3_pair_use_answer_correctness", type=int, default=0,
                        help="Stage3 Phase-A 是否优先按答案正确性选择 y+/y-，1=启用，0=关闭")
     parser.add_argument("--stage3_wrong_image_enable", type=int, default=0,
                        help="Stage3 是否启用错图负样本约束，默认关闭")
@@ -1775,11 +1926,11 @@ def setup_args():
                        help="兼容旧脚本参数（已废弃，无实际作用；vq_lord3 固定强门禁）")
     parser.add_argument("--teacher_lang", type=str, default="zh", choices=["zh", "en"],
                        help="教师回答统一语言：zh 或 en")
-    parser.add_argument("--teacher_observed_max_tokens", type=int, default=256,
+    parser.add_argument("--teacher_observed_max_tokens", type=int, default=192,
                        help="教师字段 observed_facts_visual 的最大 token 预算")
-    parser.add_argument("--teacher_context_max_tokens", type=int, default=192,
+    parser.add_argument("--teacher_context_max_tokens", type=int, default=160,
                        help="教师字段 context_textual 的最大 token 预算")
-    parser.add_argument("--teacher_reasoning_max_tokens", type=int, default=256,
+    parser.add_argument("--teacher_reasoning_max_tokens", type=int, default=96,
                        help="教师字段 reasoning 的最大 token 预算")
     parser.add_argument("--teacher_answer_max_tokens", type=int, default=64,
                        help="教师字段 answer 的最大 token 预算")
@@ -1992,11 +2143,15 @@ def save_stage2_checkpoint(model, args, ckpt_path: str):
         "freeze_vision_tower": args.freeze_vision_tower,
         "beta": args.beta,
         "stage": 2,
-        "stage2_answer_weight": float(args.stage2_answer_weight),
-        "stage2_rationale_weight": float(args.stage2_rationale_weight),
+        "stage2_objective": "readable_four_field_generate",
+        "stage2_field_weight_observed": float(getattr(args, "stage2_field_weight_observed", 1.0)),
+        "stage2_field_weight_context": float(getattr(args, "stage2_field_weight_context", 1.0)),
+        "stage2_field_weight_reasoning": float(getattr(args, "stage2_field_weight_reasoning", 0.5)),
+        "stage2_field_weight_answer": float(getattr(args, "stage2_field_weight_answer", 6.0)),
+        "stage2_answer_prefix_weight": float(getattr(args, "stage2_answer_prefix_weight", 12.0)),
         "stage2_train_lora": 1,
         "stage2_train_codebook": 0,
-        "stage2_answer_format": "letter",
+        "stage2_answer_format": "teacher_annotation.answer",
         "projector_state_path": "projector.pt",
         "projector_state_param_count": int(projector_param_count),
     }
@@ -2043,8 +2198,12 @@ def load_stage2_checkpoint(model, ckpt_path: str, remove_vq_codebook: bool = Fal
             stage2_cfg = json.load(f)
         print(
             f"已读取 Stage2 配置: stage={stage2_cfg.get('stage')}, "
-            f"answer_w={stage2_cfg.get('stage2_answer_weight')}, "
-            f"rationale_w={stage2_cfg.get('stage2_rationale_weight')}"
+            f"objective={stage2_cfg.get('stage2_objective')}, "
+            f"field_w=({stage2_cfg.get('stage2_field_weight_observed')}, "
+            f"{stage2_cfg.get('stage2_field_weight_context')}, "
+            f"{stage2_cfg.get('stage2_field_weight_reasoning')}, "
+            f"{stage2_cfg.get('stage2_field_weight_answer')}), "
+            f"answer_prefix_w={stage2_cfg.get('stage2_answer_prefix_weight')}"
         )
     else:
         print(f"[Warn] 未找到 stage2_config.json: {ckpt_path}")
@@ -2092,7 +2251,11 @@ def wrap_model_for_ddp(model, args, find_unused_parameters: bool = False):
 
 
 def wrap_model_for_stage2_ddp(model, args):
-    return wrap_model_for_ddp(model, args, find_unused_parameters=False)
+    return wrap_model_for_ddp(
+        model,
+        args,
+        find_unused_parameters=(str(getattr(args, "student_model_type", LLAVA_NEXT)) == LLAVA_NEXT),
+    )
 
 
 def wrap_model_for_stage3_ddp(model, args):
@@ -2171,7 +2334,7 @@ def main():
             print("=" * 60)
             print("VQ-LoRD 训练")
             print("=" * 60)
-            pprint(vars(args))
+            # pprint(vars(args))
             print("=" * 60)
             if args.remove_vq_codebook:
                 print("[Info] remove_vq_codebook=1，使用学生模型原生视觉链路并跳过 Stage1。")
@@ -2308,9 +2471,11 @@ def main():
                 "full_input_ids": pad_token_id,
                 "full_attention_mask": 0,
                 "full_labels": -100,
-                "answer_input_ids": pad_token_id,
-                "answer_attention_mask": 0,
-                "answer_labels": -100,
+                "field_mask_observed": 0.0,
+                "field_mask_context": 0.0,
+                "field_mask_reasoning": 0.0,
+                "field_mask_answer": 0.0,
+                "field_mask_answer_prefix": 0.0,
             }
 
             max_lens = {}

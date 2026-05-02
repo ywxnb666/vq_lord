@@ -82,6 +82,25 @@ def build_legacy_instruction(question: str, choices: List[str], hint: str = "") 
     return f"Question: {question}\n{hint_block}Options:\n{choices_text}Answer:"
 
 
+def build_readable_instruction(question: str, choices: List[str], hint: str = "") -> str:
+    choices_text = ""
+    for idx, choice in enumerate(choices):
+        choices_text += f"({chr(65 + idx)}) {choice}\n"
+    hint_block = f"Hint: {hint}\n" if hint else ""
+    return (
+        f"Question: {question}\n"
+        f"{hint_block}"
+        "Options:\n"
+        f"{choices_text}"
+        "\n"
+        "Generate exactly four fields in this order:\n"
+        "Observed Facts: describe only image-observable evidence.\n"
+        "Context: restate relevant textual conditions from question, hint, and options.\n"
+        "Reasoning: compare options briefly, but do not state the final answer here.\n"
+        "Answer: give only the final option and answer, for example '(A) answer text'."
+    )
+
+
 def build_prompt(processor, question: str, choices: List[str], hint: str = "") -> str:
     instruction_text = build_legacy_instruction(question, choices, hint)
     if hasattr(processor, "apply_chat_template"):
@@ -96,6 +115,44 @@ def build_prompt(processor, question: str, choices: List[str], hint: str = "") -
         ]
         return processor.apply_chat_template(prompt_conv, add_generation_prompt=True)
     return f"<image>\n{instruction_text}"
+
+
+def build_readable_prompt(processor, question: str, choices: List[str], hint: str = "") -> str:
+    instruction_text = build_readable_instruction(question, choices, hint)
+    if hasattr(processor, "apply_chat_template"):
+        prompt_conv = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction_text},
+                    {"type": "image"},
+                ],
+            }
+        ]
+        return processor.apply_chat_template(prompt_conv, add_generation_prompt=True)
+    return f"<image>\n{instruction_text}"
+
+
+def parse_readable_fields(output_text: str) -> Tuple[bool, dict]:
+    text = output_text or ""
+    prefixes = ["Observed Facts:", "Context:", "Reasoning:", "Answer:"]
+    positions = []
+    for prefix in prefixes:
+        pos = text.find(prefix)
+        if pos < 0:
+            return False, {}
+        positions.append(pos)
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        return False, {}
+    fields = {}
+    for idx, prefix in enumerate(prefixes):
+        start = positions[idx] + len(prefix)
+        end = positions[idx + 1] if idx + 1 < len(prefixes) else len(text)
+        value = text[start:end].strip()
+        key = prefix[:-1].lower().replace(" ", "_")
+        fields[key] = value
+    ok = all(fields.get(prefix[:-1].lower().replace(" ", "_"), "") for prefix in prefixes)
+    return bool(ok), fields
 
 
 def normalize_text(text: str) -> str:
@@ -398,6 +455,24 @@ def load_model_and_processor(
         "trainable_state_skipped": 0,
     }
 
+    def prepare_generation_eval_model(target_model):
+        target_model.eval()
+        target_model.config.use_cache = True
+        if getattr(target_model, "generation_config", None) is not None:
+            target_model.generation_config.use_cache = True
+        if hasattr(target_model, "gradient_checkpointing_disable"):
+            target_model.gradient_checkpointing_disable()
+        base_model_fn = getattr(target_model, "get_base_model", None)
+        if callable(base_model_fn):
+            base_model = base_model_fn()
+            if base_model is not target_model:
+                base_model.eval()
+                base_model.config.use_cache = True
+                if getattr(base_model, "generation_config", None) is not None:
+                    base_model.generation_config.use_cache = True
+                if hasattr(base_model, "gradient_checkpointing_disable"):
+                    base_model.gradient_checkpointing_disable()
+
     student_model_type = normalize_student_model_type(student_model_type)
     if student_model_type != LLAVA_NEXT:
         args_obj = type("Args", (), {
@@ -440,7 +515,7 @@ def load_model_and_processor(
             load_info["trainable_state_found"] = bool(found)
             load_info["trainable_state_loaded"] = int(loaded)
             load_info["trainable_state_skipped"] = int(skipped)
-        model.eval()
+        prepare_generation_eval_model(model)
         return model, processor, load_info
 
     if use_4bit:
@@ -506,7 +581,7 @@ def load_model_and_processor(
         load_info["trainable_state_loaded"] = int(loaded)
         load_info["trainable_state_skipped"] = int(skipped)
 
-    model.eval()
+    prepare_generation_eval_model(model)
 
     processor = LlavaNextProcessor.from_pretrained(model_path, trust_remote_code=True)
     if processor.tokenizer.pad_token is None:
@@ -537,6 +612,15 @@ def run_eval(
     results = []
     correct = 0
     total = 0
+    format_hits = 0
+    answer_parse_hits = 0
+    field_nonempty = {
+        "observed_facts": 0,
+        "context": 0,
+        "reasoning": 0,
+        "answer": 0,
+    }
+    field_token_totals = {key: 0 for key in field_nonempty}
     student_model_type = normalize_student_model_type(
         getattr(getattr(model, "config", None), "student_model_type", LLAVA_NEXT)
     )
@@ -556,7 +640,11 @@ def run_eval(
         image = item.get("image")
 
         if student_model_type == LLAVA_NEXT:
-            prompt = build_prompt(processor, question, choices, hint)
+            prompt = (
+                build_readable_prompt(processor, question, choices, hint)
+                if answer_mode == "generate_readable"
+                else build_prompt(processor, question, choices, hint)
+            )
             inputs = processor(
                 text=prompt,
                 images=image,
@@ -565,7 +653,11 @@ def run_eval(
                 truncation=False,
             )
         else:
-            instruction_text = build_legacy_instruction(question, choices, hint)
+            instruction_text = (
+                build_readable_instruction(question, choices, hint)
+                if answer_mode == "generate_readable"
+                else build_legacy_instruction(question, choices, hint)
+            )
             inputs = encode_multimodal(
                 processor,
                 student_model_type,
@@ -587,7 +679,10 @@ def run_eval(
         output_text = ""
         pred_idx = None
 
-        if answer_mode in ("generate", "hybrid"):
+        parsed_fields = {}
+        readable_format_ok = False
+
+        if answer_mode in ("generate", "hybrid", "generate_readable"):
             with torch.no_grad():
                 if student_model_type == LLAVA_NEXT:
                     generated = model.generate(
@@ -596,7 +691,7 @@ def run_eval(
                         pixel_values=pixel_values,
                         image_sizes=image_sizes,
                         max_new_tokens=max_new_tokens,
-                        min_new_tokens=1,
+                        min_new_tokens=16 if answer_mode == "generate_readable" else 1,
                         do_sample=False,
                         pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
                         eos_token_id=processor.tokenizer.eos_token_id,
@@ -611,7 +706,7 @@ def run_eval(
                         image_sizes=image_sizes,
                         image_grid_thw=image_grid_thw,
                         max_new_tokens=max_new_tokens,
-                        min_new_tokens=1,
+                        min_new_tokens=16 if answer_mode == "generate_readable" else 1,
                         do_sample=False,
                         pad_token_id=model.config.pad_token_id or processor.tokenizer.pad_token_id,
                         eos_token_id=processor.tokenizer.eos_token_id,
@@ -626,7 +721,20 @@ def run_eval(
                 # 空生成时不要回退解码整段序列；那会把 prompt 误记成模型输出。
                 output_text = "[empty_generation]"
 
-            pred_idx = extract_choice_from_output(output_text, choices)
+            if answer_mode == "generate_readable":
+                readable_format_ok, parsed_fields = parse_readable_fields(output_text)
+                if readable_format_ok:
+                    format_hits += 1
+                    for field_name in field_nonempty:
+                        value = parsed_fields.get(field_name, "")
+                        if value:
+                            field_nonempty[field_name] += 1
+                            field_token_totals[field_name] += len(value.split())
+                    pred_idx = extract_choice_from_output(parsed_fields.get("answer", ""), choices)
+                    if pred_idx is not None:
+                        answer_parse_hits += 1
+            else:
+                pred_idx = extract_choice_from_output(output_text, choices)
 
         if pred_idx is None and answer_mode in ("logits", "hybrid"):
             pred_idx = predict_choice_with_next_token_logits(
@@ -659,11 +767,29 @@ def run_eval(
             "answer_idx": answer_idx,
             "pred_idx": pred_idx,
             "output": output_text,
+            "readable_format_ok": readable_format_ok,
+            "readable_fields": parsed_fields,
             "correct": is_correct,
         })
 
     accuracy = correct / total if total else 0.0
     metrics = {"accuracy": accuracy, "total": total, "correct": correct}
+    if answer_mode == "generate_readable":
+        metrics.update(
+            {
+                "format_rate": format_hits / total if total else 0.0,
+                "answer_parse_rate": answer_parse_hits / total if total else 0.0,
+                "answer_accuracy": accuracy,
+                "field_nonempty_rate": {
+                    key: field_nonempty[key] / total if total else 0.0
+                    for key in field_nonempty
+                },
+                "avg_field_tokens": {
+                    key: field_token_totals[key] / max(1, field_nonempty[key])
+                    for key in field_token_totals
+                },
+            }
+        )
 
     save_dir = os.path.dirname(save_path)
     if save_dir:
@@ -677,6 +803,9 @@ def run_eval(
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
+    if answer_mode == "generate_readable":
+        print(f"Format rate: {metrics['format_rate']:.4f}")
+        print(f"Answer parse rate: {metrics['answer_parse_rate']:.4f}")
     print(f"Results saved to: {save_path}")
 
 
@@ -699,8 +828,8 @@ def parse_args():
         "--answer_mode",
         type=str,
         default="hybrid",
-        choices=["generate", "logits", "hybrid"],
-        help="答案获取方式：generate=仅生成解析, logits=仅下一token打分, hybrid=生成失败时回退logits",
+        choices=["generate", "logits", "hybrid", "generate_readable"],
+        help="答案获取方式：generate_readable=四字段生成严格解析, generate=仅生成解析, logits=仅下一token打分, hybrid=生成失败时回退logits",
     )
     parser.add_argument("--save_path", type=str, default="./sciqa_eval.json", help="保存结果路径")
     return parser.parse_args()
@@ -741,7 +870,7 @@ def main():
         "trainable_state_loaded": load_info.get("trainable_state_loaded", 0),
         "trainable_state_skipped": load_info.get("trainable_state_skipped", 0),
         "answer_mode": args.answer_mode,
-        "prompt_style": "stage3_legacy",
+        "prompt_style": "readable_four_field" if args.answer_mode == "generate_readable" else "stage3_legacy",
     }
     run_eval(
         model=model,
