@@ -105,6 +105,51 @@ def _stage3_use_answer_correctness_pair(args) -> bool:
     return str(getattr(args, "student_model_type", "")) == "llava_next"
 
 
+def _stage3_llava_readable_sft_mask(
+    weighted_mask: torch.Tensor,
+    reasoning_mask: torch.Tensor,
+) -> torch.Tensor:
+    reasoning_tokens = (reasoning_mask > 0).sum(dim=1).to(dtype=weighted_mask.dtype)
+    row_weight = torch.ones_like(reasoning_tokens)
+    row_weight = torch.where(reasoning_tokens > 128, row_weight * 0.5, row_weight)
+    row_weight = torch.where(reasoning_tokens > 192, row_weight * 0.5, row_weight)
+    return weighted_mask * row_weight.unsqueeze(1)
+
+
+def _stage3_teacher_answer_letter(sample: "Stage3SampleCacheItem", tokenizer) -> str:
+    if tokenizer is None:
+        return ""
+    return str(
+        _extract_answer_letter_from_ids(
+            sample.y_vic_ids,
+            int(sample.prompt_len),
+            tokenizer,
+        )
+        or ""
+    ).strip().upper()[:1]
+
+
+def _stage3_score_readable_candidate(
+    cand: dict,
+    sample: "Stage3SampleCacheItem",
+    tokenizer,
+    teacher_letter: str,
+) -> dict:
+    text = _decode_generated_text_from_ids(
+        cand["ids"],
+        int(sample.prompt_len),
+        tokenizer,
+    )
+    readable_ok, answer_text = _parse_readable_answer_field(text)
+    pred_letter = _extract_answer_letter(answer_text) if readable_ok else None
+    return {
+        **cand,
+        "readable_ok": 1 if readable_ok else 0,
+        "pred_letter": pred_letter,
+        "is_correct": 1 if pred_letter == teacher_letter else 0,
+    }
+
+
 def _compute_token_log_probs(
     model,
     args,
@@ -721,6 +766,7 @@ class PeriodTrainingDataset(torch.utils.data.Dataset):
             "prompt_len": int(sample.prompt_len),
             "answer_idx": int(sample.answer_idx),
             "num_choices": int(sample.num_choices),
+            "wrong_is_self": int(pair.wrong_sample_idx == pair.sample_idx),
         }
 
 
@@ -956,6 +1002,7 @@ def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
         "prompt_lens": prompt_lens,
         "answer_idx": torch.tensor([int(item["answer_idx"]) for item in batch], dtype=torch.long),
         "num_choices": torch.tensor([int(item["num_choices"]) for item in batch], dtype=torch.long),
+        "wrong_is_self": torch.tensor([int(item["wrong_is_self"]) for item in batch], dtype=torch.float32),
     }
 
 
@@ -1302,7 +1349,7 @@ def _generate_candidate_single(
     temperature: Optional[float] = None,
     generator: Optional[torch.Generator] = None,
     max_new_tokens: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = args.device
     prompt_ids = sample.prompt_ids.unsqueeze(0).to(device)
     prompt_mask = sample.prompt_mask.unsqueeze(0).to(device)
@@ -1581,6 +1628,69 @@ def _compute_choice_scores_from_prompt_batch(
             row_valid = True
         valid_rows[row_idx] = row_valid
     return choice_scores, valid_rows
+
+
+def _compute_choice_scores_from_answer_field_batch(
+    model,
+    args,
+    y_vic_ids: torch.Tensor,
+    y_vic_mask: torch.Tensor,
+    pixel_values: torch.Tensor,
+    image_sizes: Optional[torch.Tensor],
+    vic_answer_mask: torch.Tensor,
+    num_choices: torch.Tensor,
+    choice_token_map: Dict[int, List[int]],
+    image_grid_thw: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    outputs = student_forward(
+        model=model,
+        args=args,
+        input_ids=y_vic_ids,
+        attention_mask=y_vic_mask,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+        image_grid_thw=image_grid_thw,
+        use_cache=False,
+    )
+    max_num_choices = max(1, int(num_choices.max().item())) if num_choices.numel() > 0 else 1
+    choice_scores = torch.full(
+        (y_vic_ids.shape[0], max_num_choices),
+        fill_value=-1e9,
+        device=y_vic_ids.device,
+        dtype=torch.float32,
+    )
+    valid_rows = torch.zeros((y_vic_ids.shape[0],), device=y_vic_ids.device, dtype=torch.bool)
+    choice_token_ids = {
+        int(token_id)
+        for ids in choice_token_map.values()
+        for token_id in ids
+    }
+    for row_idx in range(y_vic_ids.shape[0]):
+        active_positions = torch.nonzero(vic_answer_mask[row_idx] > 0, as_tuple=False).view(-1)
+        score_pos = None
+        for pos_tensor in active_positions:
+            pos = int(pos_tensor.item())
+            label_pos = pos + 1
+            if label_pos >= int(y_vic_ids.shape[1]):
+                continue
+            if int(y_vic_ids[row_idx, label_pos].item()) in choice_token_ids:
+                score_pos = pos
+                break
+        if score_pos is None:
+            continue
+        cur_num_choices = min(max_num_choices, int(num_choices[row_idx].item()))
+        if cur_num_choices <= 0:
+            continue
+        row_valid = False
+        for choice_idx in range(cur_num_choices):
+            cand_ids = choice_token_map.get(choice_idx, [])
+            if not cand_ids:
+                continue
+            choice_scores[row_idx, choice_idx] = outputs.logits[row_idx, score_pos, cand_ids].float().max()
+            row_valid = True
+        valid_rows[row_idx] = row_valid
+    zero_anchor = outputs.logits.sum() * 0.0
+    return choice_scores, valid_rows, zero_anchor
 
 
 def _predict_choice_from_choice_scores(
@@ -2167,27 +2277,22 @@ def _build_pairs_and_next_states_distributed(
                 if prob12 > prob11:
                     local_stats["swap_count"] += 1
 
+                use_vic_positive_for_llava = False
                 if _stage3_use_answer_correctness_pair(args) and tokenizer is not None:
-                    gold_letter = str(getattr(sample, "answer_letter", "") or "").strip().upper()[:1]
-                    if len(gold_letter) == 1 and "A" <= gold_letter <= "Z":
-                        cand_scored = []
-                        for cand in candidates:
-                            pred_letter = _extract_answer_letter_from_ids(
-                                cand["ids"],
-                                int(sample.prompt_len),
-                                tokenizer,
-                            )
-                            cand_scored.append({
-                                **cand,
-                                "pred_letter": pred_letter,
-                                "is_correct": 1 if pred_letter == gold_letter else 0,
-                            })
+                    teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
+                    if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
+                        cand_scored = [
+                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            for cand in candidates
+                        ]
                         cand_scored.sort(
-                            key=lambda x: (x["is_correct"], float(x["prob"])),
+                            key=lambda x: (x["readable_ok"], x["is_correct"], float(x["prob"])),
                             reverse=True,
                         )
                         y11 = cand_scored[0]
                         y12 = cand_scored[1]
+                        if not (int(y11["readable_ok"]) == 1 and int(y11["is_correct"]) == 1):
+                            use_vic_positive_for_llava = True
 
                 delta11 = float(y11["prob"] - y11["prev_prob"])
                 p_best = max(float(y11["prob"]), float(y12["prob"]))
@@ -2203,6 +2308,17 @@ def _build_pairs_and_next_states_distributed(
                     old_lp_minus = token12
                     old_mask_minus = mask12
                     y_minus_avg_lp = float(lp12)
+                elif use_vic_positive_for_llava:
+                    y_plus_ids = sample.y_vic_ids
+                    y_plus_mask = sample.y_vic_mask
+                    old_lp_plus = y_vic_token_lp
+                    old_mask_plus = y_vic_token_mask
+                    y_plus_avg_lp = float(y_vic_lp)
+                    y_minus_ids = y12["ids"]
+                    y_minus_mask = y12["mask"]
+                    old_lp_minus = y12["old_token_lp"]
+                    old_mask_minus = y12["old_token_mask"]
+                    y_minus_avg_lp = float(y12["avg_lp"])
                 elif use_cold_start:
                     y_plus_ids = sample.y_vic_ids
                     y_plus_mask = sample.y_vic_mask
@@ -2251,22 +2367,42 @@ def _build_pairs_and_next_states_distributed(
                 next1_lp, next1_prob, _, _ = next1_scores[row_idx]
                 next2_lp, next2_prob, _, _ = next2_scores[row_idx]
                 next_sorted = [
-                    (next1_ids, next1_mask, next1_lp, next1_prob),
-                    (next2_ids, next2_mask, next2_lp, next2_prob),
+                    {"ids": next1_ids, "mask": next1_mask, "avg_lp": next1_lp, "prob": next1_prob},
+                    {"ids": next2_ids, "mask": next2_mask, "avg_lp": next2_lp, "prob": next2_prob},
                 ]
-                next_sorted.sort(key=lambda x: x[3], reverse=True)
+                next_sorted.sort(key=lambda x: x["prob"], reverse=True)
                 high = next_sorted[0]
                 low = next_sorted[1]
+                if _stage3_use_answer_correctness_pair(args) and tokenizer is not None:
+                    teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
+                    if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
+                        next_scored = [
+                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            for cand in next_sorted
+                        ]
+                        next_scored.sort(
+                            key=lambda x: (x["readable_ok"], x["is_correct"], float(x["prob"])),
+                            reverse=True,
+                        )
+                        high = next_scored[0]
+                        low = next_scored[1]
+                        if not (int(high["readable_ok"]) == 1 and int(high["is_correct"]) == 1):
+                            high = {
+                                "ids": sample.y_vic_ids,
+                                "mask": sample.y_vic_mask,
+                                "avg_lp": y_vic_lp,
+                                "prob": y_vic_prob,
+                            }
                 batch_next_states[int(idx)] = PeriodState(
                     sample_idx=int(idx),
-                    y11_ids=high[0].clone(),
-                    y11_mask=high[1].clone(),
-                    y12_ids=low[0].clone(),
-                    y12_mask=low[1].clone(),
-                    avg_lp_11=float(high[2]),
-                    avg_lp_12=float(low[2]),
-                    prob_11=float(high[3]),
-                    prob_12=float(low[3]),
+                    y11_ids=high["ids"].clone(),
+                    y11_mask=high["mask"].clone(),
+                    y12_ids=low["ids"].clone(),
+                    y12_mask=low["mask"].clone(),
+                    avg_lp_11=float(high["avg_lp"]),
+                    avg_lp_12=float(low["avg_lp"]),
+                    prob_11=float(high["prob"]),
+                    prob_12=float(low["prob"]),
                 )
 
             local_training_chunks.append((int(global_batch_idx), batch_training_items))
@@ -2558,27 +2694,22 @@ def _build_pairs_and_next_states(
                 if prob12 > prob11:
                     swap_count += 1
 
+                use_vic_positive_for_llava = False
                 if _stage3_use_answer_correctness_pair(args) and tokenizer is not None:
-                    gold_letter = str(getattr(sample, "answer_letter", "") or "").strip().upper()[:1]
-                    if len(gold_letter) == 1 and "A" <= gold_letter <= "Z":
-                        cand_scored = []
-                        for cand in candidates:
-                            pred_letter = _extract_answer_letter_from_ids(
-                                cand["ids"],
-                                int(sample.prompt_len),
-                                tokenizer,
-                            )
-                            cand_scored.append({
-                                **cand,
-                                "pred_letter": pred_letter,
-                                "is_correct": 1 if pred_letter == gold_letter else 0,
-                            })
+                    teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
+                    if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
+                        cand_scored = [
+                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            for cand in candidates
+                        ]
                         cand_scored.sort(
-                            key=lambda x: (x["is_correct"], float(x["prob"])),
+                            key=lambda x: (x["readable_ok"], x["is_correct"], float(x["prob"])),
                             reverse=True,
                         )
                         y11 = cand_scored[0]
                         y12 = cand_scored[1]
+                        if not (int(y11["readable_ok"]) == 1 and int(y11["is_correct"]) == 1):
+                            use_vic_positive_for_llava = True
 
                 delta11 = float(y11["prob"] - y11["prev_prob"])
                 p_best = max(float(y11["prob"]), float(y12["prob"]))
@@ -2595,6 +2726,17 @@ def _build_pairs_and_next_states(
                     old_lp_minus = token12
                     old_mask_minus = mask12
                     y_minus_avg_lp = float(lp12)
+                elif use_vic_positive_for_llava:
+                    y_plus_ids = sample.y_vic_ids
+                    y_plus_mask = sample.y_vic_mask
+                    old_lp_plus = y_vic_token_lp
+                    old_mask_plus = y_vic_token_mask
+                    y_plus_avg_lp = float(y_vic_lp)
+                    y_minus_ids = y12["ids"]
+                    y_minus_mask = y12["mask"]
+                    old_lp_minus = y12["old_token_lp"]
+                    old_mask_minus = y12["old_token_mask"]
+                    y_minus_avg_lp = float(y12["avg_lp"])
                 elif use_cold_start:
                     y_plus_ids = sample.y_vic_ids
                     y_plus_mask = sample.y_vic_mask
@@ -2643,22 +2785,42 @@ def _build_pairs_and_next_states(
                 next1_lp, next1_prob, _, _ = next1_scores[row_idx]
                 next2_lp, next2_prob, _, _ = next2_scores[row_idx]
                 next_sorted = [
-                    (next1_ids, next1_mask, next1_lp, next1_prob),
-                    (next2_ids, next2_mask, next2_lp, next2_prob),
+                    {"ids": next1_ids, "mask": next1_mask, "avg_lp": next1_lp, "prob": next1_prob},
+                    {"ids": next2_ids, "mask": next2_mask, "avg_lp": next2_lp, "prob": next2_prob},
                 ]
-                next_sorted.sort(key=lambda x: x[3], reverse=True)
+                next_sorted.sort(key=lambda x: x["prob"], reverse=True)
                 high = next_sorted[0]
                 low = next_sorted[1]
+                if _stage3_use_answer_correctness_pair(args) and tokenizer is not None:
+                    teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
+                    if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
+                        next_scored = [
+                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            for cand in next_sorted
+                        ]
+                        next_scored.sort(
+                            key=lambda x: (x["readable_ok"], x["is_correct"], float(x["prob"])),
+                            reverse=True,
+                        )
+                        high = next_scored[0]
+                        low = next_scored[1]
+                        if not (int(high["readable_ok"]) == 1 and int(high["is_correct"]) == 1):
+                            high = {
+                                "ids": sample.y_vic_ids,
+                                "mask": sample.y_vic_mask,
+                                "avg_lp": y_vic_lp,
+                                "prob": y_vic_prob,
+                            }
                 next_states[idx] = PeriodState(
                     sample_idx=int(idx),
-                    y11_ids=high[0].clone(),
-                    y11_mask=high[1].clone(),
-                    y12_ids=low[0].clone(),
-                    y12_mask=low[1].clone(),
-                    avg_lp_11=float(high[2]),
-                    avg_lp_12=float(low[2]),
-                    prob_11=float(high[3]),
-                    prob_12=float(low[3]),
+                    y11_ids=high["ids"].clone(),
+                    y11_mask=high["mask"].clone(),
+                    y12_ids=low["ids"].clone(),
+                    y12_mask=low["mask"].clone(),
+                    avg_lp_11=float(high["avg_lp"]),
+                    avg_lp_12=float(low["avg_lp"]),
+                    prob_11=float(high["prob"]),
+                    prob_12=float(low["prob"]),
                 )
     finally:
         _restore_model_gradient_checkpointing(gc_states)
@@ -2677,6 +2839,7 @@ def _run_one_period_train(
     sub_stage_idx: int,
     period_idx: int,
     choice_token_map: Optional[Dict[int, List[int]]] = None,
+    tokenizer=None,
 ) -> Tuple[float, float, float, float, float, float, float, Dict[str, float], int]:
     model.train()
     grad_accum = max(1, int(args.stage3_grad_accum or args.grad_accum))
@@ -2689,7 +2852,7 @@ def _run_one_period_train(
     readable_sft_weight = float(getattr(args, "stage3_readable_sft_weight", 1.0))
     answer_anchor_weight = float(args.stage3_answer_anchor_weight)
     answer_prefix_weight = float(args.stage3_answer_prefix_weight)
-    mc_weight = 0.0
+    mc_weight = float(args.stage3_mc_weight) if _stage3_use_answer_correctness_pair(args) else 0.0
     field_weights = {
         "observed": float(args.stage3_field_weight_observed),
         "context": float(args.stage3_field_weight_context),
@@ -2766,19 +2929,29 @@ def _run_one_period_train(
         vic_reasoning_mask = batch["vic_reasoning_mask"].to(args.device)
         vic_answer_mask = batch["vic_answer_mask"].to(args.device)
         vic_other_mask = batch["vic_other_mask"].to(args.device)
-        answer_idx = batch["answer_idx"].to(args.device)
+        wrong_is_self = batch["wrong_is_self"].to(args.device)
         num_choices = batch["num_choices"].to(args.device)
+        if mc_weight > 0.0 and tokenizer is not None:
+            teacher_answer_idx = []
+            for ids_cpu, prompt_len_cpu in zip(batch["y_vic_ids"], batch["prompt_lens"]):
+                letter = _extract_answer_letter_from_ids(ids_cpu, int(prompt_len_cpu), tokenizer)
+                if letter is None or not ("A" <= letter <= "Z"):
+                    teacher_answer_idx.append(-1)
+                else:
+                    teacher_answer_idx.append(ord(letter) - ord("A"))
+            answer_idx = torch.tensor(teacher_answer_idx, dtype=torch.long, device=args.device)
+        else:
+            answer_idx = torch.full_like(num_choices, -1)
 
         # 分路前向 + 分路 backward，避免同时保留 plus/minus/vic 三路完整计算图。
         is_last_micro_step = (
             ((batch_idx + 1) % grad_accum == 0)
             or (batch_idx == len(loader) - 1)
         )
-        sync_ctx = (
-            contextlib.nullcontext()
-            if (is_last_micro_step or not is_distributed() or not hasattr(model, "no_sync"))
-            else model.no_sync()
-        )
+        def _backward_sync_context():
+            if is_last_micro_step or not is_distributed() or not hasattr(model, "no_sync"):
+                return contextlib.nullcontext()
+            return model.no_sync()
 
         cur_lp_plus, cur_mask_plus = _compute_token_log_probs(
             model, args, y_plus_ids, y_plus_mask, pixel_values, image_sizes, prompt_lens, image_grid_thw=image_grid_thw
@@ -2797,7 +2970,7 @@ def _run_one_period_train(
             f"[Stage3][Warn] step={global_step} 检测到非有限 plus loss，所有 rank 同步跳过该 batch。",
         ):
             continue
-        with sync_ctx:
+        with _backward_sync_context():
             ((obj_weight * loss_plus) / grad_accum).backward()
         del cur_lp_plus, cur_mask_plus, mask_plus, loss_plus
 
@@ -2818,7 +2991,7 @@ def _run_one_period_train(
             f"[Stage3][Warn] step={global_step} 检测到非有限 minus loss，所有 rank 同步跳过该 batch。",
         ):
             continue
-        with sync_ctx:
+        with _backward_sync_context():
             ((obj_weight * loss_minus) / grad_accum).backward()
         del cur_lp_minus, cur_mask_minus, mask_minus, loss_minus
 
@@ -2852,9 +3025,15 @@ def _run_one_period_train(
         )
 
         loss_reg, loss_reg_val = _stage3_masked_mean_ddp(delta_vic, weighted_mask_vic)
+        readable_sft_mask = weighted_mask_vic
+        if _stage3_use_answer_correctness_pair(args):
+            readable_sft_mask = _stage3_llava_readable_sft_mask(
+                weighted_mask_vic,
+                field_masks["reasoning"],
+            )
         loss_readable_sft, loss_readable_sft_val = _stage3_masked_mean_ddp(
             -cur_lp_vic,
-            weighted_mask_vic,
+            readable_sft_mask,
         )
         field_loss_vals = {}
         for name, field_mask in field_masks.items():
@@ -2900,6 +3079,10 @@ def _run_one_period_train(
                     cur_lp_vic = cur_lp_vic[:, :target]
                     mask_vic = mask_vic[:, :target]
                 wrong_mask = (mask_vic * cur_mask_wrong_vic).float()
+                if _stage3_use_answer_correctness_pair(args):
+                    if vic_observed_mask.shape[1] != wrong_mask.shape[1]:
+                        vic_observed_mask = vic_observed_mask[:, :wrong_mask.shape[1]]
+                    wrong_mask = wrong_mask * vic_observed_mask * (1.0 - wrong_is_self).view(-1, 1)
                 wrong_delta = F.relu(cur_lp_wrong_vic - cur_lp_vic + wrong_image_margin)
                 loss_wrong, loss_wrong_val = _stage3_masked_mean_ddp(wrong_delta, wrong_mask)
 
@@ -2915,52 +3098,51 @@ def _run_one_period_train(
             f"[Stage3][Warn] step={global_step} 检测到非有限 vic loss，所有 rank 同步跳过该 batch。",
         ):
             continue
-        has_mc_backward = False
-        valid_mc_rows_exist = False
-        choice_scores = None
-        valid_mc_rows = None
-        if mc_weight > 0.0 and choice_token_map:
-            choice_scores, valid_mc_rows = _compute_choice_scores_from_prompt_batch(
-                model=model,
-                args=args,
-                prompt_ids=prompt_ids,
-                prompt_mask=prompt_mask,
-                pixel_values=pixel_values,
-                image_sizes=image_sizes,
-                num_choices=num_choices,
-                choice_token_map=choice_token_map,
-                image_grid_thw=image_grid_thw,
-            )
-            valid_mc_rows = valid_mc_rows & (num_choices > 0) & (answer_idx >= 0) & (answer_idx < num_choices)
-            valid_mc_rows_exist = bool(valid_mc_rows.any().item())
-            has_mc_backward = valid_mc_rows_exist
-
-        if has_mc_backward and is_distributed() and hasattr(model, "no_sync"):
-            with model.no_sync() if is_last_micro_step else sync_ctx:
-                (loss_vic_total / grad_accum).backward()
-        else:
-            with sync_ctx:
-                (loss_vic_total / grad_accum).backward()
+        with _backward_sync_context():
+            (loss_vic_total / grad_accum).backward()
         del cur_lp_vic, cur_mask_vic, mask_vic, delta_vic, loss_reg, loss_readable_sft, loss_answer_anchor, loss_answer_prefix, loss_vic_total
         if cur_lp_wrong_vic is not None and cur_mask_wrong_vic is not None:
             del cur_lp_wrong_vic, cur_mask_wrong_vic, wrong_mask, wrong_delta
 
         loss_mc = torch.zeros((), device=args.device, dtype=old_lp_vic.dtype)
         mc_acc_proxy = 0.0
-        if has_mc_backward and choice_scores is not None and valid_mc_rows is not None:
-            if valid_mc_rows_exist:
-                loss_mc = F.cross_entropy(choice_scores[valid_mc_rows], answer_idx[valid_mc_rows])
+        if mc_weight > 0.0 and choice_token_map:
+            choice_scores, valid_mc_rows, mc_zero_anchor = _compute_choice_scores_from_answer_field_batch(
+                model=model,
+                args=args,
+                y_vic_ids=y_vic_ids,
+                y_vic_mask=y_vic_mask,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                vic_answer_mask=vic_answer_mask,
+                num_choices=num_choices,
+                choice_token_map=choice_token_map,
+                image_grid_thw=image_grid_thw,
+            )
+            valid_mc_rows = valid_mc_rows & (num_choices > 0) & (answer_idx >= 0) & (answer_idx < num_choices)
+            local_has_mc = bool(valid_mc_rows.any().item())
+            reduced_mc = reduce_numeric_dict(
+                {"has_mc": 1.0 if local_has_mc else 0.0},
+                device=args.device,
+            )
+            if reduced_mc["has_mc"] > 0.0:
+                if local_has_mc:
+                    loss_mc = F.cross_entropy(choice_scores[valid_mc_rows], answer_idx[valid_mc_rows])
+                else:
+                    loss_mc = mc_zero_anchor
                 if _sync_skip(
                     not torch.isfinite(loss_mc).item(),
                     f"[Stage3][Warn] step={global_step} 检测到非有限多选 loss，所有 rank 同步跳过该 batch。",
                 ):
-                    del choice_scores, valid_mc_rows
+                    del choice_scores, valid_mc_rows, mc_zero_anchor
                     continue
-                pred_idx = choice_scores[valid_mc_rows].argmax(dim=-1)
-                mc_acc_proxy = float((pred_idx == answer_idx[valid_mc_rows]).float().mean().item())
-                ((mc_weight * loss_mc) / grad_accum).backward()
-                del pred_idx
-            del choice_scores, valid_mc_rows
+                if local_has_mc:
+                    pred_idx = choice_scores[valid_mc_rows].argmax(dim=-1)
+                    mc_acc_proxy = float((pred_idx == answer_idx[valid_mc_rows]).float().mean().item())
+                    del pred_idx
+                with _backward_sync_context():
+                    ((mc_weight * loss_mc) / grad_accum).backward()
+            del choice_scores, valid_mc_rows, mc_zero_anchor
 
         obj_val = loss_plus_val + loss_minus_val
         reg_val = loss_reg_val
@@ -3097,6 +3279,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
             f"{float(args.stage3_field_weight_context):.2f},"
             f"{float(args.stage3_field_weight_reasoning):.2f},"
             f"{float(args.stage3_field_weight_answer):.2f}), "
+            f"mc_w={float(args.stage3_mc_weight):.2f}, "
             f"obj_w={float(args.stage3_obj_weight):.2f}, "
             f"readable_sft_w={float(getattr(args, 'stage3_readable_sft_weight', 1.0)):.2f}, "
             f"reg_w={float(args.stage3_reg_weight):.2f}, "
@@ -3135,6 +3318,8 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
 
     tokenizer = train_dataset.processor.tokenizer
     choice_token_map: Optional[Dict[int, List[int]]] = None
+    if _stage3_use_answer_correctness_pair(args) and float(args.stage3_mc_weight) > 0.0:
+        choice_token_map = _build_stage3_choice_token_map(tokenizer)
     answer_lookup: Dict[int, str] = {}
     raw_samples = train_dataset.samples
     for idx, sample in enumerate(raw_samples):
@@ -3362,6 +3547,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                 sub_stage_idx=sub_stage_idx,
                 period_idx=period_idx,
                 choice_token_map=choice_token_map,
+                tokenizer=tokenizer,
             )
 
             cold_ratio = float(cold_start_count) / max(1, len(active_indices))
