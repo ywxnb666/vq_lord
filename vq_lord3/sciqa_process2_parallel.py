@@ -26,10 +26,12 @@ from sciqa_process2 import (
     build_readable_instruction,
     build_prompt,
     build_readable_prompt,
+    build_readable_prompt_no_context,
     extract_choice_from_output,
     load_model_and_processor,
     normalize_dataset_name,
     parse_readable_fields,
+    parse_readable_fields_no_context,
     resolve_eval_answer_idx,
 )
 from student_models import (
@@ -477,10 +479,12 @@ def run_eval_shard(
     num_shards: int,
     shard_id: int,
     student_model_type: str,
+    stage3_llava_remove_context: int = 0,
     run_config: Optional[dict] = None,
 ):
     dataset_name = normalize_dataset_name(dataset_name)
     student_model_type = normalize_student_model_type(student_model_type)
+    llava_remove_context = student_model_type == LLAVA_NEXT and int(stage3_llava_remove_context) == 1
     runtime_args = type("Args", (), {"student_model_type": student_model_type})()
     bucket_payload = load_bucket_payload(bucket_plan_path)
     validate_bucket_payload(
@@ -520,7 +524,12 @@ def run_eval_shard(
     total = 0
     format_hits = 0
     answer_parse_hits = 0
-    field_nonempty = {"observed_facts": 0, "context": 0, "reasoning": 0, "answer": 0}
+    field_names = (
+        ("observed_facts", "reasoning", "answer")
+        if llava_remove_context
+        else ("observed_facts", "context", "reasoning", "answer")
+    )
+    field_nonempty = {key: 0 for key in field_names}
     field_token_totals = {key: 0 for key in field_nonempty}
     if student_model_type != LLAVA_NEXT and answer_mode != "generate_readable":
         raise RuntimeError("Qwen2-VL parallel eval 只支持新规范 generate_readable。")
@@ -600,7 +609,9 @@ def run_eval_shard(
         else:
             prompts = [
                 (
-                    build_readable_prompt(processor, item["question"], item["choices"], item["hint"])
+                    build_readable_prompt_no_context(processor, item["question"], item["choices"], item["hint"])
+                    if answer_mode == "generate_readable" and llava_remove_context
+                    else build_readable_prompt(processor, item["question"], item["choices"], item["hint"])
                     if answer_mode == "generate_readable"
                     else build_prompt(processor, item["question"], item["choices"], item["hint"])
                 )
@@ -648,7 +659,10 @@ def run_eval_shard(
                         output_text = "[empty_generation]"
                     batch_first_pass_output_texts[row_idx] = output_text
                     if answer_mode == "generate_readable":
-                        readable_ok, fields = parse_readable_fields(output_text)
+                        if llava_remove_context:
+                            readable_ok, fields = parse_readable_fields_no_context(output_text)
+                        else:
+                            readable_ok, fields = parse_readable_fields(output_text)
                         batch_readable_format_ok[row_idx] = readable_ok
                         batch_readable_fields[row_idx] = fields
                         if readable_ok:
@@ -872,7 +886,15 @@ def merge_shard_results(
             for item in merged_results
             if item.get("readable_format_ok") and item.get("pred_idx") is not None
         )
-        field_names = ("observed_facts", "context", "reasoning", "answer")
+        use_no_context = (
+            (run_config or {}).get("student_model_type") == LLAVA_NEXT
+            and int((run_config or {}).get("stage3_llava_remove_context", 0)) == 1
+        )
+        field_names = (
+            ("observed_facts", "reasoning", "answer")
+            if use_no_context
+            else ("observed_facts", "context", "reasoning", "answer")
+        )
         field_nonempty = {key: 0 for key in field_names}
         field_token_totals = {key: 0 for key in field_names}
         for item in merged_results:
@@ -942,6 +964,8 @@ def parse_args():
     parser.add_argument("--shard_result_dir", type=str, default="", help="分片结果目录")
     parser.add_argument("--merge_only", type=int, default=0, help="是否只执行 shard 结果合并")
     parser.add_argument("--save_path", type=str, default="./sciqa_eval_parallel_bucketed.json", help="保存结果路径")
+    parser.add_argument("--stage3_llava_remove_context", type=int, default=0,
+                        help="LLaVA generate_readable 是否使用三字段 no-context prompt/解析")
     return parser.parse_args()
 
 
@@ -965,8 +989,15 @@ def main():
             "vq_codebook_size": int(args.vq_codebook_size),
             "vq_codebook_path": args.vq_codebook_path,
             "answer_mode": args.answer_mode,
+            "stage3_llava_remove_context": int(args.stage3_llava_remove_context),
             "prompt_style": (
-                "readable_four_field"
+                "llava_three_field_no_context"
+                if (
+                    args.student_model_type == LLAVA_NEXT
+                    and args.answer_mode == "generate_readable"
+                    and int(args.stage3_llava_remove_context) == 1
+                )
+                else "readable_four_field"
                 if args.answer_mode == "generate_readable"
                 else "student_two_pass_legacy_then_structured_4field"
                 if args.answer_mode == "generate" and int(args.enable_second_pass) == 1
@@ -1021,8 +1052,15 @@ def main():
         "trainable_state_loaded": load_info.get("trainable_state_loaded", 0),
         "trainable_state_skipped": load_info.get("trainable_state_skipped", 0),
         "answer_mode": args.answer_mode,
+        "stage3_llava_remove_context": int(args.stage3_llava_remove_context),
         "prompt_style": (
-            "readable_four_field"
+            "llava_three_field_no_context"
+            if (
+                args.student_model_type == LLAVA_NEXT
+                and args.answer_mode == "generate_readable"
+                and int(args.stage3_llava_remove_context) == 1
+            )
+            else "readable_four_field"
             if args.answer_mode == "generate_readable"
             else "student_two_pass_legacy_then_structured_4field"
             if args.answer_mode == "generate" and int(args.enable_second_pass) == 1
@@ -1050,6 +1088,7 @@ def main():
         num_shards=int(args.num_shards),
         shard_id=int(args.shard_id),
         student_model_type=args.student_model_type,
+        stage3_llava_remove_context=int(args.stage3_llava_remove_context),
         run_config=run_config,
     )
 

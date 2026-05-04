@@ -32,15 +32,19 @@ from train_vq_lord3 import (
     _restore_rng_state,
     _set_model_gradient_checkpointing,
     _set_model_use_cache,
+    _normalize_reasoning_without_final_answer,
     _strip_image_tokens,
     _to_cpu_obj,
+    build_readable_instruction_no_context,
     build_scienceqa_samples,
     barrier_if_distributed,
+    encode_multimodal,
     get_rank,
     get_world_size,
     is_distributed,
     is_main_process,
     is_projector_param,
+    materialize_textvqa_image,
     maybe_set_dataloader_epoch,
     reduce_numeric_dict,
     sanitize_image_sizes,
@@ -105,6 +109,13 @@ def _stage3_use_answer_correctness_pair(args) -> bool:
     return str(getattr(args, "student_model_type", "")) == "llava_next"
 
 
+def _stage3_llava_remove_context(args) -> bool:
+    return (
+        str(getattr(args, "student_model_type", "")) == "llava_next"
+        and int(getattr(args, "stage3_llava_remove_context", 0)) == 1
+    )
+
+
 def _stage3_llava_readable_sft_mask(
     weighted_mask: torch.Tensor,
     reasoning_mask: torch.Tensor,
@@ -134,13 +145,14 @@ def _stage3_score_readable_candidate(
     sample: "Stage3SampleCacheItem",
     tokenizer,
     teacher_letter: str,
+    remove_context: bool = False,
 ) -> dict:
     text = _decode_generated_text_from_ids(
         cand["ids"],
         int(sample.prompt_len),
         tokenizer,
     )
-    readable_ok, answer_text = _parse_readable_answer_field(text)
+    readable_ok, answer_text = _parse_readable_answer_field(text, remove_context=remove_context)
     pred_letter = _extract_answer_letter(answer_text) if readable_ok else None
     return {
         **cand,
@@ -301,6 +313,7 @@ def _stage3_resume_config(args) -> dict:
         "stage3_wrong_image_weight": float(getattr(args, "stage3_wrong_image_weight", 0.0)),
         "stage3_wrong_image_margin": float(getattr(args, "stage3_wrong_image_margin", 0.0)),
         "stage3_force_cold_start_period0": int(getattr(args, "stage3_force_cold_start_period0", 0)),
+        "stage3_llava_remove_context": int(getattr(args, "stage3_llava_remove_context", 0)),
         "scienceqa_preprocessed_path": str(getattr(args, "scienceqa_preprocessed_path", "")),
         "stage3_sample_cache_path": str(getattr(args, "stage3_sample_cache_path", "")),
         "vq_codebook_path": str(getattr(args, "vq_codebook_path", "")),
@@ -358,6 +371,7 @@ def _validate_stage3_resume_config(resume_config: dict, args):
         "stage3_wrong_image_weight",
         "stage3_wrong_image_margin",
         "stage3_force_cold_start_period0",
+        "stage3_llava_remove_context",
         "remove_vq_codebook",
         "stage2_ckpt_path",
     ]
@@ -591,6 +605,13 @@ def _stage3_broadcast_object_from_main(obj):
     return object_list[0]
 
 
+def _is_stage3_qwen_backend(args) -> bool:
+    return str(getattr(args, "student_model_type", "") or "").strip().lower().replace("-", "_") in {
+        "qwen2_vl",
+        "qwen2vl",
+    }
+
+
 def _build_stage3_period_dataloader(
     period_dataset: torch.utils.data.Dataset,
     args,
@@ -623,7 +644,7 @@ def _build_stage3_period_dataloader(
             shuffle=False,
             sampler=sampler,
             num_workers=0,
-            collate_fn=lambda b: _collate_period_training(b, pad_token_id),
+            collate_fn=lambda b: _collate_period_training(b, pad_token_id, args),
         )
         maybe_set_dataloader_epoch(loader, 0)
         return loader
@@ -633,7 +654,7 @@ def _build_stage3_period_dataloader(
         batch_size=max(1, int(args.batch_size)),
         shuffle=True,
         num_workers=0,
-        collate_fn=lambda b: _collate_period_training(b, pad_token_id),
+        collate_fn=lambda b: _collate_period_training(b, pad_token_id, args),
     )
 
 
@@ -835,6 +856,23 @@ def _stack_padded_pixel_values(pv_list: List[torch.Tensor]) -> torch.Tensor:
     return torch.stack(normalized, dim=0)
 
 
+def _concat_qwen_pixel_values(pv_list: List[torch.Tensor]) -> torch.Tensor:
+    normalized = []
+    for pv in pv_list:
+        if pv.dim() == 3 and pv.shape[0] == 1:
+            pv = pv.squeeze(0)
+        if pv.dim() != 2:
+            raise RuntimeError(f"Qwen pixel_values 期望二维 [patches, dim]，实际 shape={tuple(pv.shape)}")
+        normalized.append(pv)
+    return torch.cat(normalized, dim=0)
+
+
+def _stack_pixel_values_for_backend(pv_list: List[torch.Tensor], args) -> torch.Tensor:
+    if _is_stage3_qwen_backend(args):
+        return _concat_qwen_pixel_values(pv_list)
+    return _stack_padded_pixel_values(pv_list)
+
+
 def _stack_optional_image_sizes(image_sizes_list: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
     if not any(size is not None for size in image_sizes_list):
         return None
@@ -862,7 +900,7 @@ def _stack_optional_image_grid_thw(grid_list: List[Optional[torch.Tensor]]) -> O
     return torch.cat(normalized, dim=0)
 
 
-def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
+def _collate_period_training(batch: List[dict], pad_token_id: int, args) -> dict:
     if not batch:
         return None
 
@@ -920,6 +958,9 @@ def _collate_period_training(batch: List[dict], pad_token_id: int) -> dict:
     vic_ids, vic_mask, old_lp_vic, old_mask_vic = _collate_stream("y_vic")
 
     def _stack_pixel_values(key: str) -> torch.Tensor:
+        if _is_stage3_qwen_backend(args):
+            return _concat_qwen_pixel_values([item[key] for item in batch])
+
         pv_list = []
         for item in batch:
             pv = item[key]
@@ -1116,30 +1157,188 @@ def _build_vic_field_masks(
     return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
 
 
-def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
+def _build_vic_field_masks_no_context(
+    y_vic_ids: torch.Tensor,
+    prompt_len: int,
+    tokenizer,
+    vic_target: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    old_len = max(0, int(y_vic_ids.shape[0]) - 1)
+    observed_mask = torch.zeros((old_len,), dtype=torch.float32)
+    context_mask = torch.zeros((old_len,), dtype=torch.float32)
+    reasoning_mask = torch.zeros((old_len,), dtype=torch.float32)
+    answer_mask = torch.zeros((old_len,), dtype=torch.float32)
+
+    if tokenizer is None or not vic_target or old_len == 0:
+        other_mask = torch.ones((old_len,), dtype=torch.float32)
+        return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
+
+    generated_ids = y_vic_ids[int(prompt_len):].tolist()
+    if not generated_ids:
+        other_mask = torch.ones((old_len,), dtype=torch.float32)
+        return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
+
+    field_to_mask = {
+        "Observed Facts:": observed_mask,
+        "Reasoning:": reasoning_mask,
+        "Answer:": answer_mask,
+    }
+    cursor = 0
+    field_lines = []
+    for raw_line in str(vic_target).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        prefix = next((p for p in field_to_mask if line.startswith(p)), None)
+        if prefix is None:
+            continue
+        field_lines.append((prefix, line))
+        line_tokens = tokenizer.encode(line, add_special_tokens=False)
+        start = _find_token_subsequence(generated_ids, line_tokens, cursor)
+        if start < 0:
+            continue
+        base = max(0, int(prompt_len) - 1 + start)
+        end = min(old_len, base + len(line_tokens))
+        if end > base:
+            field_to_mask[prefix][base:end] = 1.0
+        cursor = start + len(line_tokens)
+
+    union_mask = torch.clamp(observed_mask + reasoning_mask + answer_mask, min=0.0, max=1.0)
+    other_mask = torch.clamp(torch.ones((old_len,), dtype=torch.float32) - union_mask, min=0.0, max=1.0)
+    missing = [
+        name for name, mask in (
+            ("observed", observed_mask),
+            ("reasoning", reasoning_mask),
+            ("answer", answer_mask),
+        )
+        if float(mask.sum().item()) <= 0.0
+    ]
+    if missing:
+        if len(field_lines) != 3:
+            raise RuntimeError(f"Stage3 y_vic no-context 字段 mask 构建失败: missing={missing}, target={vic_target!r}")
+        observed_mask.zero_()
+        reasoning_mask.zero_()
+        answer_mask.zero_()
+        max_target_len = max(0, old_len - max(0, int(prompt_len) - 1))
+        for idx, (prefix, _line) in enumerate(field_lines):
+            prefix_text = "\n".join(line for _prefix, line in field_lines[:idx])
+            cur_text = "\n".join(line for _prefix, line in field_lines[:idx + 1])
+            start_rel = 0 if idx == 0 else len(tokenizer.encode(prefix_text, add_special_tokens=False))
+            end_rel = len(tokenizer.encode(cur_text, add_special_tokens=False))
+            start_rel = min(max(0, start_rel), max_target_len)
+            end_rel = min(max(start_rel + 1, end_rel), max_target_len)
+            base = max(0, int(prompt_len) - 1 + start_rel)
+            end = min(old_len, max(base + 1, int(prompt_len) - 1 + end_rel))
+            field_to_mask[prefix][base:end] = 1.0
+        union_mask = torch.clamp(observed_mask + reasoning_mask + answer_mask, min=0.0, max=1.0)
+        other_mask = torch.clamp(torch.ones((old_len,), dtype=torch.float32) - union_mask, min=0.0, max=1.0)
+        still_missing = [
+            name for name, mask in (
+                ("observed", observed_mask),
+                ("reasoning", reasoning_mask),
+                ("answer", answer_mask),
+            )
+            if float(mask.sum().item()) <= 0.0
+        ]
+        if still_missing:
+            raise RuntimeError(
+                f"Stage3 y_vic no-context 字段 mask 构建失败: missing={still_missing}, target={vic_target!r}"
+            )
+    return observed_mask, context_mask, reasoning_mask, answer_mask, other_mask
+
+
+def _build_stage3_sample_cache(train_dataset, args=None) -> List[Stage3SampleCacheItem]:
     cache: List[Stage3SampleCacheItem] = []
     processor = train_dataset.processor
     tokenizer = train_dataset.processor.tokenizer
+    llava_remove_context = _stage3_llava_remove_context(args) if args is not None else False
     for idx in tqdm(range(len(train_dataset)), desc="构建 Stage3SampleCache"):
-        sample = train_dataset[idx]
         raw_item = train_dataset.samples[idx]
+        if llava_remove_context:
+            ann = raw_item.get("teacher_annotation")
+            if isinstance(ann, dict):
+                observed = train_dataset._truncate_field_with_tokenizer(
+                    ann.get("observed_facts_visual", ""),
+                    train_dataset.teacher_observed_max_tokens,
+                )
+                reasoning = train_dataset._truncate_field_with_tokenizer(
+                    _normalize_reasoning_without_final_answer(ann.get("reasoning", "")),
+                    train_dataset.teacher_reasoning_max_tokens,
+                )
+                answer = train_dataset._truncate_field_with_tokenizer(
+                    ann.get("answer", ""),
+                    train_dataset.teacher_answer_max_tokens,
+                )
+            else:
+                if bool(getattr(train_dataset, "require_teacher_annotation", False)):
+                    raise RuntimeError("Stage3 LLaVA no-context 训练要求 teacher_annotation 存在。")
+                answer_letter = str(raw_item.get("answer_letter", "") or "").strip().upper()[:1]
+                if not ("A" <= answer_letter <= "Z"):
+                    raise RuntimeError("Stage3 LLaVA no-context eval cache 缺少可用 answer_letter。")
+                observed = "unavailable"
+                reasoning = "unavailable"
+                answer = answer_letter
+            if not observed or not reasoning or not answer:
+                raise RuntimeError("Stage3 LLaVA no-context 教师字段存在空值，无法构造训练目标。")
+            vic_target = "\n".join([
+                f"Observed Facts: {observed}",
+                f"Reasoning: {reasoning}",
+                f"Answer: {answer}",
+            ])
+            image = materialize_textvqa_image(raw_item["image"])
+            image_sizes = torch.tensor([image.height, image.width], dtype=torch.long)
+            instruction_text = build_readable_instruction_no_context(
+                raw_item["question"],
+                raw_item["choices"],
+                raw_item.get("hint", ""),
+            )
+            prompt_inputs = encode_multimodal(
+                processor,
+                getattr(args, "student_model_type", "llava_next"),
+                instruction_text=instruction_text,
+                image=image,
+                target_text=None,
+                add_generation_prompt=True,
+            )
+            full_inputs = encode_multimodal(
+                processor,
+                getattr(args, "student_model_type", "llava_next"),
+                instruction_text=instruction_text,
+                image=image,
+                target_text=vic_target,
+                add_generation_prompt=False,
+            )
+            prompt_ids = prompt_inputs["input_ids"].squeeze(0)
+            prompt_mask = prompt_inputs["attention_mask"].squeeze(0)
+            y_vic_ids = full_inputs["input_ids"].squeeze(0)
+            y_vic_mask = full_inputs["attention_mask"].squeeze(0)
+            pixel_values = full_inputs["pixel_values"].squeeze(0)
+            if pixel_values.dim() == 3:
+                pixel_values = pixel_values.unsqueeze(0)
+            prompt_len = int(prompt_ids.shape[0])
+            image_grid_thw = full_inputs.get("image_grid_thw")
+            if image_grid_thw is not None:
+                image_grid_thw = image_grid_thw.squeeze(0).detach().cpu()
+        else:
+            sample = train_dataset[idx]
 
-        prompt_ids = sample["prompt_input_ids"]
-        prompt_mask = sample["prompt_attention_mask"]
+            prompt_ids = sample["prompt_input_ids"]
+            prompt_mask = sample["prompt_attention_mask"]
 
-        instruction = raw_item["instruction"]
-        instruction_text = _strip_image_tokens(instruction)
-        _, _, vic_target, _ = train_dataset._build_targets(raw_item, instruction_text)
+            instruction = raw_item["instruction"]
+            instruction_text = _strip_image_tokens(instruction)
+            _, _, vic_target, _ = train_dataset._build_targets(raw_item, instruction_text)
 
-        y_vic_ids = sample["full_input_ids"]
-        y_vic_mask = sample["full_attention_mask"]
+            y_vic_ids = sample["full_input_ids"]
+            y_vic_mask = sample["full_attention_mask"]
 
-        prompt_len = int(prompt_ids.shape[0])
-        pixel_values = sample["pixel_values"]
-        if pixel_values.dim() == 3:
-            pixel_values = pixel_values.unsqueeze(0)
+            prompt_len = int(prompt_ids.shape[0])
+            pixel_values = sample["pixel_values"]
+            if pixel_values.dim() == 3:
+                pixel_values = pixel_values.unsqueeze(0)
 
-        image_sizes = sample["image_sizes"][:2].to(dtype=torch.long).cpu()
+            image_sizes = sample["image_sizes"][:2].to(dtype=torch.long).cpu()
+            image_grid_thw = sample.get("image_grid_thw")
 
         observed_ids = None
         context_ids = None
@@ -1153,7 +1352,6 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
         ann = raw_item.get("teacher_annotation")
         if isinstance(ann, dict):
             observed = ann.get("observed_facts_visual", "")
-            context = ann.get("context_textual", "")
             reasoning = ann.get("reasoning", "")
             answer = ann.get("answer", "")
             if isinstance(observed, str):
@@ -1161,9 +1359,9 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
                     tokenizer.encode(observed, add_special_tokens=False),
                     dtype=torch.long,
                 )
-            if isinstance(context, str):
+            if not llava_remove_context and isinstance(ann.get("context_textual", ""), str):
                 context_ids = torch.tensor(
-                    tokenizer.encode(context, add_special_tokens=False),
+                    tokenizer.encode(ann.get("context_textual", ""), add_special_tokens=False),
                     dtype=torch.long,
                 )
             if isinstance(reasoning, str):
@@ -1176,18 +1374,32 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
                     tokenizer.encode(answer, add_special_tokens=False),
                     dtype=torch.long,
                 )
-        (
-            vic_observed_mask,
-            vic_context_mask,
-            vic_reasoning_mask,
-            vic_answer_mask,
-            vic_other_mask,
-        ) = _build_vic_field_masks(
-            y_vic_ids=y_vic_ids.detach().cpu().long(),
-            prompt_len=prompt_len,
-            tokenizer=tokenizer,
-            vic_target=vic_target,
-        )
+        if llava_remove_context:
+            (
+                vic_observed_mask,
+                vic_context_mask,
+                vic_reasoning_mask,
+                vic_answer_mask,
+                vic_other_mask,
+            ) = _build_vic_field_masks_no_context(
+                y_vic_ids=y_vic_ids.detach().cpu().long(),
+                prompt_len=prompt_len,
+                tokenizer=tokenizer,
+                vic_target=vic_target,
+            )
+        else:
+            (
+                vic_observed_mask,
+                vic_context_mask,
+                vic_reasoning_mask,
+                vic_answer_mask,
+                vic_other_mask,
+            ) = _build_vic_field_masks(
+                y_vic_ids=y_vic_ids.detach().cpu().long(),
+                prompt_len=prompt_len,
+                tokenizer=tokenizer,
+                vic_target=vic_target,
+            )
 
         cache.append(Stage3SampleCacheItem(
             sample_idx=int(idx),
@@ -1197,7 +1409,7 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
             y_vic_mask=y_vic_mask.detach().cpu().long(),
             pixel_values=pixel_values.detach().cpu(),
             image_sizes=image_sizes,
-            image_grid_thw=sample.get("image_grid_thw"),
+            image_grid_thw=image_grid_thw,
             prompt_len=prompt_len,
             observed_ids=observed_ids,
             context_ids=context_ids,
@@ -1208,8 +1420,8 @@ def _build_stage3_sample_cache(train_dataset) -> List[Stage3SampleCacheItem]:
             vic_reasoning_mask=vic_reasoning_mask,
             vic_answer_mask=vic_answer_mask,
             vic_other_mask=vic_other_mask,
-            answer_letter=str(sample.get("answer_letter", "") or "").strip().upper()[:1],
-            answer_idx=int(sample["answer_idx"]),
+            answer_letter=str(raw_item.get("answer_letter", "") or "").strip().upper()[:1],
+            answer_idx=int(raw_item["answer_idx"]),
             num_choices=len(raw_item["choices"]),
         ))
     return cache
@@ -1353,7 +1565,10 @@ def _generate_candidate_single(
     device = args.device
     prompt_ids = sample.prompt_ids.unsqueeze(0).to(device)
     prompt_mask = sample.prompt_mask.unsqueeze(0).to(device)
-    pixel_values = sample.pixel_values.unsqueeze(0).to(device)
+    if _is_stage3_qwen_backend(args):
+        pixel_values = _concat_qwen_pixel_values([sample.pixel_values]).to(device)
+    else:
+        pixel_values = sample.pixel_values.unsqueeze(0).to(device)
     image_sizes = sanitize_image_sizes(sample.image_sizes.unsqueeze(0), batch_size=1)
     image_grid_thw = _stack_optional_image_grid_thw([sample.image_grid_thw])
     allowed_img_count = int((sample.prompt_ids == int(image_token_id)).sum().item()) if image_token_id is not None else 0
@@ -1430,7 +1645,7 @@ def _generate_candidate_batch(
         pad_value=0.0,
         dtype=torch.long,
     ).to(device)
-    pixel_values = _stack_padded_pixel_values([sample.pixel_values for sample in samples]).to(device)
+    pixel_values = _stack_pixel_values_for_backend([sample.pixel_values for sample in samples], args).to(device)
     image_sizes = sanitize_image_sizes(
         _stack_optional_image_sizes([sample.image_sizes for sample in samples]),
         batch_size=len(samples),
@@ -1513,8 +1728,14 @@ def _extract_answer_letter(text: str) -> Optional[str]:
     return None
 
 
-def _parse_readable_answer_field(text: str) -> Tuple[bool, str]:
-    prefixes = ["Observed Facts:", "Context:", "Reasoning:", "Answer:"]
+def _parse_readable_answer_field(text: str, remove_context: bool = False) -> Tuple[bool, str]:
+    if remove_context and "Context:" in str(text or ""):
+        return False, ""
+    prefixes = (
+        ["Observed Facts:", "Reasoning:", "Answer:"]
+        if remove_context
+        else ["Observed Facts:", "Context:", "Reasoning:", "Answer:"]
+    )
     positions = []
     for prefix in prefixes:
         pos = str(text or "").find(prefix)
@@ -1751,7 +1972,7 @@ def _evaluate_stage3_answer_metrics(
                     _pad_1d_tensor(sample.prompt_mask.long(), prompt_ids.shape[1], 0)
                     for sample in batch_samples
                 ], dim=0).to(args.device)
-                pixel_values = _stack_padded_pixel_values([sample.pixel_values for sample in batch_samples]).to(args.device)
+                pixel_values = _stack_pixel_values_for_backend([sample.pixel_values for sample in batch_samples], args).to(args.device)
                 image_sizes = sanitize_image_sizes(
                     _stack_optional_image_sizes([sample.image_sizes for sample in batch_samples]),
                     batch_size=len(batch_samples),
@@ -1798,7 +2019,10 @@ def _evaluate_stage3_answer_metrics(
                 gen_ids = ids[prompt_len:] if ids.shape[0] > prompt_len else ids
                 text = tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True)
                 if eval_mode == "generate_readable":
-                    readable_ok, answer_text = _parse_readable_answer_field(text)
+                    readable_ok, answer_text = _parse_readable_answer_field(
+                        text,
+                        remove_context=_stage3_llava_remove_context(args),
+                    )
                     pred = _extract_answer_letter(answer_text) if readable_ok else None
                 else:
                     readable_ok = False
@@ -1844,7 +2068,7 @@ def _score_sequences_no_grad_batch(
     with torch.no_grad():
         ids_b = _pad_and_stack_1d_tensors(ids_list, pad_value=float(pad_token_id), dtype=torch.long).to(args.device)
         mask_b = _pad_and_stack_1d_tensors(mask_list, pad_value=0.0, dtype=torch.long).to(args.device)
-        pixel_values = _stack_padded_pixel_values([sample.pixel_values for sample in samples]).to(args.device)
+        pixel_values = _stack_pixel_values_for_backend([sample.pixel_values for sample in samples], args).to(args.device)
         image_sizes = sanitize_image_sizes(
             _stack_optional_image_sizes([sample.image_sizes for sample in samples]),
             batch_size=len(samples),
@@ -2282,7 +2506,13 @@ def _build_pairs_and_next_states_distributed(
                     teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
                     if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
                         cand_scored = [
-                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            _stage3_score_readable_candidate(
+                                cand,
+                                sample,
+                                tokenizer,
+                                teacher_letter,
+                                remove_context=_stage3_llava_remove_context(args),
+                            )
                             for cand in candidates
                         ]
                         cand_scored.sort(
@@ -2377,7 +2607,13 @@ def _build_pairs_and_next_states_distributed(
                     teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
                     if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
                         next_scored = [
-                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            _stage3_score_readable_candidate(
+                                cand,
+                                sample,
+                                tokenizer,
+                                teacher_letter,
+                                remove_context=_stage3_llava_remove_context(args),
+                            )
                             for cand in next_sorted
                         ]
                         next_scored.sort(
@@ -2699,7 +2935,13 @@ def _build_pairs_and_next_states(
                     teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
                     if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
                         cand_scored = [
-                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            _stage3_score_readable_candidate(
+                                cand,
+                                sample,
+                                tokenizer,
+                                teacher_letter,
+                                remove_context=_stage3_llava_remove_context(args),
+                            )
                             for cand in candidates
                         ]
                         cand_scored.sort(
@@ -2795,7 +3037,13 @@ def _build_pairs_and_next_states(
                     teacher_letter = _stage3_teacher_answer_letter(sample, tokenizer)
                     if len(teacher_letter) == 1 and "A" <= teacher_letter <= "Z":
                         next_scored = [
-                            _stage3_score_readable_candidate(cand, sample, tokenizer, teacher_letter)
+                            _stage3_score_readable_candidate(
+                                cand,
+                                sample,
+                                tokenizer,
+                                teacher_letter,
+                                remove_context=_stage3_llava_remove_context(args),
+                            )
                             for cand in next_sorted
                         ]
                         next_scored.sort(
@@ -3266,6 +3514,11 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
     stage3_phase_a_batch_size = _get_stage3_phase_a_batch_size(args, train_bucket_meta)
     stage3_use_static_bucket = bool(_is_hf_multichoice_dataset(args.dataset_name) and train_bucket_meta is not None)
     stage3_eval_answer_mode = str(args.stage3_eval_answer_mode).strip().lower()
+    readable_schema = (
+        "llava_three_field_no_context"
+        if _stage3_llava_remove_context(args)
+        else "readable_four_field"
+    )
 
     if is_main_process():
         print(
@@ -3286,6 +3539,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
             f"ans_anchor_w={float(args.stage3_answer_anchor_weight):.2f}, "
             f"ans_prefix_w={float(args.stage3_answer_prefix_weight):.2f}, "
             f"pair_by_answer={int(_stage3_use_answer_correctness_pair(args))}, "
+            f"schema={readable_schema}, "
             f"wrong_image={int(bool(args.stage3_wrong_image_enable))}, "
             f"force_cold_start_p0={int(bool(args.stage3_force_cold_start_period0))}, "
             f"phaseA_batch_size={stage3_phase_a_batch_size}, static_bucket={int(stage3_use_static_bucket)}, "
@@ -3305,13 +3559,13 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
     if sample_cache is None:
         if is_distributed():
             if is_main_process():
-                sample_cache = _build_stage3_sample_cache(train_dataset)
+                sample_cache = _build_stage3_sample_cache(train_dataset, args=args)
                 _save_stage3_sample_cache(stage3_sample_cache_path, sample_cache)
             barrier_if_distributed()
             if not is_main_process():
                 sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
         else:
-            sample_cache = _build_stage3_sample_cache(train_dataset)
+            sample_cache = _build_stage3_sample_cache(train_dataset, args=args)
             _save_stage3_sample_cache(stage3_sample_cache_path, sample_cache)
     if not sample_cache:
         raise RuntimeError("Stage3SampleCache 为空，无法开始 Stage3 训练")
@@ -3375,13 +3629,13 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
         if eval_sample_cache is None:
             if is_distributed():
                 if is_main_process():
-                    eval_sample_cache = _build_stage3_sample_cache(eval_dataset)
+                    eval_sample_cache = _build_stage3_sample_cache(eval_dataset, args=args)
                     _save_stage3_sample_cache(stage3_eval_sample_cache_path, eval_sample_cache)
                 barrier_if_distributed()
                 if not is_main_process():
                     eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
             else:
-                eval_sample_cache = _build_stage3_sample_cache(eval_dataset)
+                eval_sample_cache = _build_stage3_sample_cache(eval_dataset, args=args)
                 _save_stage3_sample_cache(stage3_eval_sample_cache_path, eval_sample_cache)
         eval_pool_indices = list(range(len(eval_sample_cache)))
         for idx, sample in enumerate(eval_samples):
@@ -3629,7 +3883,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
                     print(
                         f"[Stage3][Eval][S{sub_stage_idx+1}P{period_idx+1}] "
                         f"val_answer_acc={val_acc:.4f}, format_rate={val_fmt:.4f}, "
-                        f"mode={stage3_eval_answer_mode}, n={val_n}"
+                        f"mode={stage3_eval_answer_mode}, schema={readable_schema}, n={val_n}"
                     )
                     if tb_writer is not None:
                         tb_writer.add_scalar("stage3_eval/val_answer_acc", val_acc, period_counter)

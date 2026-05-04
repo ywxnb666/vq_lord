@@ -17,6 +17,11 @@ EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-512}"
 ENABLE_SECOND_PASS="${ENABLE_SECOND_PASS:-0}"
 SECOND_PASS_MAX_NEW_TOKENS="${SECOND_PASS_MAX_NEW_TOKENS:-1024}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate_readable}"
+if [ "${STUDENT_MODEL_TYPE}" = "llava_next" ]; then
+    STAGE3_LLAVA_REMOVE_CONTEXT="${STAGE3_LLAVA_REMOVE_CONTEXT:-1}"
+else
+    STAGE3_LLAVA_REMOVE_CONTEXT="${STAGE3_LLAVA_REMOVE_CONTEXT:-0}"
+fi
 USE_4BIT="${USE_4BIT:-0}"
 USE_VQ="${USE_VQ:-1}"
 if [ "${REMOVE_VQ_CODEBOOK}" = "1" ]; then
@@ -40,12 +45,16 @@ GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 # Paths
 PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
-PERIOD=1
+PERIOD=12
 STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3/stage3_sub1_period${PERIOD}}"
 # STAGE3_FINAL_ADAPTER_PATH="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7"
 BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/scienceqa_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
-SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_shards}"
-RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/${STUDENT_MODEL_TYPE}_${DATASET_TAG}_stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_period${PERIOD}.json}"
+STAGE3_EVAL_SCHEMA_SUFFIX=""
+if [ "${STUDENT_MODEL_TYPE}" = "llava_next" ] && [ "${STAGE3_LLAVA_REMOVE_CONTEXT}" = "1" ]; then
+    STAGE3_EVAL_SCHEMA_SUFFIX="_noctx"
+fi
+SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}${STAGE3_EVAL_SCHEMA_SUFFIX}_vq${USE_VQ}_bucketed_shards}"
+RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/${STUDENT_MODEL_TYPE}_${DATASET_TAG}_stage3_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_period${PERIOD}${STAGE3_EVAL_SCHEMA_SUFFIX}.json}"
 
 align_vq_print_header "Stage3 产物并行分桶评测"
 echo "ROOT_DIR: ${ROOT_DIR}"
@@ -61,6 +70,7 @@ echo "EVAL_MAX_NEW_TOKENS: ${EVAL_MAX_NEW_TOKENS}"
 echo "ENABLE_SECOND_PASS: ${ENABLE_SECOND_PASS}"
 echo "SECOND_PASS_MAX_NEW_TOKENS: ${SECOND_PASS_MAX_NEW_TOKENS}"
 echo "EVAL_BUCKET_BATCH_SIZE: ${EVAL_BUCKET_BATCH_SIZE}"
+echo "STAGE3_LLAVA_REMOVE_CONTEXT: ${STAGE3_LLAVA_REMOVE_CONTEXT}"
 echo "SHARD_RESULT_DIR: ${SHARD_RESULT_DIR}"
 echo "RESULT_PATH: ${RESULT_PATH}"
 echo "LOG_FILE: ${LOG_FILE}"
@@ -128,6 +138,7 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
             --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
             --vq_codebook_path="${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" \
             --answer_mode="${EVAL_ANSWER_MODE}" \
+            --stage3_llava_remove_context="${STAGE3_LLAVA_REMOVE_CONTEXT}" \
             --bucket_plan_path="${BUCKET_PLAN_PATH}" \
             --num_shards="${NUM_SHARDS}" \
             --shard_id="${shard_id}" \
@@ -223,6 +234,7 @@ fi
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
     --vq_codebook_path="${STAGE3_FINAL_ADAPTER_PATH}/vq_codebook.pt" \
     --answer_mode="${EVAL_ANSWER_MODE}" \
+    --stage3_llava_remove_context="${STAGE3_LLAVA_REMOVE_CONTEXT}" \
     --bucket_plan_path="${BUCKET_PLAN_PATH}" \
     --num_shards="${NUM_SHARDS}" \
     --shard_result_dir="${SHARD_RESULT_DIR}" \

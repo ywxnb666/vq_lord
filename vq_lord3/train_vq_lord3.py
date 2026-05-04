@@ -453,6 +453,24 @@ def build_readable_instruction(question: str, choices: List[str], hint: str = ""
     )
 
 
+def build_readable_instruction_no_context(question: str, choices: List[str], hint: str = "") -> str:
+    choices_text = ""
+    for idx, choice in enumerate(choices or []):
+        choices_text += f"({chr(65 + idx)}) {choice}\n"
+    hint_block = f"Hint: {hint}\n" if hint else ""
+    return (
+        f"Question: {question}\n"
+        f"{hint_block}"
+        "Options:\n"
+        f"{choices_text}"
+        "\n"
+        "Generate exactly three fields in this order:\n"
+        "Observed Facts: describe only image-observable evidence.\n"
+        "Reasoning: compare options briefly, but do not state the final answer here.\n"
+        "Answer: give only the final option and answer, for example '(A) answer text'."
+    )
+
+
 def _build_readable_target_from_annotation(ann: dict) -> str:
     if not isinstance(ann, dict):
         raise RuntimeError("teacher_annotation 必须是 dict，无法构造四字段目标。")
@@ -1886,6 +1904,8 @@ def setup_args():
                        help="Stage3 错图负样本对比边际（token-level log-prob）")
     parser.add_argument("--stage3_force_cold_start_period0", type=int, default=1,
                        help="Stage3 是否在 period0 强制使用 y_vic 作为正样本，1=启用，0=关闭")
+    parser.add_argument("--stage3_llava_remove_context", type=int, default=0,
+                       help="Stage3 LLaVA 是否使用三字段 no-context readable 目标，1=启用，0=关闭")
     
     # LoRA 参数
     parser.add_argument("--use_lora", type=int, default=1,

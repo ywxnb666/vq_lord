@@ -101,6 +101,24 @@ def build_readable_instruction(question: str, choices: List[str], hint: str = ""
     )
 
 
+def build_readable_instruction_no_context(question: str, choices: List[str], hint: str = "") -> str:
+    choices_text = ""
+    for idx, choice in enumerate(choices):
+        choices_text += f"({chr(65 + idx)}) {choice}\n"
+    hint_block = f"Hint: {hint}\n" if hint else ""
+    return (
+        f"Question: {question}\n"
+        f"{hint_block}"
+        "Options:\n"
+        f"{choices_text}"
+        "\n"
+        "Generate exactly three fields in this order:\n"
+        "Observed Facts: describe only image-observable evidence.\n"
+        "Reasoning: compare options briefly, but do not state the final answer here.\n"
+        "Answer: give only the final option and answer, for example '(A) answer text'."
+    )
+
+
 def build_prompt(processor, question: str, choices: List[str], hint: str = "") -> str:
     instruction_text = build_legacy_instruction(question, choices, hint)
     if hasattr(processor, "apply_chat_template"):
@@ -133,9 +151,49 @@ def build_readable_prompt(processor, question: str, choices: List[str], hint: st
     return f"<image>\n{instruction_text}"
 
 
+def build_readable_prompt_no_context(processor, question: str, choices: List[str], hint: str = "") -> str:
+    instruction_text = build_readable_instruction_no_context(question, choices, hint)
+    if hasattr(processor, "apply_chat_template"):
+        prompt_conv = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction_text},
+                    {"type": "image"},
+                ],
+            }
+        ]
+        return processor.apply_chat_template(prompt_conv, add_generation_prompt=True)
+    return f"<image>\n{instruction_text}"
+
+
 def parse_readable_fields(output_text: str) -> Tuple[bool, dict]:
     text = output_text or ""
     prefixes = ["Observed Facts:", "Context:", "Reasoning:", "Answer:"]
+    positions = []
+    for prefix in prefixes:
+        pos = text.find(prefix)
+        if pos < 0:
+            return False, {}
+        positions.append(pos)
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        return False, {}
+    fields = {}
+    for idx, prefix in enumerate(prefixes):
+        start = positions[idx] + len(prefix)
+        end = positions[idx + 1] if idx + 1 < len(prefixes) else len(text)
+        value = text[start:end].strip()
+        key = prefix[:-1].lower().replace(" ", "_")
+        fields[key] = value
+    ok = all(fields.get(prefix[:-1].lower().replace(" ", "_"), "") for prefix in prefixes)
+    return bool(ok), fields
+
+
+def parse_readable_fields_no_context(output_text: str) -> Tuple[bool, dict]:
+    text = output_text or ""
+    if "Context:" in text:
+        return False, {}
+    prefixes = ["Observed Facts:", "Reasoning:", "Answer:"]
     positions = []
     for prefix in prefixes:
         pos = text.find(prefix)
@@ -600,6 +658,7 @@ def run_eval(
     max_new_tokens: int,
     save_path: str,
     answer_mode: str,
+    stage3_llava_remove_context: int = 0,
     run_config: Optional[dict] = None,
 ):
     dataset_name = normalize_dataset_name(dataset_name)
@@ -614,16 +673,17 @@ def run_eval(
     total = 0
     format_hits = 0
     answer_parse_hits = 0
-    field_nonempty = {
-        "observed_facts": 0,
-        "context": 0,
-        "reasoning": 0,
-        "answer": 0,
-    }
-    field_token_totals = {key: 0 for key in field_nonempty}
     student_model_type = normalize_student_model_type(
         getattr(getattr(model, "config", None), "student_model_type", LLAVA_NEXT)
     )
+    llava_remove_context = student_model_type == LLAVA_NEXT and int(stage3_llava_remove_context) == 1
+    field_names = (
+        ("observed_facts", "reasoning", "answer")
+        if llava_remove_context
+        else ("observed_facts", "context", "reasoning", "answer")
+    )
+    field_nonempty = {key: 0 for key in field_names}
+    field_token_totals = {key: 0 for key in field_names}
     runtime_args = type("Args", (), {"student_model_type": student_model_type})()
     device = next(model.parameters()).device
 
@@ -641,7 +701,9 @@ def run_eval(
 
         if student_model_type == LLAVA_NEXT:
             prompt = (
-                build_readable_prompt(processor, question, choices, hint)
+                build_readable_prompt_no_context(processor, question, choices, hint)
+                if llava_remove_context and answer_mode == "generate_readable"
+                else build_readable_prompt(processor, question, choices, hint)
                 if answer_mode == "generate_readable"
                 else build_prompt(processor, question, choices, hint)
             )
@@ -722,7 +784,10 @@ def run_eval(
                 output_text = "[empty_generation]"
 
             if answer_mode == "generate_readable":
-                readable_format_ok, parsed_fields = parse_readable_fields(output_text)
+                if llava_remove_context:
+                    readable_format_ok, parsed_fields = parse_readable_fields_no_context(output_text)
+                else:
+                    readable_format_ok, parsed_fields = parse_readable_fields(output_text)
                 if readable_format_ok:
                     format_hits += 1
                     for field_name in field_nonempty:
@@ -832,6 +897,8 @@ def parse_args():
         help="答案获取方式：generate_readable=四字段生成严格解析, generate=仅生成解析, logits=仅下一token打分, hybrid=生成失败时回退logits",
     )
     parser.add_argument("--save_path", type=str, default="./sciqa_eval.json", help="保存结果路径")
+    parser.add_argument("--stage3_llava_remove_context", type=int, default=0,
+                        help="LLaVA generate_readable 是否使用三字段 no-context 解析")
     return parser.parse_args()
 
 
@@ -870,7 +937,18 @@ def main():
         "trainable_state_loaded": load_info.get("trainable_state_loaded", 0),
         "trainable_state_skipped": load_info.get("trainable_state_skipped", 0),
         "answer_mode": args.answer_mode,
-        "prompt_style": "readable_four_field" if args.answer_mode == "generate_readable" else "stage3_legacy",
+        "stage3_llava_remove_context": int(args.stage3_llava_remove_context),
+        "prompt_style": (
+            "llava_three_field_no_context"
+            if (
+                args.student_model_type == LLAVA_NEXT
+                and args.answer_mode == "generate_readable"
+                and int(args.stage3_llava_remove_context) == 1
+            )
+            else "readable_four_field"
+            if args.answer_mode == "generate_readable"
+            else "stage3_legacy"
+        ),
     }
     run_eval(
         model=model,
@@ -882,6 +960,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         save_path=args.save_path,
         answer_mode=args.answer_mode,
+        stage3_llava_remove_context=int(args.stage3_llava_remove_context),
         run_config=run_config,
     )
 
