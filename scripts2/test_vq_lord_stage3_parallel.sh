@@ -45,7 +45,7 @@ GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 # Paths
 PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
-PERIOD=12
+PERIOD=7
 STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3/stage3_sub1_period${PERIOD}}"
 # STAGE3_FINAL_ADAPTER_PATH="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7"
 BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/scienceqa_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"

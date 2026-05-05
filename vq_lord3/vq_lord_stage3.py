@@ -105,6 +105,29 @@ def _stage3_prefix_mask_from_field_mask(field_mask: torch.Tensor, max_prefix_tok
     return active * (prefix_pos <= int(max_prefix_tokens)).to(dtype=field_mask.dtype)
 
 
+def _stage3_observed_content_mask(observed_mask: torch.Tensor, max_prefix_tokens: int = 4) -> torch.Tensor:
+    prefix_mask = _stage3_prefix_mask_from_field_mask(
+        observed_mask,
+        max_prefix_tokens=max_prefix_tokens,
+    )
+    return torch.clamp(observed_mask - prefix_mask, min=0.0)
+
+
+def _stage3_row_masked_mean(values: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    row_weight = mask.to(dtype=values.dtype).sum(dim=1)
+    row_sum = (values * mask.to(dtype=values.dtype)).sum(dim=1)
+    valid = row_weight > 0
+    row_mean = row_sum / row_weight.clamp_min(1.0)
+    return row_mean, valid
+
+
+def _stage3_valid_row_mean_ddp(values: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, float]:
+    row_mask = valid.to(device=values.device, dtype=values.dtype)
+    local_sum = (values * row_mask).sum()
+    local_weight = row_mask.sum().to(dtype=torch.float32)
+    return _stage3_global_mean_from_local_sum(local_sum, local_weight)
+
+
 def _stage3_use_answer_correctness_pair(args) -> bool:
     return str(getattr(args, "student_model_type", "")) == "llava_next"
 
@@ -2048,8 +2071,9 @@ def _evaluate_stage3_answer_metrics(
     if is_distributed():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     total_all = int(stats[2].item())
-    denom = max(1, total_all)
-    return float(stats[0].item()) / denom, float(stats[1].item()) / denom, total_all
+    acc_denom = max(1, int(stats[1].item()))
+    fmt_denom = max(1, total_all)
+    return float(stats[0].item()) / acc_denom, float(stats[1].item()) / fmt_denom, total_all
 
 
 def _score_sequences_no_grad_batch(
@@ -3327,12 +3351,16 @@ def _run_one_period_train(
                     cur_lp_vic = cur_lp_vic[:, :target]
                     mask_vic = mask_vic[:, :target]
                 wrong_mask = (mask_vic * cur_mask_wrong_vic).float()
-                if _stage3_use_answer_correctness_pair(args):
-                    if vic_observed_mask.shape[1] != wrong_mask.shape[1]:
-                        vic_observed_mask = vic_observed_mask[:, :wrong_mask.shape[1]]
-                    wrong_mask = wrong_mask * vic_observed_mask * (1.0 - wrong_is_self).view(-1, 1)
-                wrong_delta = F.relu(cur_lp_wrong_vic - cur_lp_vic + wrong_image_margin)
-                loss_wrong, loss_wrong_val = _stage3_masked_mean_ddp(wrong_delta, wrong_mask)
+                observed_mask_for_wrong = vic_observed_mask[:, :wrong_mask.shape[1]]
+                observed_content_mask = _stage3_observed_content_mask(observed_mask_for_wrong)
+                wrong_mask = wrong_mask * observed_content_mask * (1.0 - wrong_is_self).view(-1, 1)
+                pos_score, pos_valid = _stage3_row_masked_mean(cur_lp_vic, wrong_mask)
+                wrong_score, wrong_valid = _stage3_row_masked_mean(cur_lp_wrong_vic, wrong_mask)
+                wrong_delta = F.relu(wrong_score - pos_score + wrong_image_margin)
+                loss_wrong, loss_wrong_val = _stage3_valid_row_mean_ddp(
+                    wrong_delta,
+                    pos_valid & wrong_valid,
+                )
 
         loss_vic_total = (
             readable_sft_weight * loss_readable_sft
@@ -3497,7 +3525,7 @@ def _run_one_period_train(
 def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: Optional[dict] = None):
     if is_main_process():
         print("\n" + "=" * 50)
-        print("阶段 3: LoRD-II 多 Period 训练")
+        print("Stage 3")
         print("=" * 50)
 
     base_model = unwrap_model(model)

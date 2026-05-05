@@ -12,7 +12,7 @@ VQ-LoRD 主训练脚本
 3. 加载教师模型收集的视觉数据
 4. 三阶段训练: VQ预训练 → 视觉蒸馏 → LoRD联合训练
 
-    Author: VQ-LoRD Project
+    Author: LoRD Project
     Created: January 2026
 ======================================================================
 """
@@ -404,14 +404,14 @@ READABLE_FIELD_PREFIXES = (
 FINAL_ANSWER_CUE_RE = re.compile(
     r"(?is)"
     r"(?:^|[\n。.!?]\s*)"
-    r"(?:therefore|thus|so|hence|overall|in conclusion|最终|因此|所以|综上)[^。\n.!?]*"
+    r"(?:\b(?:therefore|thus|so|hence|overall|in conclusion)\b|最终|因此|所以|综上)[^。\n.!?]*"
     r"(?:answer|答案|correct answer|正确答案|option\s*\(?[A-Z]\)?|选项\s*[A-Z])"
     r"[^。\n.!?]*(?:[。.!?]|$)"
 )
 ANSWER_CUE_RE = re.compile(
     r"(?is)"
     r"(?:^|[\n。.!?]\s*)"
-    r"[^。\n.!?]*(?:the\s+answer\s+is|answer\s*:|答案是|答案为|correct\s+answer\s+is|正确答案是)"
+    r"(?:the\s+answer\s+is|answer\s*:|答案是|答案为|correct\s+answer\s+is|正确答案是)"
     r"[^。\n.!?]*(?:[。.!?]|$)"
 )
 
@@ -948,8 +948,21 @@ class ScienceQADataset(torch.utils.data.Dataset):
             self.teacher_answer_max_tokens,
         )
 
-        if not observed or not context or not reasoning or not answer_field:
-            raise RuntimeError("teacher_annotation 四字段存在空值，无法构造训练目标。")
+        bad_fields = []
+        if not observed:
+            bad_fields.append("observed_facts_visual")
+        if not context:
+            bad_fields.append("context_textual")
+        if not reasoning:
+            bad_fields.append("reasoning")
+        if not answer_field:
+            bad_fields.append("answer")
+        if bad_fields:
+            raise RuntimeError(
+                "teacher_annotation 四字段存在空值，无法构造训练目标。"
+                f" sample_id={item.get('sample_id')}, source_index={item.get('source_index')}, "
+                f"bad_fields={bad_fields}"
+            )
 
         readable_lines = [
             f"Observed Facts: {observed}",
@@ -1751,7 +1764,7 @@ def save_stage3_checkpoint(
 
 def setup_args():
     """设置训练参数"""
-    parser = argparse.ArgumentParser(description="VQ-LoRD 训练脚本")
+    parser = argparse.ArgumentParser(description="LoRD 训练脚本")
     
     # 模型参数
     parser.add_argument("--model_path", type=str, 
@@ -2352,7 +2365,7 @@ def main():
 
         if is_main_process():
             print("=" * 60)
-            print("VQ-LoRD 训练")
+            print("MLoRD")
             print("=" * 60)
             # pprint(vars(args))
             print("=" * 60)
@@ -2724,7 +2737,7 @@ def main():
 
         if is_main_process():
             print("\n" + "=" * 60)
-            print("VQ-LoRD 训练完成!")
+            print("MLoRD Finished!")
             print("=" * 60)
     finally:
         if tb_writer is not None:

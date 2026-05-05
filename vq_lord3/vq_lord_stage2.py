@@ -415,7 +415,7 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
     """
     if is_main_process():
         print("\n" + "=" * 50)
-        print("阶段 2: 视觉能力蒸馏")
+        print("Stage2")
         print("=" * 50)
 
     image_token_id = _get_image_token_id(model)
@@ -531,7 +531,7 @@ def train_stage2_vision(model, dataloader, args, tb_writer):
         optimizer.zero_grad(set_to_none=True)
         progress_bar = tqdm(
             dataloader,
-            desc=f"视觉蒸馏 Epoch {epoch+1}",
+            desc=f"Stage2 Epoch {epoch+1}",
             disable=not is_main_process(),
         )
         for batch_idx, batch in enumerate(progress_bar):
