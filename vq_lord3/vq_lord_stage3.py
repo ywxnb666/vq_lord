@@ -44,7 +44,7 @@ from train_vq_lord3 import (
     is_distributed,
     is_main_process,
     is_projector_param,
-    materialize_textvqa_image,
+    materialize_iconqa_image,
     maybe_set_dataloader_epoch,
     reduce_numeric_dict,
     sanitize_image_sizes,
@@ -305,6 +305,7 @@ def _stage3_resume_config(args) -> dict:
         "stage3_vic_include_context": int(getattr(args, "stage3_vic_include_context", 0)),
         "lr": float(args.lr),
         "stage3_lr_scale": float(getattr(args, "stage3_lr_scale", 0.0)),
+        "stage3_projector_lr_scale": float(getattr(args, "stage3_projector_lr_scale", 0.0)),
         "stage3_grad_clip": float(getattr(args, "stage3_grad_clip", 0.0)),
         "stage3_grad_accum": int(getattr(args, "stage3_grad_accum", 0)),
         "grad_accum": int(getattr(args, "grad_accum", 1)),
@@ -379,6 +380,7 @@ def _validate_stage3_resume_config(resume_config: dict, args):
         "max_new_tokens",
         "stage3_eval_max_new_tokens",
         "stage3_train_projector",
+        "stage3_projector_lr_scale",
         "stage3_field_weight_observed",
         "stage3_field_weight_context",
         "stage3_field_weight_reasoning",
@@ -1308,7 +1310,7 @@ def _build_stage3_sample_cache(train_dataset, args=None) -> List[Stage3SampleCac
                 f"Reasoning: {reasoning}",
                 f"Answer: {answer}",
             ])
-            image = materialize_textvqa_image(raw_item["image"])
+            image = materialize_iconqa_image(raw_item["image"])
             image_sizes = torch.tensor([image.height, image.width], dtype=torch.long)
             instruction_text = build_readable_instruction_no_context(
                 raw_item["question"],
@@ -1539,7 +1541,12 @@ def _load_stage3_sample_cache(cache_path: str, args=None) -> Optional[List[Stage
 def _save_stage3_sample_cache(cache_path: str, cache_items: List[Stage3SampleCacheItem]):
     cache_dir = os.path.dirname(cache_path) or "."
     os.makedirs(cache_dir, exist_ok=True)
-    torch.save(cache_items, cache_path)
+    tmp_path = os.path.join(
+        cache_dir,
+        f".{os.path.basename(cache_path)}.tmp.rank{get_rank()}.pid{os.getpid()}",
+    )
+    torch.save(cache_items, tmp_path)
+    os.replace(tmp_path, cache_path)
     print(f"[Stage3][Cache] 已保存 Stage3SampleCache: {cache_path}, samples={len(cache_items)}")
 
 
@@ -1557,6 +1564,30 @@ def _set_stage3_trainable_params(model, args) -> List[torch.nn.Parameter]:
         )
         param.requires_grad = bool(is_lora or is_projector)
     return [p for p in base_model.parameters() if p.requires_grad]
+
+
+def _build_stage3_optimizer_param_groups(model, args, stage3_lr: float) -> List[dict]:
+    base_model = unwrap_model(model)
+    lora_params: List[torch.nn.Parameter] = []
+    projector_params: List[torch.nn.Parameter] = []
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        name_l = name.lower()
+        if is_projector_param(name, getattr(args, "student_model_type", "llava_next")):
+            projector_params.append(param)
+        elif "lora_" in name_l or "modules_to_save" in name_l:
+            lora_params.append(param)
+        else:
+            lora_params.append(param)
+
+    param_groups: List[dict] = []
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": stage3_lr})
+    if projector_params:
+        projector_lr = stage3_lr * float(getattr(args, "stage3_projector_lr_scale", 0.1))
+        param_groups.append({"params": projector_params, "lr": projector_lr})
+    return param_groups
 
 
 def _strip_extra_image_tokens(
@@ -3553,6 +3584,7 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
             f"[Stage3] tau1={tau1}, tau_delta={tau_delta}, "
             f"sub_stage_num={sub_stage_num}, period_num={period_num}, sub_set_num={sub_set_num}, "
             f"lr={stage3_lr}, train_projector={int(bool(args.stage3_train_projector))}, "
+            f"projector_lr_scale={float(getattr(args, 'stage3_projector_lr_scale', 0.1)):.3f}, "
             f"resume_opt={int(bool(args.stage3_resume_save_optimizer))}, "
             f"eval_max_samples={int(args.stage3_eval_max_samples)}, "
             f"eval_max_new_tokens={int(args.stage3_eval_max_new_tokens)}, "
@@ -3580,19 +3612,25 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
         print(f"Stage3 可训练参数量: {sum(p.numel() for p in trainable_params):,}")
     if not trainable_params:
         raise RuntimeError("Stage3 没有可训练参数，请检查 LoRA 或 stage3_train_projector 配置")
-    optimizer = torch.optim.AdamW(trainable_params, lr=stage3_lr)
+    optimizer = torch.optim.AdamW(
+        _build_stage3_optimizer_param_groups(model, args, stage3_lr),
+        lr=stage3_lr,
+    )
 
     stage3_sample_cache_path = _resolve_stage3_sample_cache_path(args)
-    sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
-    if sample_cache is None:
-        if is_distributed():
-            if is_main_process():
+    sample_cache = None
+    if is_distributed():
+        if is_main_process():
+            sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
+            if sample_cache is None:
                 sample_cache = _build_stage3_sample_cache(train_dataset, args=args)
                 _save_stage3_sample_cache(stage3_sample_cache_path, sample_cache)
-            barrier_if_distributed()
-            if not is_main_process():
-                sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
-        else:
+        barrier_if_distributed()
+        if not is_main_process():
+            sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
+    else:
+        sample_cache = _load_stage3_sample_cache(stage3_sample_cache_path, args)
+        if sample_cache is None:
             sample_cache = _build_stage3_sample_cache(train_dataset, args=args)
             _save_stage3_sample_cache(stage3_sample_cache_path, sample_cache)
     if not sample_cache:
@@ -3653,18 +3691,23 @@ def train_stage3_lord(model, train_dataset, args, tb_writer, train_bucket_meta: 
             stage3_vic_include_context=bool(int(args.stage3_vic_include_context)),
             require_teacher_annotation=False,
         )
-        eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
-        if eval_sample_cache is None:
-            if is_distributed():
-                if is_main_process():
+        eval_sample_cache = None
+        if is_distributed():
+            if is_main_process():
+                eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
+                if eval_sample_cache is None:
                     eval_sample_cache = _build_stage3_sample_cache(eval_dataset, args=args)
                     _save_stage3_sample_cache(stage3_eval_sample_cache_path, eval_sample_cache)
-                barrier_if_distributed()
-                if not is_main_process():
-                    eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
-            else:
+            barrier_if_distributed()
+            if not is_main_process():
+                eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
+        else:
+            eval_sample_cache = _load_stage3_sample_cache(stage3_eval_sample_cache_path, args)
+            if eval_sample_cache is None:
                 eval_sample_cache = _build_stage3_sample_cache(eval_dataset, args=args)
                 _save_stage3_sample_cache(stage3_eval_sample_cache_path, eval_sample_cache)
+        if not eval_sample_cache:
+            raise RuntimeError("Stage3 eval sample cache 为空，无法开始 Stage3 评估")
         eval_pool_indices = list(range(len(eval_sample_cache)))
         for idx, sample in enumerate(eval_samples):
             answer_letter = str(sample.get("answer_letter", "") or "").strip().upper()[:1]

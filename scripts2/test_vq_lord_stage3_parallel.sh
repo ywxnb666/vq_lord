@@ -11,14 +11,18 @@ align_vq_ensure_runtime_dirs
 align_vq_setup_logging "test_vq_lord_stage3_parallel"
 
 # Evaluation
-EVAL_SPLIT="${EVAL_SPLIT:-test}"
+if [ "${DATASET_NAME}" = "aokvqa" ]; then
+    EVAL_SPLIT="${EVAL_SPLIT:-validation}"
+else
+    EVAL_SPLIT="${EVAL_SPLIT:-test}"
+fi
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-512}"
 ENABLE_SECOND_PASS="${ENABLE_SECOND_PASS:-0}"
 SECOND_PASS_MAX_NEW_TOKENS="${SECOND_PASS_MAX_NEW_TOKENS:-1024}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate_readable}"
 if [ "${STUDENT_MODEL_TYPE}" = "llava_next" ]; then
-    STAGE3_LLAVA_REMOVE_CONTEXT="${STAGE3_LLAVA_REMOVE_CONTEXT:-1}"
+    STAGE3_LLAVA_REMOVE_CONTEXT="${STAGE3_LLAVA_REMOVE_CONTEXT:-0}"
 else
     STAGE3_LLAVA_REMOVE_CONTEXT="${STAGE3_LLAVA_REMOVE_CONTEXT:-0}"
 fi
@@ -45,10 +49,11 @@ GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 # Paths
 PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
-PERIOD=7
+PERIOD=15
+STAGE3_FINAL_ADAPTER_PATH="/home/songxinhao/workspace/vq_lord/vq_lord_ckpts/stu-qwen/scienceqa/gemini-2.5-pro/stage3/stage3_sub1_period${PERIOD}"
 STAGE3_FINAL_ADAPTER_PATH="${STAGE3_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage3/stage3_sub1_period${PERIOD}}"
 # STAGE3_FINAL_ADAPTER_PATH="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage3_tune/run_20260323_140152/stage3_sub1_period7"
-BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/scienceqa_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
+BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/${DATASET_TAG}_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
 STAGE3_EVAL_SCHEMA_SUFFIX=""
 if [ "${STUDENT_MODEL_TYPE}" = "llava_next" ] && [ "${STAGE3_LLAVA_REMOVE_CONTEXT}" = "1" ]; then
     STAGE3_EVAL_SCHEMA_SUFFIX="_noctx"
@@ -89,6 +94,7 @@ mkdir -p "${PREPROCESS_DIR}" "${SHARD_RESULT_DIR}" "$(dirname "${RESULT_PATH}")"
 if [ ! -f "${BUCKET_PLAN_PATH}" ]; then
     echo "[Info] 未找到 test split 分桶文件，开始生成: ${BUCKET_PLAN_PATH}"
     "${PYTHON_BIN}" "${PREPROCESS_ENTRY}" \
+        --dataset-name="${DATASET_NAME}" \
         --dataset-path="${DATASET_PATH}" \
         --model-path="${MODEL_PATH}" \
         --split="${EVAL_SPLIT}" \
@@ -126,6 +132,7 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
             --model_path="${MODEL_PATH}" \
     --student_model_type="${STUDENT_MODEL_TYPE}" \
             --adapter_path="${STAGE3_FINAL_ADAPTER_PATH}" \
+            --dataset_name="${DATASET_NAME}" \
             --scienceqa_path="${DATASET_PATH}" \
             --split="${EVAL_SPLIT}" \
             --max_samples="${EVAL_MAX_SAMPLES}" \
@@ -222,6 +229,7 @@ fi
     --model_path="${MODEL_PATH}" \
     --student_model_type="${STUDENT_MODEL_TYPE}" \
     --adapter_path="${STAGE3_FINAL_ADAPTER_PATH}" \
+    --dataset_name="${DATASET_NAME}" \
     --scienceqa_path="${DATASET_PATH}" \
     --split="${EVAL_SPLIT}" \
     --max_samples="${EVAL_MAX_SAMPLES}" \

@@ -65,7 +65,7 @@ from data_collector2 import (
     VisualQAItem,
     ImageDescriptionItem,
 )
-from textvqa_mcq import build_textvqa_mcq_samples, materialize_textvqa_image
+from iconqa_mcq import build_iconqa_mcq_samples, materialize_iconqa_image
 from student_models import (
     LLAVA_NEXT,
     add_vq_to_student_model,
@@ -181,7 +181,7 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-HF_MULTICHOICE_DATASET_NAMES = ("scienceqa", "aokvqa", "textvqa")
+HF_MULTICHOICE_DATASET_NAMES = ("scienceqa", "aokvqa", "iconqa")
 
 
 def _normalize_dataset_name(dataset_name: str) -> str:
@@ -228,8 +228,8 @@ def build_scienceqa_samples(
     include_dataset_answer: bool = False,
 ) -> List[dict]:
     dataset_name = _normalize_dataset_name(dataset_name)
-    if dataset_name == "textvqa":
-        return build_textvqa_mcq_samples(
+    if dataset_name == "iconqa":
+        return build_iconqa_mcq_samples(
             dataset_path=scienceqa_path,
             split=split,
             train_num=train_num,
@@ -341,21 +341,26 @@ def _load_cached_teacher_source_indices(
     for cache_key, teacher_payload in cache_samples.items():
         if not isinstance(cache_key, str) or not cache_key.startswith(stable_prefix):
             continue
-        suffix = cache_key[len(stable_prefix):]
-        try:
-            source_index = int(suffix)
-        except (TypeError, ValueError):
-            continue
         if not isinstance(teacher_payload, dict):
             continue
+        if dataset_prefix == "iconqa":
+            source_index = teacher_payload.get("source_index")
+            annotation = teacher_payload.get("teacher_annotation")
+        else:
+            suffix = cache_key[len(stable_prefix):]
+            try:
+                source_index = int(suffix)
+            except (TypeError, ValueError):
+                continue
+            annotation = teacher_payload
         valid = True
         for field in TEACHER_REQUIRED_FIELDS:
-            value = teacher_payload.get(field)
+            value = annotation.get(field) if isinstance(annotation, dict) else None
             if not isinstance(value, str) or len(value.strip()) == 0:
                 valid = False
                 break
-        if valid:
-            allowed.add(source_index)
+        if valid and source_index is not None:
+            allowed.add(int(source_index))
 
     return allowed
 
@@ -371,6 +376,9 @@ def _safe_name(text: str) -> str:
 
 
 def _sample_key(sample: dict) -> str:
+    teacher_cache_key = sample.get("teacher_cache_key")
+    if teacher_cache_key:
+        return str(teacher_cache_key)
     source_index = sample.get("source_index")
     if source_index is not None:
         split_name = str(sample.get("split") or "unknown")
@@ -597,6 +605,8 @@ def _normalize_teacher_annotation(
 ) -> Optional[dict]:
     if not isinstance(payload, dict):
         return None
+    if isinstance(payload.get("teacher_annotation"), dict):
+        payload = payload["teacher_annotation"]
 
     canonical = {
         "format_version": TEACHER_SCHEMA_VERSION,
@@ -1071,7 +1081,7 @@ class ScienceQADataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = self.samples[idx]
-        image = materialize_textvqa_image(item["image"])
+        image = materialize_iconqa_image(item["image"])
         image_sizes_default = torch.tensor([image.height, image.width], dtype=torch.long)
 
         instruction = item.get("instruction", "")
@@ -1862,6 +1872,8 @@ def setup_args():
                        help="Stage3 梯度累积步数，0 表示回退到 grad_accum")
     parser.add_argument("--stage3_lr_scale", type=float, default=0.2,
                        help="Stage3 学习率缩放，默认低于 Stage2")
+    parser.add_argument("--stage3_projector_lr_scale", type=float, default=0.1,
+                       help="Stage3 projector 学习率相对 Stage3 LoRA 学习率的缩放")
     parser.add_argument("--stage3_grad_clip", type=float, default=1.0,
                        help="Stage3 梯度裁剪阈值；<=0 表示关闭")
     parser.add_argument("--stage3_train_projector", type=int, default=0,
@@ -1941,8 +1953,8 @@ def setup_args():
     parser.add_argument("--train_num", type=int, default=500,
                        help="训练样本数")
     parser.add_argument("--dataset_name", type=str, default="vq_lord",
-                       choices=["vq_lord", "scienceqa", "aokvqa", "textvqa"],
-                       help="训练数据来源 (vq_lord / scienceqa / aokvqa / textvqa)")
+                       choices=["vq_lord", "scienceqa", "aokvqa", "iconqa"],
+                       help="训练数据来源 (vq_lord / scienceqa / aokvqa / iconqa)")
     parser.add_argument("--scienceqa_split", type=str, default="train",
                        help="ScienceQA 数据集 split")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA",

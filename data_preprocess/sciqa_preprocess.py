@@ -38,7 +38,7 @@ VQ_LORD3_DIR = os.path.join(REPO_ROOT, "vq_lord3")
 if VQ_LORD3_DIR not in sys.path:
 	sys.path.insert(0, VQ_LORD3_DIR)
 
-from textvqa_mcq import build_textvqa_mcq_samples, materialize_textvqa_image
+from iconqa_mcq import build_iconqa_mcq_samples, materialize_iconqa_image
 
 
 # 与 train_vq_lord.py 保持一致，避免旧版配置里的 image_token 触发报错。
@@ -100,8 +100,8 @@ def build_scienceqa_samples(
 ) -> List[dict]:
 	"""复用 train_vq_lord.py 的采样语义，只保留有图像样本。"""
 	dataset_name = normalize_dataset_name(dataset_name)
-	if dataset_name == "textvqa":
-		return build_textvqa_mcq_samples(
+	if dataset_name == "iconqa":
+		return build_iconqa_mcq_samples(
 			dataset_path=dataset_path,
 			split=split,
 			train_num=train_num,
@@ -208,21 +208,26 @@ def load_cached_teacher_source_indices(
 	for cache_key, teacher_payload in cache_samples.items():
 		if not isinstance(cache_key, str) or not cache_key.startswith(prefix):
 			continue
-		suffix = cache_key[len(prefix):]
-		try:
-			source_index = int(suffix)
-		except (TypeError, ValueError):
-			continue
 		if not isinstance(teacher_payload, dict):
 			continue
+		if normalize_dataset_name(dataset_name) == "iconqa":
+			source_index = teacher_payload.get("source_index")
+			annotation = teacher_payload.get("teacher_annotation")
+		else:
+			suffix = cache_key[len(prefix):]
+			try:
+				source_index = int(suffix)
+			except (TypeError, ValueError):
+				continue
+			annotation = teacher_payload
 		valid = True
 		for field in required_fields:
-			value = teacher_payload.get(field)
+			value = annotation.get(field) if isinstance(annotation, dict) else None
 			if not isinstance(value, str) or len(value.strip()) == 0:
 				valid = False
 				break
-		if valid:
-			allowed.add(source_index)
+		if valid and source_index is not None:
+			allowed.add(int(source_index))
 	return allowed
 
 
@@ -238,7 +243,7 @@ def extract_image_hw(image) -> Tuple[int, int]:
 
 
 def estimate_patch_count(processor, image) -> int:
-	image = materialize_textvqa_image(image)
+	image = materialize_iconqa_image(image)
 	image_processor = getattr(processor, "image_processor", None)
 	if image_processor is not None:
 		inputs = image_processor(images=image, return_tensors="pt")
@@ -412,7 +417,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		"--dataset-name",
 		type=str,
 		default="scienceqa",
-		choices=["scienceqa", "aokvqa", "textvqa"],
+		choices=["scienceqa", "aokvqa", "iconqa"],
 		help="数据集名称（用于字段映射）",
 	)
 	parser.add_argument(

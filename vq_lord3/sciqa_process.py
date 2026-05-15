@@ -36,11 +36,7 @@ from student_models import (
     student_forward,
     student_generate,
 )
-from textvqa_mcq import (
-    build_textvqa_mcq_samples,
-    materialize_textvqa_image,
-    textvqa_soft_score,
-)
+from iconqa_mcq import build_iconqa_mcq_samples, materialize_iconqa_image
 
 
 def file_md5(path: str) -> str:
@@ -522,8 +518,8 @@ def run_eval(
     run_config: Optional[dict] = None,
 ):
     dataset_name = normalize_dataset_name(dataset_name)
-    if dataset_name == "textvqa":
-        dataset_with_images = build_textvqa_mcq_samples(
+    if dataset_name == "iconqa":
+        dataset_with_images = build_iconqa_mcq_samples(
             dataset_path=scienceqa_path,
             split=split,
             train_num=max_samples,
@@ -533,17 +529,12 @@ def run_eval(
         dataset = load_dataset(scienceqa_path, split=split)
         dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
-    if dataset_name != "textvqa" and max_samples > 0 and len(dataset_with_images) > max_samples:
+    if dataset_name != "iconqa" and max_samples > 0 and len(dataset_with_images) > max_samples:
         dataset_with_images = dataset_with_images[:max_samples]
 
     results = []
     correct = 0
     total = 0
-    soft_score_sum = 0.0
-    gold_soft_sum = 0.0
-    oracle_soft_sum = 0.0
-    distractor_soft_sum = 0.0
-    distractor_soft_count = 0
     student_model_type = normalize_student_model_type(
         getattr(getattr(model, "config", None), "student_model_type", LLAVA_NEXT)
     )
@@ -553,7 +544,7 @@ def run_eval(
     for item in tqdm(dataset_with_images, desc="ScienceQA Eval"):
         question = item.get("question", "")
         choices = item.get("choices", [])
-        if dataset_name == "textvqa":
+        if dataset_name == "iconqa":
             answer_idx = int(item.get("answer_idx", 0))
         else:
             answer_idx = resolve_eval_answer_idx(item, dataset_name=dataset_name)
@@ -562,7 +553,7 @@ def run_eval(
                 f"answer_idx 越界。dataset_name={dataset_name}, split={split}, "
                 f"answer_idx={answer_idx}, num_choices={len(choices)}"
             )
-        image = materialize_textvqa_image(item.get("image"))
+        image = materialize_iconqa_image(item.get("image"))
 
         if student_model_type == LLAVA_NEXT:
             prompt = build_prompt(question, choices)
@@ -657,30 +648,6 @@ def run_eval(
                 output_text = f"{output_text}\n[hybrid_fallback_to_logits]"
 
         is_correct = pred_idx == answer_idx
-        textvqa_metrics = {}
-        if dataset_name == "textvqa":
-            human_answers = item.get("textvqa_answers", [])
-            pred_answer = choices[pred_idx] if pred_idx is not None and 0 <= pred_idx < len(choices) else ""
-            choice_soft_scores = [textvqa_soft_score(choice, human_answers) for choice in choices]
-            pred_soft = textvqa_soft_score(pred_answer, human_answers)
-            gold_soft = choice_soft_scores[answer_idx]
-            oracle_soft = max(choice_soft_scores) if choice_soft_scores else 0.0
-            distractor_scores = [score for idx, score in enumerate(choice_soft_scores) if idx != answer_idx]
-            soft_score_sum += pred_soft
-            gold_soft_sum += gold_soft
-            oracle_soft_sum += oracle_soft
-            distractor_soft_sum += sum(distractor_scores)
-            distractor_soft_count += len(distractor_scores)
-            textvqa_metrics = {
-                "pred_answer": pred_answer,
-                "textvqa_answers": human_answers,
-                "choice_soft_scores": choice_soft_scores,
-                "pred_soft_score": pred_soft,
-                "gold_soft_score": gold_soft,
-                "choice_oracle_soft_score": oracle_soft,
-                "distractor_soft_scores": distractor_scores,
-            }
-
         total += 1
         if is_correct:
             correct += 1
@@ -693,19 +660,10 @@ def run_eval(
             "output": output_text,
             "correct": is_correct,
         }
-        result.update(textvqa_metrics)
         results.append(result)
 
     accuracy = correct / total if total else 0.0
     metrics = {"accuracy": accuracy, "total": total, "correct": correct}
-    if dataset_name == "textvqa":
-        metrics.update({
-            "mcq_exact_acc": accuracy,
-            "textvqa_soft_acc": soft_score_sum / total if total else 0.0,
-            "gold_soft_acc": gold_soft_sum / total if total else 0.0,
-            "choice_oracle_soft_acc": oracle_soft_sum / total if total else 0.0,
-            "distractor_soft_avg": distractor_soft_sum / distractor_soft_count if distractor_soft_count else 0.0,
-        })
 
     save_dir = os.path.dirname(save_path)
     if save_dir:
@@ -719,9 +677,6 @@ def run_eval(
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
-    if dataset_name == "textvqa":
-        print(f"TextVQA soft accuracy: {metrics['textvqa_soft_acc']:.4f}")
-        print(f"Choice oracle soft accuracy: {metrics['choice_oracle_soft_acc']:.4f}")
     print(f"Results saved to: {save_path}")
 
 
@@ -730,7 +685,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
     parser.add_argument("--student_model_type", type=str, default="llava_next", choices=["llava_next", "qwen2_vl"], help="学生模型后端类型")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
-    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa", "textvqa"], help="评测数据集名称")
+    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa", "iconqa"], help="评测数据集名称")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="validation", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")

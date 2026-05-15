@@ -36,6 +36,7 @@ from student_models import (
     student_forward,
     student_generate,
 )
+from iconqa_mcq import build_iconqa_mcq_samples, materialize_iconqa_image
 
 
 def file_md5(path: str) -> str:
@@ -228,7 +229,9 @@ def normalize_dataset_name(dataset_name: str) -> str:
 
 def resolve_eval_answer_idx(item: dict, dataset_name: str) -> int:
     dataset_name = normalize_dataset_name(dataset_name)
-    if dataset_name == "aokvqa":
+    if dataset_name == "iconqa":
+        field_candidates = ("answer_idx",)
+    elif dataset_name == "aokvqa":
         field_candidates = ("correct_choice_idx", "answer")
     else:
         field_candidates = ("answer", "correct_choice_idx")
@@ -662,10 +665,18 @@ def run_eval(
     run_config: Optional[dict] = None,
 ):
     dataset_name = normalize_dataset_name(dataset_name)
-    dataset = load_dataset(scienceqa_path, split=split)
-    dataset_with_images = [item for item in dataset if item.get("image") is not None]
+    if dataset_name == "iconqa":
+        dataset_with_images = build_iconqa_mcq_samples(
+            dataset_path=scienceqa_path,
+            split=split,
+            train_num=max_samples,
+            seed=20240306,
+        )
+    else:
+        dataset = load_dataset(scienceqa_path, split=split)
+        dataset_with_images = [item for item in dataset if item.get("image") is not None]
 
-    if max_samples > 0 and len(dataset_with_images) > max_samples:
+    if dataset_name != "iconqa" and max_samples > 0 and len(dataset_with_images) > max_samples:
         dataset_with_images = dataset_with_images[:max_samples]
 
     results = []
@@ -697,7 +708,7 @@ def run_eval(
                 f"answer_idx={answer_idx}, num_choices={len(choices)}"
             )
         hint = item.get("hint", "")
-        image = item.get("image")
+        image = materialize_iconqa_image(item.get("image"))
 
         if student_model_type == LLAVA_NEXT:
             prompt = (
@@ -837,7 +848,7 @@ def run_eval(
             "correct": is_correct,
         })
 
-    accuracy = correct / total if total else 0.0
+    accuracy = correct / (format_hits if answer_mode == "generate_readable" else total) if (format_hits if answer_mode == "generate_readable" else total) else 0.0
     metrics = {"accuracy": accuracy, "total": total, "correct": correct}
     if answer_mode == "generate_readable":
         metrics.update(
@@ -879,7 +890,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
     parser.add_argument("--student_model_type", type=str, default="llava_next", choices=["llava_next", "qwen2_vl"], help="学生模型后端类型")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
-    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa"], help="评测数据集名称")
+    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa", "iconqa"], help="评测数据集名称")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="validation", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=200, help="最大评测样本数")

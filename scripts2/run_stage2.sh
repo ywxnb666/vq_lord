@@ -89,10 +89,15 @@ MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 REUSE_STAGE2="0"
 
 # Evaluation
-EVAL_SPLIT="${EVAL_SPLIT:-validation}"
+if [ "${DATASET_NAME}" = "iconqa" ]; then
+    EVAL_SPLIT="${EVAL_SPLIT:-test}"
+else
+    EVAL_SPLIT="${EVAL_SPLIT:-validation}"
+fi
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-500}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-512}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate_readable}"
+RUN_STAGE2_EVAL="${RUN_STAGE2_EVAL:-0}"
 RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/${DATASET_TAG}_stage2_validation_generate_readable.json}"
 
 # Logging / save
@@ -118,6 +123,7 @@ echo "STAGE2_RESUME_SAVE_PATH: ${STAGE2_RESUME_SAVE_PATH}"
 echo "TEACHER_CACHE_PATH: ${TEACHER_CACHE_PATH:-<empty>}"
 echo "SAMPLE_ONLY_CACHED_TEACHER: ${SAMPLE_ONLY_CACHED_TEACHER}"
 echo "RESULT_PATH: ${RESULT_PATH}"
+echo "RUN_STAGE2_EVAL: ${RUN_STAGE2_EVAL}"
 echo "EPOCHS: ${EPOCHS}"
 echo "LR: ${LR}"
 echo "BATCH_SIZE: ${BATCH_SIZE}"
@@ -241,6 +247,12 @@ align_vq_make_train_launcher TRAIN_LAUNCHER
 
 align_vq_require_stage2_artifacts "${STAGE2_CKPT_PATH}"
 
+if [ "${RUN_STAGE2_EVAL}" != "1" ]; then
+    align_vq_print_header "Stage2 训练完成"
+    echo "Stage2 checkpoint: ${STAGE2_CKPT_PATH}"
+    echo "Validation skipped: RUN_STAGE2_EVAL=${RUN_STAGE2_EVAL}"
+    exit 0
+fi
 
 mkdir -p "$(dirname "${RESULT_PATH}")"
 

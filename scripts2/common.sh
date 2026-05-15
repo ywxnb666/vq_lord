@@ -13,23 +13,32 @@ MODEL_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/models/llava-
 QWEN2_VL_MODEL_DEFAULT="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/models/Qwen2-VL-7B-Instruct"
 # STUDENT_MODEL_TYPE_DEFAULT="llava_next"
 STUDENT_MODEL_TYPE_DEFAULT="qwen2_vl"
-DATASET_NAME_DEFAULT="scienceqa"
-# DATASET_NAME_DEFAULT="aokvqa"
+# DATASET_NAME_DEFAULT="scienceqa"
+DATASET_NAME_DEFAULT="aokvqa"
+# DATASET_NAME_DEFAULT="iconqa"
 DATASET_PATH_DEFAULT_SCIENCEQA="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/ScienceQA"
 DATASET_PATH_DEFAULT_AOKVQA="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/A-OKVQA"
-DATASET_PATH_DEFAULT_TEXTVQA="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/textvqa"
+DATASET_PATH_DEFAULT_ICONQA="/mnt/shared-storage-gpfs2/evoagi-share-gpfs2/xhsong/datasets/IconQA"
 DATASET_SPLIT_DEFAULT="train"
 DATASET_SEED_DEFAULT="20240306"
 TRAIN_NUM_DEFAULT_SCIENCEQA="0"
-TRAIN_NUM_DEFAULT_AOKVQA="6200"
-TRAIN_NUM_DEFAULT_TEXTVQA="6200"
+# TRAIN_NUM_DEFAULT_AOKVQA="5161"
+TRAIN_NUM_DEFAULT_AOKVQA="4284"
+# TRAIN_NUM_DEFAULT_AOKVQA="3193"
+TRAIN_NUM_DEFAULT_ICONQA="4000"
 # VICTIM_MODEL_DEFAULT_SCIENCEQA="qwen3.5-flash-2026-02-23"
-VICTIM_MODEL_DEFAULT_SCIENCEQA="gpt-4.1-mini"
+# VICTIM_MODEL_DEFAULT_SCIENCEQA="qwen3vl_vlamark"
+# VICTIM_MODEL_DEFAULT_SCIENCEQA="qwen3vl"
+# VICTIM_MODEL_DEFAULT_SCIENCEQA="gpt-4.1-mini"
+VICTIM_MODEL_DEFAULT_SCIENCEQA="qwen3.5-flash-2026-02-23"
 VICTIM_MODEL_DEFAULT_AOKVQA="qwen3.5-flash-2026-02-23"
-VICTIM_MODEL_DEFAULT_TEXTVQA="qwen3.5-flash-2026-02-23"
-SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_SCIENCEQA="0"
+# VICTIM_MODEL_DEFAULT_AOKVQA="gpt-4.1-mini"
+VICTIM_MODEL_DEFAULT_AOKVQA="gpt-5.4"
+# VICTIM_MODEL_DEFAULT_AOKVQA="gemini-2.5-pro"
+VICTIM_MODEL_DEFAULT_ICONQA="qwen3.5-flash-2026-02-23"
+SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_SCIENCEQA="1"
 SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_AOKVQA="1"
-SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_TEXTVQA="1"
+SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_ICONQA="1"
 
 align_vq_apply_dataset_profile() {
     local dataset_name="${DATASET_NAME}"
@@ -38,6 +47,7 @@ align_vq_apply_dataset_profile() {
     local victim_model_default="${VICTIM_MODEL_DEFAULT_AOKVQA}"
     local teacher_cache_default=""
     local sample_only_cached_default="0"
+    local dataset_split_default="${DATASET_SPLIT_DEFAULT}"
 
     case "${dataset_name}" in
         scienceqa)
@@ -51,18 +61,19 @@ align_vq_apply_dataset_profile() {
             dataset_path_default="${DATASET_PATH_DEFAULT_AOKVQA}"
             train_num_default="${TRAIN_NUM_DEFAULT_AOKVQA}"
             victim_model_default="${VICTIM_MODEL_DEFAULT_AOKVQA}"
-            teacher_cache_default="${DATA_DIR}/aokvqa_teacher_${VICTIM_MODEL_DEFAULT_AOKVQA}_train_n6200_new.json"
+            teacher_cache_default="${DATA_DIR}/aokvqa_teacher_${VICTIM_MODEL_DEFAULT_AOKVQA}_train_n${TRAIN_NUM_DEFAULT_AOKVQA}_new.json"
             sample_only_cached_default="${SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_AOKVQA}"
             ;;
-        textvqa)
-            dataset_path_default="${DATASET_PATH_DEFAULT_TEXTVQA}"
-            train_num_default="${TRAIN_NUM_DEFAULT_TEXTVQA}"
-            victim_model_default="${VICTIM_MODEL_DEFAULT_TEXTVQA}"
-            teacher_cache_default="${DATA_DIR}/textvqa_teacher_${VICTIM_MODEL_DEFAULT_TEXTVQA}_train_n6200_stratified_new.json"
-            sample_only_cached_default="${SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_TEXTVQA}"
+        iconqa)
+            dataset_path_default="${DATASET_PATH_DEFAULT_ICONQA}"
+            train_num_default="${TRAIN_NUM_DEFAULT_ICONQA}"
+            victim_model_default="${VICTIM_MODEL_DEFAULT_ICONQA}"
+            teacher_cache_default="${DATA_DIR}/iconqa_choose_txt_qwen3.5-flash_full6316.json"
+            sample_only_cached_default="${SAMPLE_ONLY_CACHED_TEACHER_DEFAULT_ICONQA}"
+            dataset_split_default="val"
             ;;
         *)
-            echo "错误: 不支持 DATASET_NAME=${dataset_name}，当前仅支持 scienceqa、aokvqa 或 textvqa"
+            echo "错误: 不支持 DATASET_NAME=${dataset_name}，当前仅支持 scienceqa、aokvqa 或 iconqa"
             exit 1
             ;;
     esac
@@ -70,7 +81,7 @@ align_vq_apply_dataset_profile() {
     DATASET_TAG="${DATASET_TAG:-${DATASET_NAME}}"
     TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-${DATASET_NAME}}"
     DATASET_PATH="${DATASET_PATH:-${dataset_path_default}}"
-    DATASET_SPLIT="${DATASET_SPLIT:-${DATASET_SPLIT_DEFAULT}}"
+    DATASET_SPLIT="${DATASET_SPLIT:-${dataset_split_default}}"
     DATASET_SEED="${DATASET_SEED:-${DATASET_SEED_DEFAULT}}"
     TRAIN_NUM="${TRAIN_NUM:-${train_num_default}}"
     BUCKET_BY="${BUCKET_BY:-patches}"

@@ -46,6 +46,7 @@ from train_vq_lord3 import (
     build_scienceqa_samples,
     sanitize_image_sizes,
 )
+from iconqa_mcq import materialize_iconqa_image
 from vq_lord_stage3 import (
     _build_stage3_choice_token_map,
     _build_stage3_sample_cache,
@@ -215,28 +216,34 @@ def validate_bucket_payload(payload: dict, scienceqa_path: str, split: str, max_
 
 def build_eval_sample_map(scienceqa_path: str, split: str, bucket_payload: dict, dataset_name: str) -> Dict[int, dict]:
     dataset_name = normalize_dataset_name(dataset_name)
-    dataset = load_dataset(scienceqa_path, split=split)
-    dataset_with_images = [item for item in dataset if item.get("image") is not None]
+    cfg = bucket_payload.get("config", {})
+    seed = int(cfg.get("seed", 20240306) or 20240306)
+    train_num = int(cfg.get("train_num", 0) or 0)
+    eval_samples = build_scienceqa_samples(
+        scienceqa_path=scienceqa_path,
+        dataset_name=dataset_name,
+        split=split,
+        train_num=train_num,
+        seed=seed,
+        include_dataset_answer=True,
+    )
+    eval_sample_map = {int(sample["sample_id"]): sample for sample in eval_samples}
 
     sample_map: Dict[int, dict] = {}
     for record in bucket_payload.get("samples", []):
         sample_id = int(record["sample_id"])
-        source_index = int(record["source_index"])
-        if source_index < 0 or source_index >= len(dataset_with_images):
-            raise IndexError(
-                f"source_index out of range in bucket plan: source_index={source_index}, "
-                f"dataset_with_images={len(dataset_with_images)}"
-            )
+        item = eval_sample_map.get(sample_id)
+        if item is None:
+            raise KeyError(f"bucket plan sample_id 不存在于评测样本: sample_id={sample_id}")
 
-        item = dataset_with_images[source_index]
         sample_map[sample_id] = {
             "sample_id": sample_id,
-            "source_index": source_index,
+            "source_index": int(item["source_index"]),
             "question": item.get("question", ""),
             "choices": item.get("choices", []),
-            "answer_idx": resolve_eval_answer_idx(item, dataset_name=dataset_name),
+            "answer_idx": int(item["answer_idx"]),
             "hint": item.get("hint", ""),
-            "image": item.get("image"),
+            "image": materialize_iconqa_image(item.get("image")),
             "patch_count": int(record.get("patch_count", 0)),
             "image_size": record.get("image_size"),
             "bucket_key": str(record.get("bucket_key", "")),
@@ -811,7 +818,7 @@ def run_eval_shard(
 
     results.sort(key=lambda item: int(item["sample_id"]))
 
-    accuracy = correct / total if total else 0.0
+    accuracy = correct / (format_hits if answer_mode == "generate_readable" else total) if (format_hits if answer_mode == "generate_readable" else total) else 0.0
     metrics = {
         "accuracy": accuracy,
         "total": total,
@@ -872,7 +879,8 @@ def merge_shard_results(
 
     correct = sum(1 for item in merged_results if item.get("correct"))
     total = len(merged_results)
-    accuracy = correct / total if total else 0.0
+    format_hits = sum(1 for item in merged_results if item.get("readable_format_ok")) if (run_config or {}).get("answer_mode") == "generate_readable" else 0
+    accuracy = correct / (format_hits if (run_config or {}).get("answer_mode") == "generate_readable" else total) if (format_hits if (run_config or {}).get("answer_mode") == "generate_readable" else total) else 0.0
 
     metrics = {
         "accuracy": accuracy,
@@ -880,7 +888,6 @@ def merge_shard_results(
         "correct": correct,
     }
     if (run_config or {}).get("answer_mode") == "generate_readable":
-        format_hits = sum(1 for item in merged_results if item.get("readable_format_ok"))
         answer_parse_hits = sum(
             1
             for item in merged_results
@@ -939,7 +946,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default="", help="基础模型路径")
     parser.add_argument("--student_model_type", type=str, default="llava_next", choices=["llava_next", "qwen2_vl"], help="学生模型后端类型")
     parser.add_argument("--adapter_path", type=str, default="", help="LoRA 适配器路径")
-    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa"], help="评测数据集名称")
+    parser.add_argument("--dataset_name", type=str, default="scienceqa", choices=["scienceqa", "aokvqa", "iconqa"], help="评测数据集名称")
     parser.add_argument("--scienceqa_path", type=str, default="ScienceQA", help="ScienceQA 数据集路径（本地目录或数据集名）")
     parser.add_argument("--split", type=str, default="test", help="ScienceQA split")
     parser.add_argument("--max_samples", type=int, default=0, help="最大评测样本数，0 表示全量")

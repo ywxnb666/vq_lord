@@ -11,9 +11,13 @@ align_vq_ensure_runtime_dirs
 align_vq_setup_logging "test_vq_lord_stage2_parallel"
 
 # Evaluation
-EVAL_SPLIT="${EVAL_SPLIT:-validation}"
+if [ "${DATASET_NAME}" = "aokvqa" ]; then
+    EVAL_SPLIT="${EVAL_SPLIT:-validation}"
+else
+    EVAL_SPLIT="${EVAL_SPLIT:-test}"
+fi
 # EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-400}"
-EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-2017}"
+EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-1000}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate_readable}"
 USE_4BIT="${USE_4BIT:-0}"
@@ -23,7 +27,7 @@ FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-0}"
 
 # Stable conservative batching
 SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
-EVAL_BUCKET_BATCH_SIZE="${EVAL_BUCKET_BATCH_SIZE:-4}"
+EVAL_BUCKET_BATCH_SIZE="${EVAL_BUCKET_BATCH_SIZE:-1}"
 PREPROCESS_SHUFFLE="${PREPROCESS_SHUFFLE:-1}"
 
 # Parallel
@@ -36,8 +40,9 @@ GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 # Paths
 PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
 EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
-STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch13}"
-BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/scienceqa_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
+STAGE2_CKPT_PATH="/home/songxinhao/workspace/vq_lord/vq_lord_ckpts/stu-qwen/a-okvqa/gemini-2.5-pro/stage2/stage2_vision_epoch1"
+# STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch1}"
+BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/${DATASET_TAG}_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
 SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_shards}"
 RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_parallel.json}"
 
@@ -68,6 +73,7 @@ mkdir -p "${PREPROCESS_DIR}" "${SHARD_RESULT_DIR}" "$(dirname "${RESULT_PATH}")"
 if [ ! -f "${BUCKET_PLAN_PATH}" ]; then
     echo "[Info] 未找到 eval split 分桶文件，开始生成: ${BUCKET_PLAN_PATH}"
     "${PYTHON_BIN}" "${PREPROCESS_ENTRY}" \
+        --dataset-name="${DATASET_NAME}" \
         --dataset-path="${DATASET_PATH}" \
         --model-path="${MODEL_PATH}" \
         --split="${EVAL_SPLIT}" \
