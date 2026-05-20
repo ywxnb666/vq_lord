@@ -344,6 +344,10 @@ EVAL_USE_VQ=1
 if [ "${REMOVE_VQ_CODEBOOK}" = "1" ]; then
     EVAL_USE_VQ=0
 fi
+FINAL_VALIDATION_SPLIT="validation"
+if [ "${DATASET_NAME}" = "iconqa" ]; then
+    FINAL_VALIDATION_SPLIT="test"
+fi
 
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
@@ -351,7 +355,7 @@ fi
     --adapter_path="${STAGE3_FINAL_ADAPTER_PATH}" \
     --dataset_name="${DATASET_NAME}" \
     --scienceqa_path="${DATASET_PATH}" \
-    --split="validation" \
+    --split="${FINAL_VALIDATION_SPLIT}" \
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
     --use_4bit="${USE_4BIT}" \
