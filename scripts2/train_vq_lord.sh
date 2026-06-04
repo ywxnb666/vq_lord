@@ -21,12 +21,12 @@ echo "LOG_FILE: ${LOG_FILE}"
 PIPELINE_STEPS=(
     "teacher_model_data_collect.sh"
     "data_preprocess.sh"
+    "run_stage0.sh"
     "run_stage1.sh"
     "run_stage2.sh"
-    "run_stage3.sh"
     "test_origin.sh"
+    "test_vq_lord_stage1_parallel.sh"
     "test_vq_lord_stage2.sh"
-    "test_vq_lord_stage3.sh"
 )
 
 for step_script in "${PIPELINE_STEPS[@]}"; do

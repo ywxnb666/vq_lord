@@ -60,8 +60,8 @@ GLOBAL_ENV = {
 # Tabs
 # ============================================================
 tab_data, tab_s1, tab_s2, tab_s3, tab_eval, tab_info = st.tabs([
-    "1. 数据筹备", "2. Stage1(VQ底座)", "3. Stage2(视觉蒸馏)",
-    "4. Stage3(偏好对齐)", "5. 评测大盘", "任务状态和日志信息"
+    "1. 数据筹备", "2. Stage0(VQ底座)", "3. Stage1(视觉蒸馏)",
+    "4. Stage2(偏好对齐)", "5. 评测大盘", "任务状态和日志信息"
 ])
 
 # ============================================================
@@ -212,12 +212,12 @@ with tab_data:
 # Tab 2–5: 占位（下一步填充）
 # ============================================================
 with tab_s1:
-    st.header("2. Stage1: 视觉离散表示学习 (Codebook)")
+    st.header("2. Stage0: 视觉离散表示学习 (Codebook)")
     st.info("冻结 LLM 主干，只训练 VQ stack（pre_quant → codebook → post_quant）。"
-            "产物为 vq_codebook.pt，供 Stage2/3 复用。")
+            "产物为 vq_codebook.pt，供 Stage1/2 复用。")
 
     # ---- 前置检查提示 ----
-    st.warning("⚠️ 请确保 Tab1 的分桶预处理已完成，Stage1 启动时会自动检查预处理文件是否存在。"
+    st.warning("⚠️ 请确保 Tab1 的分桶预处理已完成，Stage0 启动时会自动检查预处理文件是否存在。"
                "若不存在，脚本会自动触发预处理（需要 MODEL_PATH 可访问）。")
 
     # ========== 数据与分桶 ==========
@@ -247,8 +247,8 @@ with tab_s1:
             s1_grad_accum = st.number_input("GRAD_ACCUM", 1, 64, 8, key="s1_grad_accum")
         with s1t_col2:
             s1_lr = st.text_input("LR (全局学习率)", value="2e-5", key="s1_lr")
-            s1_stage1_lr = st.text_input("STAGE1_LR (VQ 专用学习率)", value="7e-5",
-                                         key="s1_stage1_lr")
+            s1_stage0_lr = st.text_input("STAGE0_LR (VQ 专用学习率)", value="7e-5",
+                                         key="s1_stage0_lr")
             s1_max_length = st.number_input("MAX_LENGTH", 128, 4096, 1024,
                                             key="s1_max_length")
         with s1t_col3:
@@ -262,16 +262,16 @@ with tab_s1:
     with st.expander("⚖️ VQ 损失权重", expanded=True):
         s1w_col1, s1w_col2 = st.columns(2)
         with s1w_col1:
-            s1_recon_weight = st.slider("STAGE1_RECON_WEIGHT (重建损失)", 0.0, 5.0, 1.0,
+            s1_recon_weight = st.slider("STAGE0_RECON_WEIGHT (重建损失)", 0.0, 5.0, 1.0,
                                         step=0.05, key="s1_recon_w")
-            s1_cosine_weight = st.slider("STAGE1_COSINE_WEIGHT (余弦损失)", 0.0, 2.0, 0.25,
+            s1_cosine_weight = st.slider("STAGE0_COSINE_WEIGHT (余弦损失)", 0.0, 2.0, 0.25,
                                          step=0.05, key="s1_cosine_w")
-            s1_vq_weight = st.slider("STAGE1_VQ_WEIGHT (VQ commitment)", 0.0, 5.0, 1.0,
+            s1_vq_weight = st.slider("STAGE0_VQ_WEIGHT (VQ commitment)", 0.0, 5.0, 1.0,
                                      step=0.05, key="s1_vq_w")
         with s1w_col2:
             s1_beta = st.slider("BETA (VQ 全局权重)", 0.0, 2.0, 0.25,
                                 step=0.05, key="s1_beta")
-            s1_grad_clip = st.number_input("STAGE1_GRAD_CLIP", 0.1, 20.0, 5.0,
+            s1_grad_clip = st.number_input("STAGE0_GRAD_CLIP", 0.1, 20.0, 5.0,
                                            step=0.1, key="s1_grad_clip")
 
     # ========== VQ Codebook 配置 ==========
@@ -313,7 +313,7 @@ with tab_s1:
     with st.expander("🔄 蒸馏与复用设置", expanded=False):
         s1r_col1, s1r_col2 = st.columns(2)
         with s1r_col1:
-            s1_collect_teacher = st.checkbox("COLLECT_TEACHER_DATA (Stage1中采集)",
+            s1_collect_teacher = st.checkbox("COLLECT_TEACHER_DATA (Stage0中采集)",
                                              value=False, key="s1_collect")
             s1_strict_distill = st.checkbox("STRICT_TEACHER_DISTILL", value=False,
                                             key="s1_strict")
@@ -322,7 +322,7 @@ with tab_s1:
         with s1r_col2:
             s1_reuse_codebook = st.checkbox("REUSE_VQ_CODEBOOK (复用已有码本)",
                                             value=False, key="s1_reuse_cb")
-            s1_reuse_stage2 = st.checkbox("REUSE_STAGE2", value=True,
+            s1_reuse_stage1 = st.checkbox("REUSE_STAGE1", value=True,
                                           key="s1_reuse_s2")
 
     # ========== 日志与保存 ==========
@@ -337,7 +337,7 @@ with tab_s1:
 
     # ========== 启动按钮 ==========
     st.divider()
-    if st.button("🚀 启动 Stage 1 训练", use_container_width=True, key="btn_stage1"):
+    if st.button("🚀 启动 Stage 0 训练", use_container_width=True, key="btn_stage0"):
         payload = {
             **GLOBAL_ENV,
             # 数据与分桶
@@ -347,25 +347,25 @@ with tab_s1:
             "BUCKET_BY": s1_bucket_by,
             "BUCKET_BATCH_SIZE": s1_bucket_bs,
             "BUCKET_DROP_LAST": int(s1_bucket_drop),
-            "DISABLE_BUCKET_FOR_STAGE3": 0,
-            "STAGE3_BUCKET_BATCH_SIZE": s1_bucket_bs,
+            "DISABLE_BUCKET_FOR_STAGE2": 0,
+            "STAGE2_BUCKET_BATCH_SIZE": s1_bucket_bs,
             # 训练超参
             "EPOCHS": s1_epochs,
             "BATCH_SIZE": s1_batch_size,
             "GRAD_ACCUM": s1_grad_accum,
+            "STAGE1_GRAD_ACCUM": 0,
             "STAGE2_GRAD_ACCUM": 0,
-            "STAGE3_GRAD_ACCUM": 0,
             "LR": s1_lr,
-            "STAGE1_LR": s1_stage1_lr,
+            "STAGE0_LR": s1_stage0_lr,
             "MAX_LENGTH": s1_max_length,
             "MAX_NEW_TOKENS": s1_max_new_tokens,
             "TEMPERATURE": s1_temperature,
             "TAU1": s1_tau1,
             # VQ 损失权重
-            "STAGE1_RECON_WEIGHT": s1_recon_weight,
-            "STAGE1_COSINE_WEIGHT": s1_cosine_weight,
-            "STAGE1_VQ_WEIGHT": s1_vq_weight,
-            "STAGE1_GRAD_CLIP": s1_grad_clip,
+            "STAGE0_RECON_WEIGHT": s1_recon_weight,
+            "STAGE0_COSINE_WEIGHT": s1_cosine_weight,
+            "STAGE0_VQ_WEIGHT": s1_vq_weight,
+            "STAGE0_GRAD_CLIP": s1_grad_clip,
             "BETA": s1_beta,
             # VQ codebook
             "VQ_CODEBOOK_SIZE": s1_codebook_size,
@@ -386,39 +386,39 @@ with tab_s1:
             "STRICT_TEACHER_DISTILL": int(s1_strict_distill),
             "TEACHER_LANG": s1_teacher_lang,
             "REUSE_VQ_CODEBOOK": int(s1_reuse_codebook),
-            "REUSE_STAGE2": int(s1_reuse_stage2),
+            "REUSE_STAGE1": int(s1_reuse_stage1),
             # 日志保存
             "LOG_STEP": s1_log_step,
             "SAVE_STEP": s1_save_step,
             "SAVE_EACH_EPOCH": int(s1_save_each_epoch),
         }
         try:
-            resp = requests.post(f"{BASE_URL}/api/task/stage1", json=payload, timeout=10)
+            resp = requests.post(f"{BASE_URL}/api/task/stage0", json=payload, timeout=10)
             if resp.status_code == 200:
-                st.success("✅ Stage1 训练任务已提交后台执行")
+                st.success("✅ Stage0 训练任务已提交后台执行")
             else:
                 st.error(f"❌ 提交失败: HTTP {resp.status_code} — {resp.text}")
         except Exception as e:
             st.error(f"❌ 请求异常: {e}")
 
 with tab_s2:
-    st.header("3. Stage2: 教师视觉能力迁移")
-    st.info("加载 Stage1 codebook（冻结 embedding），训练 LoRA + projector + pre/post_quant。"
+    st.header("3. Stage1: 教师视觉能力迁移")
+    st.info("加载 Stage0 codebook（冻结 embedding），训练 LoRA + projector + pre/post_quant。"
             "训练完成后自动执行一次 validation 评测。")
 
-    st.warning("⚠️ 前置条件：Stage1 的 `vq_codebook.pt` 必须已生成。"
-               "脚本启动时会自动校验 `STAGE1_CODEBOOK_PATH` 是否存在。")
+    st.warning("⚠️ 前置条件：Stage0 的 `vq_codebook.pt` 必须已生成。"
+               "脚本启动时会自动校验 `STAGE0_CODEBOOK_PATH` 是否存在。")
 
     # ========== 路径衔接 ==========
-    with st.expander("📂 路径与衔接（Stage1 产物）", expanded=False):
+    with st.expander("📂 路径与衔接（Stage0 产物）", expanded=False):
         # 探测按钮
         s2_detect_col1, s2_detect_col2 = st.columns(2)
         with s2_detect_col1:
-            if st.button("🔍 探测 Stage1 codebook 目录", key="s2_detect_s1"):
+            if st.button("🔍 探测 Stage0 codebook 目录", key="s2_detect_s1"):
                 try:
                     resp = requests.get(
                         f"{BASE_URL}/api/list_ckpt_dirs",
-                        params={"root_dir": glob_root_dir, "prefix": "stage1_vq"},
+                        params={"root_dir": glob_root_dir, "prefix": "stage0_vq"},
                         timeout=5,
                     )
                     if resp.status_code == 200:
@@ -428,17 +428,17 @@ with tab_s2:
                                 cb_icon = "✅" if d["has_codebook"] else "❌"
                                 st.text(f"  {cb_icon} codebook | {d['name']} → {d['path']}")
                         else:
-                            st.warning("未找到 stage1_vq* 目录")
+                            st.warning("未找到 stage0_vq* 目录")
                     else:
                         st.error(f"HTTP {resp.status_code}")
                 except Exception as e:
                     st.error(f"探测失败: {e}")
         with s2_detect_col2:
-            if st.button("🔍 探测已有 Stage2 目录", key="s2_detect_s2"):
+            if st.button("🔍 探测已有 Stage1 目录", key="s2_detect_s2"):
                 try:
                     resp = requests.get(
                         f"{BASE_URL}/api/list_ckpt_dirs",
-                        params={"root_dir": glob_root_dir, "prefix": "stage2_vision"},
+                        params={"root_dir": glob_root_dir, "prefix": "stage1_vision"},
                         timeout=5,
                     )
                     if resp.status_code == 200:
@@ -450,7 +450,7 @@ with tab_s2:
                                 cb_icon = "✅" if d["has_codebook"] else "❌"
                                 st.text(f"  {a_icon} adapter {p_icon} projector {cb_icon} codebook | {d['name']}")
                         else:
-                            st.warning("未找到 stage2_vision* 目录")
+                            st.warning("未找到 stage1_vision* 目录")
                     else:
                         st.error(f"HTTP {resp.status_code}")
                 except Exception as e:
@@ -458,16 +458,16 @@ with tab_s2:
 
         s2p_col1, s2p_col2 = st.columns(2)
         with s2p_col1:
-            s2_stage1_codebook = st.text_input(
-                "STAGE1_CODEBOOK_PATH",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage1_vq/vq_codebook.pt",
+            s2_stage0_codebook = st.text_input(
+                "STAGE0_CODEBOOK_PATH",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage0_vq/vq_codebook.pt",
                 key="s2_s1_cb_path",
-                help="Stage1 产出的 codebook 文件路径。实际目录可能带 epoch 后缀，请先点击探测确认。"
+                help="Stage0 产出的 codebook 文件路径。实际目录可能带 epoch 后缀，请先点击探测确认。"
             )
         with s2p_col2:
-            s2_stage2_ckpt = st.text_input(
-                "STAGE2_CKPT_PATH (Stage2 产物保存目录)",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage2_vision",
+            s2_stage1_ckpt = st.text_input(
+                "STAGE1_CKPT_PATH (Stage1 产物保存目录)",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage1_vision",
                 key="s2_ckpt_path"
             )
 
@@ -494,19 +494,19 @@ with tab_s2:
             s2_bucket_drop = st.checkbox("BUCKET_DROP_LAST", value=False,
                                          key="s2_bucket_drop")
 
-    # ========== Stage2 训练超参 ==========
+    # ========== Stage1 训练超参 ==========
     with st.expander("🎛️ 训练超参数", expanded=True):
         s2t_col1, s2t_col2, s2t_col3 = st.columns(3)
         with s2t_col1:
             s2_epochs = st.number_input("EPOCHS", 1, 50, 3, key="s2_epochs")
             s2_batch_size = st.number_input("BATCH_SIZE", 1, 64, 8, key="s2_bs")
             s2_grad_accum = st.number_input("GRAD_ACCUM", 1, 64, 4, key="s2_grad_accum")
-            s2_stage2_grad_accum = st.number_input("STAGE2_GRAD_ACCUM", 1, 64, 4,
+            s2_stage1_grad_accum = st.number_input("STAGE1_GRAD_ACCUM", 1, 64, 4,
                                                     key="s2_s2_grad_accum")
         with s2t_col2:
             s2_lr = st.text_input("LR (全局学习率)", value="3e-5", key="s2_lr")
-            s2_stage1_lr = st.text_input("STAGE1_LR (VQ 部分学习率)", value="5e-5",
-                                         key="s2_stage1_lr")
+            s2_stage0_lr = st.text_input("STAGE0_LR (VQ 部分学习率)", value="5e-5",
+                                         key="s2_stage0_lr")
             s2_max_length = st.number_input("MAX_LENGTH", 128, 4096, 1024,
                                             key="s2_max_length")
             s2_max_new_tokens = st.number_input("MAX_NEW_TOKENS", 32, 1024, 128,
@@ -516,27 +516,27 @@ with tab_s2:
                                              step=0.1, key="s2_temperature")
             s2_tau1 = st.text_input("TAU1", value="0.01", key="s2_tau1")
 
-    # ========== Stage2 独有损失权重 ==========
-    with st.expander("⚖️ Stage2 蒸馏损失权重", expanded=True):
+    # ========== Stage1 独有损失权重 ==========
+    with st.expander("⚖️ Stage1 蒸馏损失权重", expanded=True):
         s2w_col1, s2w_col2 = st.columns(2)
         with s2w_col1:
-            s2_answer_weight = st.slider("STAGE2_ANSWER_WEIGHT (答案损失)", 0.0, 3.0, 1.0,
+            s2_answer_weight = st.slider("STAGE1_ANSWER_WEIGHT (答案损失)", 0.0, 3.0, 1.0,
                                          step=0.05, key="s2_ans_w")
-            s2_rationale_weight = st.slider("STAGE2_RATIONALE_WEIGHT (推理链损失)", 0.0, 2.0, 0.2,
+            s2_rationale_weight = st.slider("STAGE1_RATIONALE_WEIGHT (推理链损失)", 0.0, 2.0, 0.2,
                                             step=0.05, key="s2_rat_w")
-            s2_beta = st.slider("BETA (VQ 全局权重，Stage2 建议较低)", 0.0, 1.0, 0.05,
+            s2_beta = st.slider("BETA (VQ 全局权重，Stage1 建议较低)", 0.0, 1.0, 0.05,
                                 step=0.01, key="s2_beta")
         with s2w_col2:
-            s2_prepost_lr_scale = st.slider("STAGE2_PREPOST_LR_SCALE (pre/post_quant LR缩放)",
+            s2_prepost_lr_scale = st.slider("STAGE1_PREPOST_LR_SCALE (pre/post_quant LR缩放)",
                                             0.0, 1.0, 0.2, step=0.05, key="s2_prepost_lr")
-            s2_vision_lr_scale = st.slider("STAGE2_VISION_LR_SCALE (视觉模块 LR缩放)",
+            s2_vision_lr_scale = st.slider("STAGE1_VISION_LR_SCALE (视觉模块 LR缩放)",
                                            0.0, 1.0, 0.2, step=0.05, key="s2_vis_lr")
-            s2_grad_clip = st.number_input("STAGE2_GRAD_CLIP", 0.1, 20.0, 1.0,
+            s2_grad_clip = st.number_input("STAGE1_GRAD_CLIP", 0.1, 20.0, 1.0,
                                            step=0.1, key="s2_grad_clip")
 
-    # ========== Stage1 继承参数（VQ Codebook） ==========
-    with st.expander("📚 VQ Codebook 配置（继承自 Stage1）", expanded=False):
-        st.caption("这些参数应与 Stage1 训练时保持一致，否则无法正确加载 codebook。")
+    # ========== Stage0 继承参数（VQ Codebook） ==========
+    with st.expander("📚 VQ Codebook 配置（继承自 Stage0）", expanded=False):
+        st.caption("这些参数应与 Stage0 训练时保持一致，否则无法正确加载 codebook。")
         s2c_col1, s2c_col2 = st.columns(2)
         with s2c_col1:
             s2_codebook_size = st.selectbox("VQ_CODEBOOK_SIZE",
@@ -553,19 +553,19 @@ with tab_s2:
                                                 1, 200, 10, key="s2_reset_int")
             s2_legacy_loss = st.checkbox("VQ_LEGACY_LOSS", value=False, key="s2_legacy")
 
-    # ========== Stage1 继承参数（损失权重） ==========
-    with st.expander("📐 Stage1 损失权重（继承，供训练入口使用）", expanded=False):
-        st.caption("train_vq_lord3.py 是统一入口，Stage2 也需要传入 Stage1 的损失参数。")
+    # ========== Stage0 继承参数（损失权重） ==========
+    with st.expander("📐 Stage0 损失权重（继承，供训练入口使用）", expanded=False):
+        st.caption("training/train_vq_lord.py 是统一入口，Stage1 也需要传入 Stage0 的损失参数。")
         s2s1_col1, s2s1_col2 = st.columns(2)
         with s2s1_col1:
-            s2_s1_recon = st.slider("STAGE1_RECON_WEIGHT", 0.0, 5.0, 1.0,
+            s2_s1_recon = st.slider("STAGE0_RECON_WEIGHT", 0.0, 5.0, 1.0,
                                     step=0.05, key="s2_s1_recon")
-            s2_s1_cosine = st.slider("STAGE1_COSINE_WEIGHT", 0.0, 2.0, 0.25,
+            s2_s1_cosine = st.slider("STAGE0_COSINE_WEIGHT", 0.0, 2.0, 0.25,
                                      step=0.05, key="s2_s1_cosine")
         with s2s1_col2:
-            s2_s1_vq = st.slider("STAGE1_VQ_WEIGHT", 0.0, 5.0, 1.0,
+            s2_s1_vq = st.slider("STAGE0_VQ_WEIGHT", 0.0, 5.0, 1.0,
                                  step=0.05, key="s2_s1_vq")
-            s2_s1_grad_clip = st.number_input("STAGE1_GRAD_CLIP", 0.1, 20.0, 5.0,
+            s2_s1_grad_clip = st.number_input("STAGE0_GRAD_CLIP", 0.1, 20.0, 5.0,
                                               step=0.1, key="s2_s1_grad_clip")
 
     # ========== 模型配置 ==========
@@ -595,9 +595,9 @@ with tab_s2:
             s2_teacher_lang = st.selectbox("TEACHER_LANG", ["en", "zh"], index=0,
                                            key="s2_lang")
         with s2r_col2:
-            s2_reuse_codebook = st.checkbox("REUSE_VQ_CODEBOOK (必须复用 Stage1 码本)",
+            s2_reuse_codebook = st.checkbox("REUSE_VQ_CODEBOOK (必须复用 Stage0 码本)",
                                             value=True, key="s2_reuse_cb")
-            s2_reuse_stage2 = st.checkbox("REUSE_STAGE2 (复用已有 Stage2 ckpt)",
+            s2_reuse_stage1 = st.checkbox("REUSE_STAGE1 (复用已有 Stage1 ckpt)",
                                           value=False, key="s2_reuse_s2")
 
     # ========== 训练后自动评测 ==========
@@ -627,12 +627,12 @@ with tab_s2:
 
     # ========== 启动按钮 ==========
     st.divider()
-    if st.button("🚀 启动 Stage 2 训练", use_container_width=True, key="btn_stage2"):
+    if st.button("🚀 启动 Stage 1 训练", use_container_width=True, key="btn_stage1"):
         payload = {
             **GLOBAL_ENV,
             # 路径衔接
-            "STAGE1_CODEBOOK_PATH": s2_stage1_codebook,
-            "STAGE2_CKPT_PATH": s2_stage2_ckpt,
+            "STAGE0_CODEBOOK_PATH": s2_stage0_codebook,
+            "STAGE1_CKPT_PATH": s2_stage1_ckpt,
             # 数据与分桶
             "SCIENCEQA_SPLIT": s2_split,
             "TRAIN_NUM": s2_train_num,
@@ -641,32 +641,32 @@ with tab_s2:
             "PREPROCESS_BUCKET_BATCH_SIZE": s2_preprocess_bucket_bs,
             "BUCKET_BATCH_SIZE": s2_bucket_bs,
             "BUCKET_DROP_LAST": int(s2_bucket_drop),
-            "STAGE3_BUCKET_BATCH_SIZE": s2_bucket_bs,
-            "DISABLE_BUCKET_FOR_STAGE3": 0,
+            "STAGE2_BUCKET_BATCH_SIZE": s2_bucket_bs,
+            "DISABLE_BUCKET_FOR_STAGE2": 0,
             # 训练超参
             "EPOCHS": s2_epochs,
             "BATCH_SIZE": s2_batch_size,
             "GRAD_ACCUM": s2_grad_accum,
-            "STAGE2_GRAD_ACCUM": s2_stage2_grad_accum,
-            "STAGE3_GRAD_ACCUM": 0,
+            "STAGE1_GRAD_ACCUM": s2_stage1_grad_accum,
+            "STAGE2_GRAD_ACCUM": 0,
             "LR": s2_lr,
-            "STAGE1_LR": s2_stage1_lr,
+            "STAGE0_LR": s2_stage0_lr,
             "MAX_LENGTH": s2_max_length,
             "MAX_NEW_TOKENS": s2_max_new_tokens,
             "TEMPERATURE": s2_temperature,
             "TAU1": s2_tau1,
-            # Stage2 独有损失
-            "STAGE2_ANSWER_WEIGHT": s2_answer_weight,
-            "STAGE2_RATIONALE_WEIGHT": s2_rationale_weight,
-            "STAGE2_PREPOST_LR_SCALE": s2_prepost_lr_scale,
-            "STAGE2_VISION_LR_SCALE": s2_vision_lr_scale,
-            "STAGE2_GRAD_CLIP": s2_grad_clip,
+            # Stage1 独有损失
+            "STAGE1_ANSWER_WEIGHT": s2_answer_weight,
+            "STAGE1_RATIONALE_WEIGHT": s2_rationale_weight,
+            "STAGE1_PREPOST_LR_SCALE": s2_prepost_lr_scale,
+            "STAGE1_VISION_LR_SCALE": s2_vision_lr_scale,
+            "STAGE1_GRAD_CLIP": s2_grad_clip,
             "BETA": s2_beta,
-            # Stage1 继承损失
-            "STAGE1_RECON_WEIGHT": s2_s1_recon,
-            "STAGE1_COSINE_WEIGHT": s2_s1_cosine,
-            "STAGE1_VQ_WEIGHT": s2_s1_vq,
-            "STAGE1_GRAD_CLIP": s2_s1_grad_clip,
+            # Stage0 继承损失
+            "STAGE0_RECON_WEIGHT": s2_s1_recon,
+            "STAGE0_COSINE_WEIGHT": s2_s1_cosine,
+            "STAGE0_VQ_WEIGHT": s2_s1_vq,
+            "STAGE0_GRAD_CLIP": s2_s1_grad_clip,
             # VQ codebook
             "VQ_CODEBOOK_SIZE": s2_codebook_size,
             "VQ_COMMITMENT_COST": s2_commitment_cost,
@@ -686,7 +686,7 @@ with tab_s2:
             "STRICT_TEACHER_DISTILL": int(s2_strict_distill),
             "TEACHER_LANG": s2_teacher_lang,
             "REUSE_VQ_CODEBOOK": int(s2_reuse_codebook),
-            "REUSE_STAGE2": int(s2_reuse_stage2),
+            "REUSE_STAGE1": int(s2_reuse_stage1),
             # 训练后评测
             "EVAL_SPLIT": s2_eval_split,
             "EVAL_MAX_SAMPLES": s2_eval_max_samples,
@@ -698,33 +698,33 @@ with tab_s2:
             "SAVE_EACH_EPOCH": int(s2_save_each_epoch),
         }
         try:
-            resp = requests.post(f"{BASE_URL}/api/task/stage2", json=payload, timeout=10)
+            resp = requests.post(f"{BASE_URL}/api/task/stage1", json=payload, timeout=10)
             if resp.status_code == 200:
-                st.success("✅ Stage2 训练任务已提交后台执行")
+                st.success("✅ Stage1 训练任务已提交后台执行")
             else:
                 st.error(f"❌ 提交失败: HTTP {resp.status_code} — {resp.text}")
         except Exception as e:
             st.error(f"❌ 请求异常: {e}")
 
 with tab_s3:
-    st.header("4. Stage3: 偏好对齐 (Accuracy-First LoRD)")
-    st.info("加载 Stage2 全套产物（LoRA + projector + codebook），执行多 Period 迭代的 LoRD 偏好训练。"
+    st.header("4. Stage2: 偏好对齐 (Accuracy-First LoRD)")
+    st.info("加载 Stage1 全套产物（LoRA + projector + codebook），执行多 Period 迭代的 LoRD 偏好训练。"
             "训练后自动运行 validation + test 双评测。")
 
-    st.warning("⚠️ 前置条件：Stage1 codebook 与 Stage2 checkpoint 必须已生成。"
-               "注意：实际产物目录名可能带 epoch 后缀（如 `stage1_vq_epoch40`、`stage2_vision_epoch3`），"
+    st.warning("⚠️ 前置条件：Stage0 codebook 与 Stage1 checkpoint 必须已生成。"
+               "注意：实际产物目录名可能带 epoch 后缀（如 `stage0_vq_epoch40`、`stage1_vision_epoch3`），"
                "请点击下方'探测'按钮确认准确路径。")
 
     # ========== 路径衔接 ==========
-    with st.expander("📂 路径与衔接（Stage1/2 产物）", expanded=True):
+    with st.expander("📂 路径与衔接（Stage0/1 产物）", expanded=True):
         # 探测按钮
         s3_detect_col1, s3_detect_col2, s3_detect_col3 = st.columns(3)
         with s3_detect_col1:
-            if st.button("🔍 探测 Stage1 目录", key="s3_detect_s1"):
+            if st.button("🔍 探测 Stage0 目录", key="s3_detect_s1"):
                 try:
                     resp = requests.get(
                         f"{BASE_URL}/api/list_ckpt_dirs",
-                        params={"root_dir": glob_root_dir, "prefix": "stage1_vq"},
+                        params={"root_dir": glob_root_dir, "prefix": "stage0_vq"},
                         timeout=5,
                     )
                     if resp.status_code == 200:
@@ -734,17 +734,17 @@ with tab_s3:
                                 cb_icon = "✅" if d["has_codebook"] else "❌"
                                 st.text(f"  {cb_icon} codebook | {d['name']} → {d['path']}")
                         else:
-                            st.warning("未找到 stage1_vq* 目录")
+                            st.warning("未找到 stage0_vq* 目录")
                     else:
                         st.error(f"HTTP {resp.status_code}")
                 except Exception as e:
                     st.error(f"探测失败: {e}")
         with s3_detect_col2:
-            if st.button("🔍 探测 Stage2 目录", key="s3_detect_s2"):
+            if st.button("🔍 探测 Stage1 目录", key="s3_detect_s2"):
                 try:
                     resp = requests.get(
                         f"{BASE_URL}/api/list_ckpt_dirs",
-                        params={"root_dir": glob_root_dir, "prefix": "stage2_vision"},
+                        params={"root_dir": glob_root_dir, "prefix": "stage1_vision"},
                         timeout=5,
                     )
                     if resp.status_code == 200:
@@ -756,17 +756,17 @@ with tab_s3:
                                 cb_icon = "✅" if d["has_codebook"] else "❌"
                                 st.text(f"  {a_icon} adapter {p_icon} proj {cb_icon} cb | {d['name']}")
                         else:
-                            st.warning("未找到 stage2_vision* 目录")
+                            st.warning("未找到 stage1_vision* 目录")
                     else:
                         st.error(f"HTTP {resp.status_code}")
                 except Exception as e:
                     st.error(f"探测失败: {e}")
         with s3_detect_col3:
-            if st.button("🔍 探测 Stage3 已有产物", key="s3_detect_s3"):
+            if st.button("🔍 探测 Stage2 已有产物", key="s3_detect_s3"):
                 try:
-                    # 探测 stage3_sub / stage3_lord / stage3_resume
+                    # 探测 stage2_sub / stage2_lord / stage2_resume
                     found_any = False
-                    for prefix in ["stage3_sub", "stage3_lord", "stage3_resume"]:
+                    for prefix in ["stage2_sub", "stage2_lord", "stage2_resume"]:
                         resp = requests.get(
                             f"{BASE_URL}/api/list_ckpt_dirs",
                             params={"root_dir": glob_root_dir, "prefix": prefix},
@@ -780,40 +780,40 @@ with tab_s3:
                                 cb_icon = "✅" if d["has_codebook"] else "❌"
                                 st.text(f"  {a_icon} adapter {cb_icon} codebook | {d['name']}")
                     if not found_any:
-                        st.info("未找到 Stage3 已有产物（首次训练无需关注）")
+                        st.info("未找到 Stage2 已有产物（首次训练无需关注）")
                 except Exception as e:
                     st.error(f"探测失败: {e}")
 
         s3p_col1, s3p_col2 = st.columns(2)
         with s3p_col1:
-            s3_stage1_codebook = st.text_input(
-                "STAGE1_CODEBOOK_PATH",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage1_vq/vq_codebook.pt",
+            s3_stage0_codebook = st.text_input(
+                "STAGE0_CODEBOOK_PATH",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage0_vq/vq_codebook.pt",
                 key="s3_s1_cb_path",
-                help="实际目录可能是 stage1_vq_epoch40 等，请先探测确认"
+                help="实际目录可能是 stage0_vq_epoch40 等，请先探测确认"
             )
-            s3_stage2_ckpt = st.text_input(
-                "STAGE2_CKPT_PATH",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage2_vision",
+            s3_stage1_ckpt = st.text_input(
+                "STAGE1_CKPT_PATH",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage1_vision",
                 key="s3_s2_ckpt_path",
-                help="实际目录可能是 stage2_vision_epoch3 等，请先探测确认"
+                help="实际目录可能是 stage1_vision_epoch3 等，请先探测确认"
             )
         with s3p_col2:
             s3_final_adapter = st.text_input(
-                "STAGE3_FINAL_ADAPTER_PATH (最终产物目录)",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage3_lord_final",
+                "STAGE2_FINAL_ADAPTER_PATH (最终产物目录)",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage2_lord_final",
                 key="s3_final_path"
             )
             s3_resume_save_path = st.text_input(
-                "STAGE3_RESUME_SAVE_PATH (断点保存目录)",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage3_resume_latest",
+                "STAGE2_RESUME_SAVE_PATH (断点保存目录)",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage2_resume_latest",
                 key="s3_resume_save"
             )
             s3_resume_path = st.text_input(
-                "STAGE3_RESUME_PATH (从此路径恢复训练，留空=从头开始)",
+                "STAGE2_RESUME_PATH (从此路径恢复训练，留空=从头开始)",
                 value="",
                 key="s3_resume_from",
-                help="若要断点续训，填入 stage3_resume_latest 或某个 stage3_sub1_period{N} 的路径"
+                help="若要断点续训，填入 stage2_resume_latest 或某个 stage2_sub1_period{N} 的路径"
             )
 
     # ========== 数据与分桶 ==========
@@ -831,10 +831,10 @@ with tab_s3:
                                         index=0, key="s3_bucket_by")
             s3_bucket_bs = st.number_input("BUCKET_BATCH_SIZE (预处理桶大小)", 1, 128, 8,
                                            key="s3_bucket_bs")
-            s3_stage3_bucket_bs = st.number_input("STAGE3_BUCKET_BATCH_SIZE (Stage3运行时桶大小)",
+            s3_stage2_bucket_bs = st.number_input("STAGE2_BUCKET_BATCH_SIZE (Stage2运行时桶大小)",
                                                    1, 128, 16, key="s3_s3_bucket_bs")
             s3_bucket_drop = st.checkbox("BUCKET_DROP_LAST", value=False, key="s3_bucket_drop")
-            s3_disable_bucket = st.checkbox("DISABLE_BUCKET_FOR_STAGE3", value=False,
+            s3_disable_bucket = st.checkbox("DISABLE_BUCKET_FOR_STAGE2", value=False,
                                             key="s3_disable_bucket")
 
     # ========== 训练结构 ==========
@@ -849,9 +849,9 @@ with tab_s3:
         with s3st_col3:
             s3_batch_size = st.number_input("BATCH_SIZE", 1, 64, 2, key="s3_bs")
             s3_grad_accum = st.number_input("GRAD_ACCUM", 1, 64, 4, key="s3_grad_accum")
-            s3_stage2_grad_accum = st.number_input("STAGE2_GRAD_ACCUM (parser filler)", 1, 64, 4,
+            s3_stage1_grad_accum = st.number_input("STAGE1_GRAD_ACCUM (parser filler)", 1, 64, 4,
                                                     key="s3_s2_grad_accum")
-            s3_stage3_grad_accum = st.number_input("STAGE3_GRAD_ACCUM", 1, 64, 4,
+            s3_stage2_grad_accum = st.number_input("STAGE2_GRAD_ACCUM", 1, 64, 4,
                                                     key="s3_s3_grad_accum")
 
     # ========== 学习率与采样 ==========
@@ -859,12 +859,12 @@ with tab_s3:
         s3lr_col1, s3lr_col2, s3lr_col3 = st.columns(3)
         with s3lr_col1:
             s3_lr = st.text_input("LR (全局学习率)", value="3e-5", key="s3_lr")
-            s3_lr_scale = st.slider("STAGE3_LR_SCALE", 0.0, 1.0, 0.2,
+            s3_lr_scale = st.slider("STAGE2_LR_SCALE", 0.0, 1.0, 0.2,
                                     step=0.05, key="s3_lr_scale")
         with s3lr_col2:
-            s3_grad_clip = st.number_input("STAGE3_GRAD_CLIP", 0.1, 20.0, 1.0,
+            s3_grad_clip = st.number_input("STAGE2_GRAD_CLIP", 0.1, 20.0, 1.0,
                                            step=0.1, key="s3_grad_clip")
-            s3_train_projector = st.checkbox("STAGE3_TRAIN_PROJECTOR", value=False,
+            s3_train_projector = st.checkbox("STAGE2_TRAIN_PROJECTOR", value=False,
                                              key="s3_train_proj")
         with s3lr_col3:
             s3_temperature = st.slider("TEMPERATURE (采样温度)", 0.1, 3.0, 1.2,
@@ -885,16 +885,16 @@ with tab_s3:
     with st.expander("🎯 Accuracy-First 损失权重", expanded=True):
         s3mc_col1, s3mc_col2 = st.columns(2)
         with s3mc_col1:
-            s3_mc_weight = st.slider("STAGE3_MC_WEIGHT (多选CE主损失)", 0.0, 5.0, 1.0,
+            s3_mc_weight = st.slider("STAGE2_MC_WEIGHT (多选CE主损失)", 0.0, 5.0, 1.0,
                                      step=0.05, key="s3_mc_w")
-            s3_obj_weight = st.slider("STAGE3_OBJ_WEIGHT (LoRD对比目标)", 0.0, 1.0, 0.05,
+            s3_obj_weight = st.slider("STAGE2_OBJ_WEIGHT (LoRD对比目标)", 0.0, 1.0, 0.05,
                                       step=0.01, key="s3_obj_w")
         with s3mc_col2:
-            s3_reg_weight = st.slider("STAGE3_REG_WEIGHT (PPO-clip正则)", 0.0, 2.0, 0.30,
+            s3_reg_weight = st.slider("STAGE2_REG_WEIGHT (PPO-clip正则)", 0.0, 2.0, 0.30,
                                       step=0.05, key="s3_reg_w")
-            s3_answer_anchor = st.slider("STAGE3_ANSWER_ANCHOR_WEIGHT (答案锚定)", 0.0, 3.0, 1.0,
+            s3_answer_anchor = st.slider("STAGE2_ANSWER_ANCHOR_WEIGHT (答案锚定)", 0.0, 3.0, 1.0,
                                          step=0.05, key="s3_ans_anchor")
-            s3_force_cold_period0 = st.checkbox("STAGE3_FORCE_COLD_START_PERIOD0",
+            s3_force_cold_period0 = st.checkbox("STAGE2_FORCE_COLD_START_PERIOD0",
                                                 value=False, key="s3_force_cold")
 
     # ========== 四字段 Field Weight ==========
@@ -915,16 +915,16 @@ with tab_s3:
     with st.expander("🔀 排序与负样本增强", expanded=False):
         s3neg_col1, s3neg_col2 = st.columns(2)
         with s3neg_col1:
-            s3_pair_correctness = st.checkbox("STAGE3_PAIR_USE_ANSWER_CORRECTNESS (基于正确率排序)",
+            s3_pair_correctness = st.checkbox("STAGE2_PAIR_USE_ANSWER_CORRECTNESS (基于正确率排序)",
                                               value=True, key="s3_pair_corr")
-            s3_vic_include_context = st.checkbox("STAGE3_VIC_INCLUDE_CONTEXT (y_vic 包含 context)",
+            s3_vic_include_context = st.checkbox("STAGE2_VIC_INCLUDE_CONTEXT (y_vic 包含 context)",
                                                  value=False, key="s3_vic_ctx")
         with s3neg_col2:
-            s3_wrong_image_enable = st.checkbox("STAGE3_WRONG_IMAGE_ENABLE (错图负样本)",
+            s3_wrong_image_enable = st.checkbox("STAGE2_WRONG_IMAGE_ENABLE (错图负样本)",
                                                 value=False, key="s3_wrong_img")
-            s3_wrong_image_weight = st.slider("STAGE3_WRONG_IMAGE_WEIGHT", 0.0, 1.0, 0.2,
+            s3_wrong_image_weight = st.slider("STAGE2_WRONG_IMAGE_WEIGHT", 0.0, 1.0, 0.2,
                                               step=0.05, key="s3_wrong_w")
-            s3_wrong_image_margin = st.number_input("STAGE3_WRONG_IMAGE_MARGIN", 0.0, 5.0, 0.0,
+            s3_wrong_image_margin = st.number_input("STAGE2_WRONG_IMAGE_MARGIN", 0.0, 5.0, 0.0,
                                                     step=0.1, key="s3_wrong_m")
 
     # ========== 教师缓存与 Token 预算 ==========
@@ -937,7 +937,7 @@ with tab_s3:
             s3_teacher_cache_path = st.text_input(
                 "TEACHER_CACHE_PATH (留空=自动推导)",
                 value="", key="s3_cache_path",
-                help="留空时由 run_stage3.sh 根据 VICTIM_MODEL/SPLIT/TRAIN_NUM/SEED 自动拼接"
+                help="留空时由 run_stage2.sh 根据 VICTIM_MODEL/SPLIT/TRAIN_NUM/SEED 自动拼接"
             )
         with s3tc_col2:
             s3_tc_obs = st.number_input("TEACHER_OBSERVED_MAX_TOKENS", 32, 1024, 256, key="s3_tc_obs")
@@ -946,22 +946,22 @@ with tab_s3:
             s3_tc_ans = st.number_input("TEACHER_ANSWER_MAX_TOKENS", 16, 512, 64, key="s3_tc_ans")
             s3_tc_total = st.number_input("TEACHER_MAX_NEW_TOKENS_TOTAL", 64, 4096, 768, key="s3_tc_total")
 
-    # ========== Stage1/2 继承参数 ==========
-    with st.expander("📐 Stage1/2 继承参数（填充 parser 必需）", expanded=False):
-        st.caption("train_vq_lord3.py 是统一入口，Stage3 也需要传入 Stage1/2 的损失参数。")
+    # ========== Stage0/1 继承参数 ==========
+    with st.expander("📐 Stage0/1 继承参数（填充 parser 必需）", expanded=False):
+        st.caption("training/train_vq_lord.py 是统一入口，Stage2 也需要传入 Stage0/1 的损失参数。")
         s3inh_col1, s3inh_col2 = st.columns(2)
         with s3inh_col1:
-            s3_s1_lr = st.text_input("STAGE1_LR", value="5e-5", key="s3_s1_lr")
-            s3_s1_recon = st.slider("STAGE1_RECON_WEIGHT", 0.0, 5.0, 1.0, step=0.05, key="s3_s1_recon")
-            s3_s1_cosine = st.slider("STAGE1_COSINE_WEIGHT", 0.0, 2.0, 0.25, step=0.05, key="s3_s1_cos")
-            s3_s1_vq = st.slider("STAGE1_VQ_WEIGHT", 0.0, 5.0, 1.0, step=0.05, key="s3_s1_vq")
-            s3_s1_grad_clip = st.number_input("STAGE1_GRAD_CLIP", 0.1, 20.0, 5.0, step=0.1, key="s3_s1_gc")
+            s3_s1_lr = st.text_input("STAGE0_LR", value="5e-5", key="s3_s1_lr")
+            s3_s1_recon = st.slider("STAGE0_RECON_WEIGHT", 0.0, 5.0, 1.0, step=0.05, key="s3_s1_recon")
+            s3_s1_cosine = st.slider("STAGE0_COSINE_WEIGHT", 0.0, 2.0, 0.25, step=0.05, key="s3_s1_cos")
+            s3_s1_vq = st.slider("STAGE0_VQ_WEIGHT", 0.0, 5.0, 1.0, step=0.05, key="s3_s1_vq")
+            s3_s1_grad_clip = st.number_input("STAGE0_GRAD_CLIP", 0.1, 20.0, 5.0, step=0.1, key="s3_s1_gc")
         with s3inh_col2:
-            s3_s2_ans_w = st.slider("STAGE2_ANSWER_WEIGHT", 0.0, 3.0, 1.0, step=0.05, key="s3_s2_aw")
-            s3_s2_rat_w = st.slider("STAGE2_RATIONALE_WEIGHT", 0.0, 2.0, 0.2, step=0.05, key="s3_s2_rw")
-            s3_s2_prepost_lr = st.slider("STAGE2_PREPOST_LR_SCALE", 0.0, 1.0, 0.2, step=0.05, key="s3_s2_pp")
-            s3_s2_vis_lr = st.slider("STAGE2_VISION_LR_SCALE", 0.0, 1.0, 0.2, step=0.05, key="s3_s2_vl")
-            s3_s2_grad_clip = st.number_input("STAGE2_GRAD_CLIP", 0.1, 20.0, 1.0, step=0.1, key="s3_s2_gc")
+            s3_s2_ans_w = st.slider("STAGE1_ANSWER_WEIGHT", 0.0, 3.0, 1.0, step=0.05, key="s3_s2_aw")
+            s3_s2_rat_w = st.slider("STAGE1_RATIONALE_WEIGHT", 0.0, 2.0, 0.2, step=0.05, key="s3_s2_rw")
+            s3_s2_prepost_lr = st.slider("STAGE1_PREPOST_LR_SCALE", 0.0, 1.0, 0.2, step=0.05, key="s3_s2_pp")
+            s3_s2_vis_lr = st.slider("STAGE1_VISION_LR_SCALE", 0.0, 1.0, 0.2, step=0.05, key="s3_s2_vl")
+            s3_s2_grad_clip = st.number_input("STAGE1_GRAD_CLIP", 0.1, 20.0, 1.0, step=0.1, key="s3_s2_gc")
 
     # ========== VQ / 模型 ==========
     with st.expander("📚 VQ Codebook 与模型", expanded=False):
@@ -995,24 +995,24 @@ with tab_s3:
         with s3r_col1:
             s3_reuse_codebook = st.checkbox("REUSE_VQ_CODEBOOK", value=True, key="s3_reuse_cb")
         with s3r_col2:
-            s3_reuse_stage2 = st.checkbox("REUSE_STAGE2", value=True, key="s3_reuse_s2")
+            s3_reuse_stage1 = st.checkbox("REUSE_STAGE1", value=True, key="s3_reuse_s2")
 
-    # ========== Stage3 Period 内置评测 ==========
-    with st.expander("📊 Stage3 Period 内置评测", expanded=False):
+    # ========== Stage2 Period 内置评测 ==========
+    with st.expander("📊 Stage2 Period 内置评测", expanded=False):
         s3ev_col1, s3ev_col2 = st.columns(2)
         with s3ev_col1:
-            s3_eval_every = st.number_input("STAGE3_EVAL_EVERY_PERIOD (每N Period评测)",
+            s3_eval_every = st.number_input("STAGE2_EVAL_EVERY_PERIOD (每N Period评测)",
                                             1, 50, 1, key="s3_eval_every")
-            s3_eval_max = st.number_input("STAGE3_EVAL_MAX_SAMPLES (0=全量)", 0, 10000, 0,
+            s3_eval_max = st.number_input("STAGE2_EVAL_MAX_SAMPLES (0=全量)", 0, 10000, 0,
                                           key="s3_eval_max")
-            s3_eval_train_num = st.number_input("STAGE3_EVAL_TRAIN_NUM (0=全量)", 0, 100000, 0,
+            s3_eval_train_num = st.number_input("STAGE2_EVAL_TRAIN_NUM (0=全量)", 0, 100000, 0,
                                                 key="s3_eval_train_num")
         with s3ev_col2:
-            s3_eval_split = st.selectbox("STAGE3_EVAL_SCIENCEQA_SPLIT",
+            s3_eval_split = st.selectbox("STAGE2_EVAL_SCIENCEQA_SPLIT",
                                          ["validation", "test"], index=0, key="s3_eval_split")
-            s3_eval_path = st.text_input("STAGE3_EVAL_SCIENCEQA_PATH (留空=使用全局)",
+            s3_eval_path = st.text_input("STAGE2_EVAL_SCIENCEQA_PATH (留空=使用全局)",
                                          value="", key="s3_eval_path")
-            s3_eval_answer_mode = st.selectbox("STAGE3_EVAL_ANSWER_MODE",
+            s3_eval_answer_mode = st.selectbox("STAGE2_EVAL_ANSWER_MODE",
                                                ["logits", "generate", "hybrid"],
                                                index=0, key="s3_eval_mode")
 
@@ -1037,32 +1037,32 @@ with tab_s3:
             s3_save_step = st.number_input("SAVE_STEP (0=仅按epoch保存)", 0, 2000, 0, key="s3_save_step")
             s3_save_each_epoch = st.checkbox("SAVE_EACH_EPOCH", value=True, key="s3_save_epoch")
         with s3sv_col2:
-            s3_resume_save_optimizer = st.checkbox("STAGE3_RESUME_SAVE_OPTIMIZER (保存优化器状态)",
+            s3_resume_save_optimizer = st.checkbox("STAGE2_RESUME_SAVE_OPTIMIZER (保存优化器状态)",
                                                    value=True, key="s3_resume_opt")
-            s3_resume_save_interval = st.number_input("STAGE3_RESUME_SAVE_INTERVAL (每N Period保存断点)",
+            s3_resume_save_interval = st.number_input("STAGE2_RESUME_SAVE_INTERVAL (每N Period保存断点)",
                                                       1, 50, 1, key="s3_resume_int")
     
 
     # ========== 启动按钮 ==========
     st.divider()
-    if st.button("🔥 启动 Stage 3 训练", use_container_width=True, key="btn_stage3"):
+    if st.button("🔥 启动 Stage 2 训练", use_container_width=True, key="btn_stage2"):
         payload = {
             **GLOBAL_ENV,
             # 路径衔接
-            "STAGE1_CODEBOOK_PATH": s3_stage1_codebook,
-            "STAGE2_CKPT_PATH": s3_stage2_ckpt,
-            "STAGE3_FINAL_ADAPTER_PATH": s3_final_adapter,
-            "STAGE3_RESUME_SAVE_PATH": s3_resume_save_path,
-            "STAGE3_RESUME_PATH": s3_resume_path,
+            "STAGE0_CODEBOOK_PATH": s3_stage0_codebook,
+            "STAGE1_CKPT_PATH": s3_stage1_ckpt,
+            "STAGE2_FINAL_ADAPTER_PATH": s3_final_adapter,
+            "STAGE2_RESUME_SAVE_PATH": s3_resume_save_path,
+            "STAGE2_RESUME_PATH": s3_resume_path,
             # 数据与分桶
             "SCIENCEQA_SPLIT": s3_split,
             "TRAIN_NUM": s3_train_num,
             "SCIENCEQA_SEED": s3_seed,
             "BUCKET_BY": s3_bucket_by,
             "BUCKET_BATCH_SIZE": s3_bucket_bs,
-            "STAGE3_BUCKET_BATCH_SIZE": s3_stage3_bucket_bs,
+            "STAGE2_BUCKET_BATCH_SIZE": s3_stage2_bucket_bs,
             "BUCKET_DROP_LAST": int(s3_bucket_drop),
-            "DISABLE_BUCKET_FOR_STAGE3": int(s3_disable_bucket),
+            "DISABLE_BUCKET_FOR_STAGE2": int(s3_disable_bucket),
             # 训练结构
             "EPOCHS": s3_epochs,
             "SUB_STAGE_NUM": s3_sub_stage_num,
@@ -1070,35 +1070,35 @@ with tab_s3:
             "SUB_SET_NUM": s3_sub_set_num,
             "BATCH_SIZE": s3_batch_size,
             "GRAD_ACCUM": s3_grad_accum,
+            "STAGE1_GRAD_ACCUM": s3_stage1_grad_accum,
             "STAGE2_GRAD_ACCUM": s3_stage2_grad_accum,
-            "STAGE3_GRAD_ACCUM": s3_stage3_grad_accum,
             # 学习率与采样
             "LR": s3_lr,
-            "STAGE3_LR_SCALE": s3_lr_scale,
-            "STAGE3_GRAD_CLIP": s3_grad_clip,
-            "STAGE3_TRAIN_PROJECTOR": int(s3_train_projector),
+            "STAGE2_LR_SCALE": s3_lr_scale,
+            "STAGE2_GRAD_CLIP": s3_grad_clip,
+            "STAGE2_TRAIN_PROJECTOR": int(s3_train_projector),
             "TEMPERATURE": s3_temperature,
             "MAX_NEW_TOKENS": s3_max_new_tokens,
             "MAX_LENGTH": s3_max_length,
             "TAU1": s3_tau1,
             "TAU_DELTA": s3_tau_delta,
             # Accuracy-First 损失
-            "STAGE3_MC_WEIGHT": s3_mc_weight,
-            "STAGE3_OBJ_WEIGHT": s3_obj_weight,
-            "STAGE3_REG_WEIGHT": s3_reg_weight,
-            "STAGE3_ANSWER_ANCHOR_WEIGHT": s3_answer_anchor,
-            "STAGE3_FORCE_COLD_START_PERIOD0": int(s3_force_cold_period0),
+            "STAGE2_MC_WEIGHT": s3_mc_weight,
+            "STAGE2_OBJ_WEIGHT": s3_obj_weight,
+            "STAGE2_REG_WEIGHT": s3_reg_weight,
+            "STAGE2_ANSWER_ANCHOR_WEIGHT": s3_answer_anchor,
+            "STAGE2_FORCE_COLD_START_PERIOD0": int(s3_force_cold_period0),
             # 四字段权重
-            "STAGE3_FIELD_WEIGHT_OBSERVED": s3_fw_observed,
-            "STAGE3_FIELD_WEIGHT_CONTEXT": s3_fw_context,
-            "STAGE3_FIELD_WEIGHT_REASONING": s3_fw_reasoning,
-            "STAGE3_FIELD_WEIGHT_ANSWER": s3_fw_answer,
+            "STAGE2_FIELD_WEIGHT_OBSERVED": s3_fw_observed,
+            "STAGE2_FIELD_WEIGHT_CONTEXT": s3_fw_context,
+            "STAGE2_FIELD_WEIGHT_REASONING": s3_fw_reasoning,
+            "STAGE2_FIELD_WEIGHT_ANSWER": s3_fw_answer,
             # 排序与负样本
-            "STAGE3_PAIR_USE_ANSWER_CORRECTNESS": int(s3_pair_correctness),
-            "STAGE3_VIC_INCLUDE_CONTEXT": int(s3_vic_include_context),
-            "STAGE3_WRONG_IMAGE_ENABLE": int(s3_wrong_image_enable),
-            "STAGE3_WRONG_IMAGE_WEIGHT": s3_wrong_image_weight,
-            "STAGE3_WRONG_IMAGE_MARGIN": s3_wrong_image_margin,
+            "STAGE2_PAIR_USE_ANSWER_CORRECTNESS": int(s3_pair_correctness),
+            "STAGE2_VIC_INCLUDE_CONTEXT": int(s3_vic_include_context),
+            "STAGE2_WRONG_IMAGE_ENABLE": int(s3_wrong_image_enable),
+            "STAGE2_WRONG_IMAGE_WEIGHT": s3_wrong_image_weight,
+            "STAGE2_WRONG_IMAGE_MARGIN": s3_wrong_image_margin,
             # 教师缓存
             "TEACHER_LANG": s3_teacher_lang,
             "COLLECT_TEACHER_DATA": int(s3_collect_teacher),
@@ -1109,17 +1109,17 @@ with tab_s3:
             "TEACHER_REASONING_MAX_TOKENS": s3_tc_rsn,
             "TEACHER_ANSWER_MAX_TOKENS": s3_tc_ans,
             "TEACHER_MAX_NEW_TOKENS_TOTAL": s3_tc_total,
-            # Stage1/2 继承
-            "STAGE1_LR": s3_s1_lr,
-            "STAGE1_RECON_WEIGHT": s3_s1_recon,
-            "STAGE1_COSINE_WEIGHT": s3_s1_cosine,
-            "STAGE1_VQ_WEIGHT": s3_s1_vq,
-            "STAGE1_GRAD_CLIP": s3_s1_grad_clip,
-            "STAGE2_ANSWER_WEIGHT": s3_s2_ans_w,
-            "STAGE2_RATIONALE_WEIGHT": s3_s2_rat_w,
-            "STAGE2_PREPOST_LR_SCALE": s3_s2_prepost_lr,
-            "STAGE2_VISION_LR_SCALE": s3_s2_vis_lr,
-            "STAGE2_GRAD_CLIP": s3_s2_grad_clip,
+            # Stage0/1 继承
+            "STAGE0_LR": s3_s1_lr,
+            "STAGE0_RECON_WEIGHT": s3_s1_recon,
+            "STAGE0_COSINE_WEIGHT": s3_s1_cosine,
+            "STAGE0_VQ_WEIGHT": s3_s1_vq,
+            "STAGE0_GRAD_CLIP": s3_s1_grad_clip,
+            "STAGE1_ANSWER_WEIGHT": s3_s2_ans_w,
+            "STAGE1_RATIONALE_WEIGHT": s3_s2_rat_w,
+            "STAGE1_PREPOST_LR_SCALE": s3_s2_prepost_lr,
+            "STAGE1_VISION_LR_SCALE": s3_s2_vis_lr,
+            "STAGE1_GRAD_CLIP": s3_s2_grad_clip,
             # VQ / 模型
             "VQ_CODEBOOK_SIZE": s3_codebook_size,
             "VQ_COMMITMENT_COST": s3_commitment_cost,
@@ -1135,14 +1135,14 @@ with tab_s3:
             "USE_4BIT": int(s3_use_4bit),
             "MODEL_DTYPE": s3_model_dtype,
             "REUSE_VQ_CODEBOOK": int(s3_reuse_codebook),
-            "REUSE_STAGE2": int(s3_reuse_stage2),
-            # Stage3 内置评测
-            "STAGE3_EVAL_EVERY_PERIOD": s3_eval_every,
-            "STAGE3_EVAL_MAX_SAMPLES": s3_eval_max,
-            "STAGE3_EVAL_SCIENCEQA_SPLIT": s3_eval_split,
-            "STAGE3_EVAL_SCIENCEQA_PATH": s3_eval_path,
-            "STAGE3_EVAL_TRAIN_NUM": s3_eval_train_num,
-            "STAGE3_EVAL_ANSWER_MODE": s3_eval_answer_mode,
+            "REUSE_STAGE1": int(s3_reuse_stage1),
+            # Stage2 内置评测
+            "STAGE2_EVAL_EVERY_PERIOD": s3_eval_every,
+            "STAGE2_EVAL_MAX_SAMPLES": s3_eval_max,
+            "STAGE2_EVAL_SCIENCEQA_SPLIT": s3_eval_split,
+            "STAGE2_EVAL_SCIENCEQA_PATH": s3_eval_path,
+            "STAGE2_EVAL_TRAIN_NUM": s3_eval_train_num,
+            "STAGE2_EVAL_ANSWER_MODE": s3_eval_answer_mode,
             # 训练后评测
             "EVAL_MAX_SAMPLES": s3_final_eval_max,
             "EVAL_MAX_NEW_TOKENS": s3_final_eval_tokens,
@@ -1151,13 +1151,13 @@ with tab_s3:
             "LOG_STEP": s3_log_step,
             "SAVE_STEP": s3_save_step,
             "SAVE_EACH_EPOCH": int(s3_save_each_epoch),
-            "STAGE3_RESUME_SAVE_OPTIMIZER": int(s3_resume_save_optimizer),
-            "STAGE3_RESUME_SAVE_INTERVAL": s3_resume_save_interval,
+            "STAGE2_RESUME_SAVE_OPTIMIZER": int(s3_resume_save_optimizer),
+            "STAGE2_RESUME_SAVE_INTERVAL": s3_resume_save_interval,
         }
         try:
-            resp = requests.post(f"{BASE_URL}/api/task/stage3", json=payload, timeout=10)
+            resp = requests.post(f"{BASE_URL}/api/task/stage2", json=payload, timeout=10)
             if resp.status_code == 200:
-                st.success("✅ Stage3 训练任务已提交后台执行")
+                st.success("✅ Stage2 训练任务已提交后台执行")
             else:
                 st.error(f"❌ 提交失败: HTTP {resp.status_code} — {resp.text}")
         except Exception as e:
@@ -1165,23 +1165,23 @@ with tab_s3:
 
 with tab_eval:
     st.header("5. 在线评测大盘")
-    st.info("对 Stage2 / Stage3 训练产物在 ScienceQA test set 上进行准确率评测。"
+    st.info("对 Stage1 / Stage2 训练产物在 ScienceQA test set 上进行准确率评测。"
             "评测完成后返回 ACCURACY / FORMAT_RATE / N 三个指标。")
 
-    eval_tab_s2, eval_tab_s3 = st.tabs(["Stage2 评测", "Stage3 评测"])
+    eval_tab_s2, eval_tab_s3 = st.tabs(["Stage1 评测", "Stage2 评测"])
 
     # ============================================================
-    # Stage2 评测
+    # Stage1 评测
     # ============================================================
     with eval_tab_s2:
-        st.subheader("Stage2 产物评测")
+        st.subheader("Stage1 产物评测")
 
         # 路径探测
-        if st.button("🔍 探测 Stage2 checkpoint 目录", key="eval_s2_detect"):
+        if st.button("🔍 探测 Stage1 checkpoint 目录", key="eval_s2_detect"):
             try:
                 resp = requests.get(
                     f"{BASE_URL}/api/list_ckpt_dirs",
-                    params={"root_dir": glob_root_dir, "prefix": "stage2_vision"},
+                    params={"root_dir": glob_root_dir, "prefix": "stage1_vision"},
                     timeout=5,
                 )
                 if resp.status_code == 200:
@@ -1193,7 +1193,7 @@ with tab_eval:
                             p_icon = "✅" if d["has_projector"] else "❌"
                             st.text(f"  {a_icon} adapter {p_icon} projector {cb_icon} codebook | {d['name']} → {d['path']}")
                     else:
-                        st.warning("未找到 stage2_vision* 目录")
+                        st.warning("未找到 stage1_vision* 目录")
                 else:
                     st.error(f"HTTP {resp.status_code}")
             except Exception as e:
@@ -1202,10 +1202,10 @@ with tab_eval:
         ev2_col1, ev2_col2 = st.columns(2)
         with ev2_col1:
             ev2_ckpt_path = st.text_input(
-                "STAGE2_CKPT_PATH (评测 checkpoint 目录)",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage2_vision",
+                "STAGE1_CKPT_PATH (评测 checkpoint 目录)",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage1_vision",
                 key="ev2_ckpt_path",
-                help="实际目录可能是 stage2_vision_epoch3 等，请先探测确认"
+                help="实际目录可能是 stage1_vision_epoch3 等，请先探测确认"
             )
             ev2_split = st.selectbox("EVAL_SPLIT", ["test", "validation"], index=0, key="ev2_split")
             ev2_max_samples = st.number_input("EVAL_MAX_SAMPLES (0=全量)", 0, 10000, 0, key="ev2_max")
@@ -1220,10 +1220,10 @@ with tab_eval:
                                              [256, 512, 1024, 2048, 4096, 8192],
                                              index=2, key="ev2_cb_size")
 
-        if st.button("🚀 启动 Stage2 评测", use_container_width=True, key="btn_eval_s2"):
+        if st.button("🚀 启动 Stage1 评测", use_container_width=True, key="btn_eval_s2"):
             payload = {
                 **GLOBAL_ENV,
-                "STAGE2_CKPT_PATH": ev2_ckpt_path,
+                "STAGE1_CKPT_PATH": ev2_ckpt_path,
                 "EVAL_SPLIT": ev2_split,
                 "EVAL_MAX_SAMPLES": ev2_max_samples,
                 "EVAL_MAX_NEW_TOKENS": ev2_max_new_tokens,
@@ -1234,9 +1234,9 @@ with tab_eval:
                 "FREEZE_VISION_TOWER": 0,
             }
             try:
-                resp = requests.post(f"{BASE_URL}/api/task/eval_stage2", json=payload, timeout=10)
+                resp = requests.post(f"{BASE_URL}/api/task/eval_stage1", json=payload, timeout=10)
                 if resp.status_code == 200:
-                    st.success("✅ Stage2 评测任务已提交后台")
+                    st.success("✅ Stage1 评测任务已提交后台")
                 else:
                     st.error(f"❌ HTTP {resp.status_code} — {resp.text}")
             except Exception as e:
@@ -1244,14 +1244,14 @@ with tab_eval:
 
         # 结果拉取
         st.divider()
-        st.markdown("**📊 Stage2 评测结果**")
-        if st.button("拉取最新 Stage2 评测结果", key="btn_fetch_ev2"):
+        st.markdown("**📊 Stage1 评测结果**")
+        if st.button("拉取最新 Stage1 评测结果", key="btn_fetch_ev2"):
             try:
                 resp = requests.get(
                     f"{BASE_URL}/api/eval_result",
                     params={
                         "root_dir": glob_root_dir,
-                        "prefix": "stage2",
+                        "prefix": "stage1",
                     },
                     timeout=10,
                 )
@@ -1274,16 +1274,16 @@ with tab_eval:
                 st.error(f"❌ {e}")
 
     # ============================================================
-    # Stage3 评测
+    # Stage2 评测
     # ============================================================
     with eval_tab_s3:
-        st.subheader("Stage3 产物评测")
+        st.subheader("Stage2 产物评测")
 
         # 路径探测
-        if st.button("🔍 探测 Stage3 checkpoint 目录", key="eval_s3_detect"):
+        if st.button("🔍 探测 Stage2 checkpoint 目录", key="eval_s3_detect"):
             try:
                 found_any = False
-                for prefix in ["stage3_sub", "stage3_lord", "stage3_resume"]:
+                for prefix in ["stage2_sub", "stage2_lord", "stage2_resume"]:
                     resp = requests.get(
                         f"{BASE_URL}/api/list_ckpt_dirs",
                         params={"root_dir": glob_root_dir, "prefix": prefix},
@@ -1297,15 +1297,15 @@ with tab_eval:
                             cb_icon = "✅" if d["has_codebook"] else "❌"
                             st.text(f"  {a_icon} adapter {cb_icon} codebook | {d['name']} → {d['path']}")
                 if not found_any:
-                    st.warning("未找到任何 Stage3 产物目录")
+                    st.warning("未找到任何 Stage2 产物目录")
             except Exception as e:
                 st.error(f"探测失败: {e}")
 
         ev3_col1, ev3_col2 = st.columns(2)
         with ev3_col1:
             ev3_adapter_path = st.text_input(
-                "STAGE3_FINAL_ADAPTER_PATH (评测 adapter 目录)",
-                value=f"{glob_root_dir}/vq_lord_ckpts/stage3_sub1_period7",
+                "STAGE2_FINAL_ADAPTER_PATH (评测 adapter 目录)",
+                value=f"{glob_root_dir}/vq_lord_ckpts/stage2_sub1_period7",
                 key="ev3_adapter_path",
                 help="需要包含 adapter_config.json 和 vq_codebook.pt"
             )
@@ -1322,10 +1322,10 @@ with tab_eval:
                                              [256, 512, 1024, 2048, 4096, 8192],
                                              index=2, key="ev3_cb_size")
 
-        if st.button("🚀 启动 Stage3 评测", use_container_width=True, key="btn_eval_s3"):
+        if st.button("🚀 启动 Stage2 评测", use_container_width=True, key="btn_eval_s3"):
             payload = {
                 **GLOBAL_ENV,
-                "STAGE3_FINAL_ADAPTER_PATH": ev3_adapter_path,
+                "STAGE2_FINAL_ADAPTER_PATH": ev3_adapter_path,
                 "EVAL_SPLIT": ev3_split,
                 "EVAL_MAX_SAMPLES": ev3_max_samples,
                 "EVAL_MAX_NEW_TOKENS": ev3_max_new_tokens,
@@ -1336,9 +1336,9 @@ with tab_eval:
                 "FREEZE_VISION_TOWER": 0,
             }
             try:
-                resp = requests.post(f"{BASE_URL}/api/task/eval_stage3", json=payload, timeout=10)
+                resp = requests.post(f"{BASE_URL}/api/task/eval_stage2", json=payload, timeout=10)
                 if resp.status_code == 200:
-                    st.success("✅ Stage3 评测任务已提交后台")
+                    st.success("✅ Stage2 评测任务已提交后台")
                 else:
                     st.error(f"❌ HTTP {resp.status_code} — {resp.text}")
             except Exception as e:
@@ -1346,14 +1346,14 @@ with tab_eval:
 
         # 结果拉取
         st.divider()
-        st.markdown("**📊 Stage3 评测结果**")
-        if st.button("拉取最新 Stage3 评测结果", key="btn_fetch_ev3"):
+        st.markdown("**📊 Stage2 评测结果**")
+        if st.button("拉取最新 Stage2 评测结果", key="btn_fetch_ev3"):
             try:
                 resp = requests.get(
                     f"{BASE_URL}/api/eval_result",
                     params={
                         "root_dir": glob_root_dir,
-                        "prefix": "stage3",
+                        "prefix": "stage2",
                     },
                     timeout=10,
                 )

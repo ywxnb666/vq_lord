@@ -87,7 +87,7 @@ align_vq_apply_dataset_profile() {
     TRAIN_NUM="${TRAIN_NUM:-${train_num_default}}"
     BUCKET_BY="${BUCKET_BY:-patches}"
     BUCKET_DROP_LAST="${BUCKET_DROP_LAST:-0}"
-    DISABLE_BUCKET_FOR_STAGE3="${DISABLE_BUCKET_FOR_STAGE3:-0}"
+    DISABLE_BUCKET_FOR_STAGE2="${DISABLE_BUCKET_FOR_STAGE2:-0}"
 
     VICTIM_MODEL="${VICTIM_MODEL:-${victim_model_default}}"
     COLLECT_TEACHER_DATA="${COLLECT_TEACHER_DATA:-0}"
@@ -126,7 +126,7 @@ align_vq_init_paths() {
     export ROOT_DIR SCRIPT_DIR PYTHON_BIN MODEL_PATH STUDENT_MODEL_TYPE
     export DATASET_NAME DATASET_TAG TRAIN_DATASET_NAME
     export DATASET_PATH DATASET_SPLIT DATASET_SEED TRAIN_NUM
-    export BUCKET_BY BUCKET_DROP_LAST DISABLE_BUCKET_FOR_STAGE3
+    export BUCKET_BY BUCKET_DROP_LAST DISABLE_BUCKET_FOR_STAGE2
     export COLLECT_TEACHER_DATA STRICT_TEACHER_DISTILL TEACHER_LANG
     export TEACHER_CACHE_PATH SAMPLE_ONLY_CACHED_TEACHER
     export VICTIM_MODEL REUSE_VQ_CODEBOOK REMOVE_VQ_CODEBOOK
@@ -147,6 +147,7 @@ align_vq_setup_env() {
     export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
     export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
     export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+    export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
     export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
     if ! [[ "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
@@ -312,7 +313,7 @@ align_vq_prepare_dataset_preprocess() {
     local preview_buckets="${9:-10}"
     local preview_batches="${10:-10}"
 
-    local preprocess_entry="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
+    local preprocess_entry="${ROOT_DIR}/vq_lord3/data/preprocess/sciqa_preprocess.py"
 
     align_vq_require_file "${preprocess_entry}" "预处理入口"
     align_vq_require_path "${MODEL_PATH}" "模型路径"
@@ -358,19 +359,19 @@ align_vq_prepare_scienceqa_preprocess() {
     align_vq_prepare_dataset_preprocess "$@"
 }
 
-align_vq_require_stage1_artifacts() {
+align_vq_require_stage0_artifacts() {
     local codebook_path="$1"
-    align_vq_require_file "${codebook_path}" "Stage1 vq_codebook"
+    align_vq_require_file "${codebook_path}" "Stage0 vq_codebook"
 }
 
-align_vq_require_stage2_artifacts() {
+align_vq_require_stage1_artifacts() {
     local ckpt_path="$1"
-    align_vq_require_dir "${ckpt_path}" "Stage2 checkpoint 目录"
+    align_vq_require_dir "${ckpt_path}" "Stage1 checkpoint 目录"
     if [ "${REMOVE_VQ_CODEBOOK:-0}" != "1" ]; then
-        align_vq_require_file "${ckpt_path}/vq_codebook.pt" "Stage2 vq_codebook"
+        align_vq_require_file "${ckpt_path}/vq_codebook.pt" "Stage1 vq_codebook"
     fi
-    align_vq_require_file "${ckpt_path}/adapter_config.json" "Stage2 adapter_config.json"
-    align_vq_require_file "${ckpt_path}/projector.pt" "Stage2 projector.pt"
+    align_vq_require_file "${ckpt_path}/adapter_config.json" "Stage1 adapter_config.json"
+    align_vq_require_file "${ckpt_path}/projector.pt" "Stage1 projector.pt"
 }
 
 align_vq_extract_eval_metrics() {

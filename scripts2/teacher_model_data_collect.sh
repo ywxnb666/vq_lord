@@ -12,7 +12,7 @@ align_vq_ensure_runtime_dirs
 align_vq_setup_logging "teacher_model_data_collect"
 
 # Paths
-COLLECT_ENTRY="${ROOT_DIR}/vq_lord3/data_collector2.py"
+COLLECT_ENTRY="${ROOT_DIR}/vq_lord3/data/data_collector.py"
 
 # Data
 SCIENCEQA_SPLIT="${SCIENCEQA_SPLIT:-train}"

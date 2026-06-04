@@ -10,11 +10,11 @@ mkdir -p "${OUT_DIR}"
 SUM="${OUT_DIR}/summary.tsv"
 echo -e "ckpt\tacc\tformat_rate\tn\tstatus" > "${SUM}"
 
-mapfile -t CKPTS < <(find "${CKPT_DIR}" -maxdepth 1 -type d -name 'stage2_vision_epoch*' | sort -V)
+mapfile -t CKPTS < <(find "${CKPT_DIR}" -maxdepth 1 -type d -name 'stage2_sub*_period*' | sort -V)
 for ckpt in "${CKPTS[@]}"; do
   name="$(basename "${ckpt}")"
   runlog="${OUT_DIR}/${name}.log"
-  if STAGE2_CKPT_PATH="${ckpt}" RESULT_PATH="${OUT_DIR}/${name}.json" SHARD_RESULT_DIR="${OUT_DIR}/${name}_shards" LOG_FILE="${runlog}" bash "${TEST_SH}" > "${runlog}" 2>&1; then
+  if STAGE2_FINAL_ADAPTER_PATH="${ckpt}" RESULT_PATH="${OUT_DIR}/${name}.json" SHARD_RESULT_DIR="${OUT_DIR}/${name}_shards" LOG_FILE="${runlog}" bash "${TEST_SH}" > "${runlog}" 2>&1; then
     acc="$(awk -F= '/^ACCURACY=/{v=$2} END{print v}' "${runlog}")"
     fmt="$(awk -F= '/^FORMAT_RATE=/{v=$2} END{print v}' "${runlog}")"
     n="$(awk -F= '/^N=/{v=$2} END{print v}' "${runlog}")"

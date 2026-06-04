@@ -11,7 +11,7 @@ align_vq_ensure_runtime_dirs
 align_vq_setup_logging "trim_teacher_cache"
 
 # Paths
-TRIM_ENTRY="${ROOT_DIR}/vq_lord3/trim_teacher_cache.py"
+TRIM_ENTRY="${ROOT_DIR}/vq_lord3/utils/trim_teacher_cache.py"
 
 # Data
 SCIENCEQA_SPLIT="${SCIENCEQA_SPLIT:-train}"

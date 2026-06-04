@@ -1,0 +1,35 @@
+{
+  "provider": {
+    "type": "openai_compatible",
+    "model": "${TEACHER_MODEL:-gpt-5.2}",
+    "base_url": "${TEACHER_API_BASE}",
+    "api_key": "${TEACHER_API_KEY}",
+    "enable_thinking": null,
+    "http_timeout": 120,
+    "max_retries": 2
+  },
+  "sampling": {
+    "teacher_lang": "en",
+    "max_workers": 8,
+    "per_sample_attempts": 1,
+    "save_every": 50,
+    "seed": 20240306
+  },
+  "budget": {
+    "teacher_observed_max_tokens": 256,
+    "teacher_context_max_tokens": 192,
+    "teacher_reasoning_max_tokens": 256,
+    "teacher_answer_max_tokens": 64,
+    "teacher_max_new_tokens_total": 768
+  },
+  "datasets": [
+    {
+      "name": "aokvqa",
+      "source_type": "hf_or_parquet",
+      "path": "HuggingFaceM4/A-OKVQA",
+      "split": "train",
+      "count": 8,
+      "output_path": "outputs/aokvqa_teacher_${TEACHER_MODEL:-gpt-5.2}_train_n8.json"
+    }
+  ]
+}

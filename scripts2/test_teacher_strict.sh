@@ -23,7 +23,7 @@ EVAL_MAX_NEW_TOKENS=16
 TEMPERATURE=0.0
 
 # Paths
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_teacher_strict.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/evaluation/sciqa_process2_teacher_strict.py"
 RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/teacher_${EVAL_SPLIT}_strict_generate.json}"
 
 align_vq_print_header "教师模型严格 ScienceQA 评测"

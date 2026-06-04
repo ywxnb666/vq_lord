@@ -21,7 +21,7 @@ VQ_CODEBOOK_SIZE=1024
 FREEZE_VISION_TOWER=0
 
 # Paths
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/evaluation/sciqa_process2.py"
 RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/origin_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}.json}"
 
 align_vq_print_header "原始学生模型评测"

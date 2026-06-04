@@ -134,7 +134,18 @@ def task_preprocess(payload: Dict[str, Any] = Body(...)):
     t.start()
     return {"status": "ok", "message": "Data preprocessing task spawned."}
 
-# ---- Tab 2: Stage1 VQ 码本训练 ----
+# ---- Tab 2: Stage0 VQ 码本训练 ----
+@app.post("/api/task/stage0")
+def task_stage0(payload: Dict[str, Any] = Body(...)):
+    t = threading.Thread(
+        target=run_bash_script,
+        args=("run_stage0.sh", payload),
+        daemon=True,
+    )
+    t.start()
+    return {"status": "ok", "message": "Stage0 VQ codebook training task spawned."}
+
+# ---- Tab 3: Stage1 视觉蒸馏 ----
 @app.post("/api/task/stage1")
 def task_stage1(payload: Dict[str, Any] = Body(...)):
     t = threading.Thread(
@@ -143,9 +154,9 @@ def task_stage1(payload: Dict[str, Any] = Body(...)):
         daemon=True,
     )
     t.start()
-    return {"status": "ok", "message": "Stage1 VQ codebook training task spawned."}
+    return {"status": "ok", "message": "Stage1 vision distillation task spawned."}
 
-# ---- Tab 3: Stage2 视觉蒸馏 ----
+# ---- Tab 4: Stage2 LoRD 偏好对齐 ----
 @app.post("/api/task/stage2")
 def task_stage2(payload: Dict[str, Any] = Body(...)):
     t = threading.Thread(
@@ -154,23 +165,12 @@ def task_stage2(payload: Dict[str, Any] = Body(...)):
         daemon=True,
     )
     t.start()
-    return {"status": "ok", "message": "Stage2 vision distillation task spawned."}
-
-# ---- Tab 4: Stage3 LoRD 偏好对齐 ----
-@app.post("/api/task/stage3")
-def task_stage3(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("run_stage3.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Stage3 LoRD preference alignment task spawned."}
+    return {"status": "ok", "message": "Stage2 LoRD preference alignment task spawned."}
 
 # ---- 路径探测：列出 ckpt 目录下匹配前缀的子目录 ----
 @app.get("/api/list_ckpt_dirs")
 def list_ckpt_dirs(root_dir: str = "/root/workspace/vq_lord",
-                   prefix: str = "stage1_vq"):
+                   prefix: str = "stage0_vq"):
     """列出 vq_lord_ckpts/ 下匹配指定前缀的目录，用于前端路径选择。"""
     ckpt_base = os.path.join(root_dir, "vq_lord_ckpts")
     if not os.path.isdir(ckpt_base):
@@ -193,6 +193,17 @@ def list_ckpt_dirs(root_dir: str = "/root/workspace/vq_lord",
             })
     return {"dirs": matched}
 
+# ---- Tab 5: Stage1 评测 ----
+@app.post("/api/task/eval_stage1")
+def task_eval_stage1(payload: Dict[str, Any] = Body(...)):
+    t = threading.Thread(
+        target=run_bash_script,
+        args=("test_vq_lord_stage1_parallel.sh", payload),
+        daemon=True,
+    )
+    t.start()
+    return {"status": "ok", "message": "Stage1 evaluation task spawned."}
+
 # ---- Tab 5: Stage2 评测 ----
 @app.post("/api/task/eval_stage2")
 def task_eval_stage2(payload: Dict[str, Any] = Body(...)):
@@ -204,23 +215,12 @@ def task_eval_stage2(payload: Dict[str, Any] = Body(...)):
     t.start()
     return {"status": "ok", "message": "Stage2 evaluation task spawned."}
 
-# ---- Tab 5: Stage3 评测 ----
-@app.post("/api/task/eval_stage3")
-def task_eval_stage3(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("test_vq_lord_stage3.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Stage3 evaluation task spawned."}
-
 # ---------------------------------------------------------
 # 评测结果读取接口
 # ---------------------------------------------------------
 @app.get("/api/eval_result")
 def get_eval_result(root_dir: str = "/root/workspace/vq_lord",
-                    prefix: str = "stage3"):
+                    prefix: str = "stage2"):
     """
     在 test_results/ 目录下查找匹配前缀的最新 JSON 结果文件，
     解析并返回 accuracy / format_rate / n 三个指标。

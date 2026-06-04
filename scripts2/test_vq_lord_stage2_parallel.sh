@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
+SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_SOURCE_DIR}/common.sh"
 
 align_vq_init_paths
@@ -16,62 +16,83 @@ if [ "${DATASET_NAME}" = "aokvqa" ]; then
 else
     EVAL_SPLIT="${EVAL_SPLIT:-test}"
 fi
-# EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-400}"
-EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-1000}"
-EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
+EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
+EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-512}"
+ENABLE_SECOND_PASS="${ENABLE_SECOND_PASS:-0}"
+SECOND_PASS_MAX_NEW_TOKENS="${SECOND_PASS_MAX_NEW_TOKENS:-1024}"
 EVAL_ANSWER_MODE="${EVAL_ANSWER_MODE:-generate_readable}"
+if [ "${STUDENT_MODEL_TYPE}" = "llava_next" ]; then
+    STAGE2_LLAVA_REMOVE_CONTEXT="${STAGE2_LLAVA_REMOVE_CONTEXT:-0}"
+else
+    STAGE2_LLAVA_REMOVE_CONTEXT="${STAGE2_LLAVA_REMOVE_CONTEXT:-0}"
+fi
 USE_4BIT="${USE_4BIT:-0}"
-USE_VQ="${USE_VQ:-0}"
+USE_VQ="${USE_VQ:-1}"
+if [ "${REMOVE_VQ_CODEBOOK}" = "1" ]; then
+    USE_VQ=0
+fi
 VQ_CODEBOOK_SIZE="${VQ_CODEBOOK_SIZE:-1024}"
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-0}"
 
 # Stable conservative batching
 SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
-EVAL_BUCKET_BATCH_SIZE="${EVAL_BUCKET_BATCH_SIZE:-1}"
+EVAL_BUCKET_BATCH_SIZE="${EVAL_BUCKET_BATCH_SIZE:-2}"
 PREPROCESS_SHUFFLE="${PREPROCESS_SHUFFLE:-1}"
 
 # Parallel
-# NUM_SHARDS="${NUM_SHARDS:-4}"
-# GPU_IDS="${GPU_IDS:-0 1 2 3}"
-
 NUM_SHARDS="${NUM_SHARDS:-8}"
 GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 
-# Paths
-PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
-STAGE2_CKPT_PATH="/home/songxinhao/workspace/vq_lord/vq_lord_ckpts/stu-qwen/a-okvqa/gemini-2.5-pro/stage2/stage2_vision_epoch1"
-# STAGE2_CKPT_PATH="${STAGE2_CKPT_PATH:-${CKPT_DIR}/stage2/stage2_vision_epoch1}"
-BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/${DATASET_TAG}_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
-SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_shards}"
-RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_vq${USE_VQ}_bucketed_parallel.json}"
+# NUM_SHARDS="${NUM_SHARDS:-4}"
+# GPU_IDS="${GPU_IDS:-0 1 2 3}"
 
-align_vq_print_header "Stage2 产物并行评测"
+# Paths
+PREPROCESS_ENTRY="${ROOT_DIR}/vq_lord3/data/preprocess/sciqa_preprocess.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/evaluation/sciqa_process2_parallel.py"
+PERIOD=15
+STAGE2_FINAL_ADAPTER_PATH="/home/songxinhao/workspace/vq_lord/vq_lord_ckpts/stu-qwen/scienceqa/gemini-2.5-pro/stage2/stage2_sub1_period${PERIOD}"
+STAGE2_FINAL_ADAPTER_PATH="${STAGE2_FINAL_ADAPTER_PATH:-${CKPT_DIR}/stage2/stage2_sub1_period${PERIOD}}"
+# STAGE2_FINAL_ADAPTER_PATH="/inspire/qb-ilm/project/robot-reasoning/xiangyushun-p-xiangyushun/luye/align_vq/align/vq_lord_ckpts_stage2_tune/run_20260323_140152/stage2_sub1_period7"
+BUCKET_PLAN_PATH="${BUCKET_PLAN_PATH:-${PREPROCESS_DIR}/${DATASET_TAG}_${EVAL_SPLIT}_n${EVAL_MAX_SAMPLES}_seed${SCIENCEQA_SEED}_patches_bs${EVAL_BUCKET_BATCH_SIZE}.json}"
+STAGE2_EVAL_SCHEMA_SUFFIX=""
+if [ "${STUDENT_MODEL_TYPE}" = "llava_next" ] && [ "${STAGE2_LLAVA_REMOVE_CONTEXT}" = "1" ]; then
+    STAGE2_EVAL_SCHEMA_SUFFIX="_noctx"
+fi
+SHARD_RESULT_DIR="${SHARD_RESULT_DIR:-${TEST_RESULT_DIR}/stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}${STAGE2_EVAL_SCHEMA_SUFFIX}_vq${USE_VQ}_bucketed_shards}"
+RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/${STUDENT_MODEL_TYPE}_${DATASET_TAG}_stage2_${EVAL_SPLIT}_${EVAL_ANSWER_MODE}_period${PERIOD}${STAGE2_EVAL_SCHEMA_SUFFIX}.json}"
+
+align_vq_print_header "Stage2 产物并行分桶评测"
 echo "ROOT_DIR: ${ROOT_DIR}"
 echo "MODEL_PATH: ${MODEL_PATH}"
-echo "DATASET_NAME: ${DATASET_NAME}"
 echo "DATASET_PATH: ${DATASET_PATH}"
 echo "PREPROCESS_ENTRY: ${PREPROCESS_ENTRY}"
 echo "EVAL_ENTRY: ${EVAL_ENTRY}"
-echo "STAGE2_CKPT_PATH: ${STAGE2_CKPT_PATH}"
+echo "STAGE2_FINAL_ADAPTER_PATH: ${STAGE2_FINAL_ADAPTER_PATH}"
 echo "BUCKET_PLAN_PATH: ${BUCKET_PLAN_PATH}"
 echo "NUM_SHARDS: ${NUM_SHARDS}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "EVAL_MAX_NEW_TOKENS: ${EVAL_MAX_NEW_TOKENS}"
+echo "ENABLE_SECOND_PASS: ${ENABLE_SECOND_PASS}"
+echo "SECOND_PASS_MAX_NEW_TOKENS: ${SECOND_PASS_MAX_NEW_TOKENS}"
 echo "EVAL_BUCKET_BATCH_SIZE: ${EVAL_BUCKET_BATCH_SIZE}"
+echo "STAGE2_LLAVA_REMOVE_CONTEXT: ${STAGE2_LLAVA_REMOVE_CONTEXT}"
 echo "SHARD_RESULT_DIR: ${SHARD_RESULT_DIR}"
 echo "RESULT_PATH: ${RESULT_PATH}"
 echo "LOG_FILE: ${LOG_FILE}"
 
 align_vq_require_file "${PREPROCESS_ENTRY}" "预处理分桶入口"
-align_vq_require_file "${EVAL_ENTRY}" "并行评测入口"
-align_vq_require_stage2_artifacts "${STAGE2_CKPT_PATH}"
+align_vq_require_file "${EVAL_ENTRY}" "并行分桶评测入口"
+align_vq_require_dir "${STAGE2_FINAL_ADAPTER_PATH}" "Stage2 最终 adapter 目录"
+align_vq_require_file "${STAGE2_FINAL_ADAPTER_PATH}/adapter_config.json" "Stage2 adapter_config.json"
+if [ "${REMOVE_VQ_CODEBOOK}" != "1" ]; then
+    align_vq_require_file "${STAGE2_FINAL_ADAPTER_PATH}/vq_codebook.pt" "Stage2 vq_codebook"
+fi
 align_vq_assert_dataset_path
 
 mkdir -p "${PREPROCESS_DIR}" "${SHARD_RESULT_DIR}" "$(dirname "${RESULT_PATH}")"
 
 if [ ! -f "${BUCKET_PLAN_PATH}" ]; then
-    echo "[Info] 未找到 eval split 分桶文件，开始生成: ${BUCKET_PLAN_PATH}"
+    echo "[Info] 未找到 test split 分桶文件，开始生成: ${BUCKET_PLAN_PATH}"
     "${PYTHON_BIN}" "${PREPROCESS_ENTRY}" \
         --dataset-name="${DATASET_NAME}" \
         --dataset-path="${DATASET_PATH}" \
@@ -96,6 +117,7 @@ fi
 
 PIDS=()
 SHARD_LOGS=()
+TOTAL_EVAL_SAMPLES="$("${PYTHON_BIN}" -c 'import json, sys; payload=json.load(open(sys.argv[1], "r", encoding="utf-8")); print(sum(len(batch.get("sample_ids", [])) for batch in payload.get("batch_plan", [])))' "${BUCKET_PLAN_PATH}")"
 
 for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
     gpu_id="${GPU_ID_ARR[$shard_id]}"
@@ -109,18 +131,21 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
         "${PYTHON_BIN}" "${EVAL_ENTRY}" \
             --model_path="${MODEL_PATH}" \
     --student_model_type="${STUDENT_MODEL_TYPE}" \
-            --adapter_path="${STAGE2_CKPT_PATH}" \
+            --adapter_path="${STAGE2_FINAL_ADAPTER_PATH}" \
             --dataset_name="${DATASET_NAME}" \
             --scienceqa_path="${DATASET_PATH}" \
             --split="${EVAL_SPLIT}" \
             --max_samples="${EVAL_MAX_SAMPLES}" \
             --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
+            --enable_second_pass="${ENABLE_SECOND_PASS}" \
+            --second_pass_max_new_tokens="${SECOND_PASS_MAX_NEW_TOKENS}" \
             --use_4bit="${USE_4BIT}" \
             --use_vq="${USE_VQ}" \
             --vq_codebook_size="${VQ_CODEBOOK_SIZE}" \
             --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
-            --vq_codebook_path="${STAGE2_CKPT_PATH}/vq_codebook.pt" \
+            --vq_codebook_path="${STAGE2_FINAL_ADAPTER_PATH}/vq_codebook.pt" \
             --answer_mode="${EVAL_ANSWER_MODE}" \
+            --stage2_llava_remove_context="${STAGE2_LLAVA_REMOVE_CONTEXT}" \
             --bucket_plan_path="${BUCKET_PLAN_PATH}" \
             --num_shards="${NUM_SHARDS}" \
             --shard_id="${shard_id}" \
@@ -129,15 +154,69 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
     PIDS+=("$!")
 done
 
+render_progress_bar() {
+    local done_samples="$1"
+    local total_samples="$2"
+    local running_shards="$3"
+    local width=40
+    local filled=0
+    local percent=0
+    if [ "${total_samples}" -gt 0 ]; then
+        filled=$((done_samples * width / total_samples))
+        percent=$((done_samples * 100 / total_samples))
+    fi
+    local bar=""
+    for ((i=0; i<width; i++)); do
+        if [ "${i}" -lt "${filled}" ]; then
+            bar="${bar}#"
+        else
+            bar="${bar}-"
+        fi
+    done
+    printf '\r[Eval Progress] [%s] %3d%% %s/%s samples, running_shards=%s/%s' \
+        "${bar}" "${percent}" "${done_samples}" "${total_samples}" "${running_shards}" "${NUM_SHARDS}"
+}
+
 FAILED=0
-for idx in "${!PIDS[@]}"; do
-    pid="${PIDS[$idx]}"
-    shard_id="${idx}"
-    if wait "${pid}"; then
-        echo "[Done] shard=${shard_id} log=${SHARD_LOGS[$idx]}"
+FINISHED=()
+for (( idx=0; idx<NUM_SHARDS; idx++ )); do
+    FINISHED[$idx]=0
+done
+
+all_finished=0
+while [ "${all_finished}" -eq 0 ]; do
+    running_shards=0
+    for idx in "${!PIDS[@]}"; do
+        if [ "${FINISHED[$idx]}" -eq 1 ]; then
+            continue
+        fi
+        pid="${PIDS[$idx]}"
+        if kill -0 "${pid}" 2>/dev/null; then
+            running_shards=$((running_shards + 1))
+        else
+            if wait "${pid}"; then
+                printf '\n[Done] shard=%s log=%s\n' "${idx}" "${SHARD_LOGS[$idx]}"
+            else
+                printf '\n[Error] shard=%s failed, log=%s\n' "${idx}" "${SHARD_LOGS[$idx]}"
+                FAILED=1
+            fi
+            FINISHED[$idx]=1
+        fi
+    done
+
+    done_samples="$({ grep -h -E '^\[Shard [0-9]+\] progress_done ' "${SHARD_LOGS[@]}" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    render_progress_bar "${done_samples}" "${TOTAL_EVAL_SAMPLES}" "${running_shards}"
+
+    all_finished=1
+    for idx in "${!PIDS[@]}"; do
+        if [ "${FINISHED[$idx]}" -eq 0 ]; then
+            all_finished=0
+        fi
+    done
+    if [ "${all_finished}" -eq 1 ]; then
+        printf '\n'
     else
-        echo "[Error] shard=${shard_id} failed, log=${SHARD_LOGS[$idx]}"
-        FAILED=1
+        sleep 5
     fi
 done
 
@@ -149,28 +228,31 @@ fi
 "${PYTHON_BIN}" "${EVAL_ENTRY}" \
     --model_path="${MODEL_PATH}" \
     --student_model_type="${STUDENT_MODEL_TYPE}" \
-    --adapter_path="${STAGE2_CKPT_PATH}" \
+    --adapter_path="${STAGE2_FINAL_ADAPTER_PATH}" \
     --dataset_name="${DATASET_NAME}" \
     --scienceqa_path="${DATASET_PATH}" \
     --split="${EVAL_SPLIT}" \
     --max_samples="${EVAL_MAX_SAMPLES}" \
     --max_new_tokens="${EVAL_MAX_NEW_TOKENS}" \
+    --enable_second_pass="${ENABLE_SECOND_PASS}" \
+    --second_pass_max_new_tokens="${SECOND_PASS_MAX_NEW_TOKENS}" \
     --use_4bit="${USE_4BIT}" \
     --use_vq="${USE_VQ}" \
     --vq_codebook_size="${VQ_CODEBOOK_SIZE}" \
     --freeze_vision_tower="${FREEZE_VISION_TOWER}" \
-    --vq_codebook_path="${STAGE2_CKPT_PATH}/vq_codebook.pt" \
+    --vq_codebook_path="${STAGE2_FINAL_ADAPTER_PATH}/vq_codebook.pt" \
     --answer_mode="${EVAL_ANSWER_MODE}" \
+    --stage2_llava_remove_context="${STAGE2_LLAVA_REMOVE_CONTEXT}" \
     --bucket_plan_path="${BUCKET_PLAN_PATH}" \
     --num_shards="${NUM_SHARDS}" \
     --shard_result_dir="${SHARD_RESULT_DIR}" \
     --merge_only=1 \
     --save_path="${RESULT_PATH}"
 
-align_vq_require_file "${RESULT_PATH}" "Stage2 并行 test 结果"
+align_vq_require_file "${RESULT_PATH}" "Stage2 并行分桶 test 结果"
 eval "$(align_vq_extract_eval_metrics "${RESULT_PATH}")"
 
-align_vq_print_header "Stage2 产物并行评测完成"
+align_vq_print_header "Stage2 产物并行分桶评测完成"
 echo "ACCURACY=${ACCURACY}"
 echo "FORMAT_RATE=${FORMAT_RATE}"
 echo "N=${N}"

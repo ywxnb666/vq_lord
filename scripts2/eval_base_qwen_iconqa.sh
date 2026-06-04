@@ -18,8 +18,8 @@ align_vq_setup_env
 align_vq_ensure_runtime_dirs
 align_vq_setup_logging "eval_base_qwen_iconqa"
 
-PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
+PREPROCESS_ENTRY="${ROOT_DIR}/vq_lord3/data/preprocess/sciqa_preprocess.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/evaluation/sciqa_process2_parallel.py"
 
 DATASET_NAME="iconqa"
 DATASET_PATH="${DATASET_PATH_DEFAULT_ICONQA}"
@@ -175,7 +175,7 @@ for (( shard_id=0; shard_id<NUM_SHARDS; shard_id++ )); do
             --freeze_vision_tower="0" \
             --vq_codebook_path="" \
             --answer_mode="${EVAL_ANSWER_MODE}" \
-            --stage3_llava_remove_context="0" \
+            --stage2_llava_remove_context="0" \
             --bucket_plan_path="${BUCKET_PLAN_PATH}" \
             --num_shards="${NUM_SHARDS}" \
             --shard_id="${shard_id}" \
@@ -241,7 +241,7 @@ fi
     --freeze_vision_tower="0" \
     --vq_codebook_path="" \
     --answer_mode="${EVAL_ANSWER_MODE}" \
-    --stage3_llava_remove_context="0" \
+    --stage2_llava_remove_context="0" \
     --bucket_plan_path="${BUCKET_PLAN_PATH}" \
     --num_shards="${NUM_SHARDS}" \
     --shard_result_dir="${SHARD_RESULT_DIR}" \

@@ -18,8 +18,8 @@ align_vq_setup_env
 align_vq_ensure_runtime_dirs
 align_vq_setup_logging "eval_base_students_all"
 
-PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_parallel.py"
+PREPROCESS_ENTRY="${ROOT_DIR}/vq_lord3/data/preprocess/sciqa_preprocess.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/evaluation/sciqa_process2_parallel.py"
 
 SCIENCEQA_SEED="${SCIENCEQA_SEED:-20240306}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
@@ -139,13 +139,13 @@ run_one() {
     local split
     local dataset_path
     local model_path
-    local stage3_llava_remove_context="0"
+    local stage2_llava_remove_context="0"
 
     split="$(split_for "${dataset}")"
     dataset_path="$(dataset_path_for "${dataset}")"
     model_path="$(model_path_for "${student}")"
     if [ "${student}" = "llava_next" ]; then
-        stage3_llava_remove_context="${STAGE3_LLAVA_REMOVE_CONTEXT:-1}"
+        stage2_llava_remove_context="${STAGE2_LLAVA_REMOVE_CONTEXT:-1}"
     fi
 
     local run_name="${student}_${dataset}_${split}_n${EVAL_MAX_SAMPLES}"
@@ -225,7 +225,7 @@ run_one() {
                 --freeze_vision_tower="0" \
                 --vq_codebook_path="" \
                 --answer_mode="${EVAL_ANSWER_MODE}" \
-                --stage3_llava_remove_context="${stage3_llava_remove_context}" \
+                --stage2_llava_remove_context="${stage2_llava_remove_context}" \
                 --bucket_plan_path="${bucket_plan_path}" \
                 --num_shards="${NUM_SHARDS}" \
                 --shard_id="${shard_id}" \
@@ -294,7 +294,7 @@ run_one() {
         --freeze_vision_tower="0" \
         --vq_codebook_path="" \
         --answer_mode="${EVAL_ANSWER_MODE}" \
-        --stage3_llava_remove_context="${stage3_llava_remove_context}" \
+        --stage2_llava_remove_context="${stage2_llava_remove_context}" \
         --bucket_plan_path="${bucket_plan_path}" \
         --num_shards="${NUM_SHARDS}" \
         --shard_result_dir="${shard_result_dir}" \

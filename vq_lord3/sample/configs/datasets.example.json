@@ -1,0 +1,32 @@
+{
+  "datasets": [
+    {
+      "name": "scienceqa",
+      "source_type": "hf_or_parquet",
+      "path": "derek-thomas/ScienceQA",
+      "split": "train",
+      "count": 500
+    },
+    {
+      "name": "textvqa",
+      "source_type": "hf_or_parquet",
+      "path": "lmms-lab/textvqa",
+      "split": "train",
+      "count": 150
+    },
+    {
+      "name": "aokvqa",
+      "source_type": "hf_or_parquet",
+      "path": "HuggingFaceM4/A-OKVQA",
+      "split": "train",
+      "count": 150
+    },
+    {
+      "name": "iconqa",
+      "source_type": "local_parquet",
+      "path": "/root/autodl-tmp/datasets/IconQA/data",
+      "split": "val",
+      "count": 100
+    }
+  ]
+}

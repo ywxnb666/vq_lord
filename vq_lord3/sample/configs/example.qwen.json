@@ -1,0 +1,36 @@
+{
+  "provider": {
+    "type": "openai_compatible",
+    "model": "${QWEN_MODEL:-qwen3.5-flash-2026-02-23}",
+    "base_url": "${QWEN_API_BASE}",
+    "api_key": "${QWEN_API_KEY}",
+    "enable_thinking": "${QWEN_ENABLE_THINKING:-false}",
+    "http_timeout": 120,
+    "max_retries": 2
+  },
+  "sampling": {
+    "teacher_lang": "en",
+    "max_workers": 16,
+    "per_sample_attempts": 1,
+    "save_every": 100,
+    "seed": 20240306
+  },
+  "datasets": [
+    {
+      "name": "textvqa",
+      "source_type": "hf_or_parquet",
+      "path": "lmms-lab/textvqa",
+      "split": "train",
+      "count": 150,
+      "output_path": "outputs/textvqa_teacher_qwen_train_n150.json"
+    },
+    {
+      "name": "aokvqa",
+      "source_type": "hf_or_parquet",
+      "path": "HuggingFaceM4/A-OKVQA",
+      "split": "train",
+      "count": 150,
+      "output_path": "outputs/aokvqa_teacher_qwen_train_n150.json"
+    }
+  ]
+}

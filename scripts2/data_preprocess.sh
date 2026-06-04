@@ -12,7 +12,7 @@ align_vq_ensure_runtime_dirs
 align_vq_setup_logging "data_preprocess"
 
 # Paths
-PREPROCESS_ENTRY="${ROOT_DIR}/data_preprocess/sciqa_preprocess.py"
+PREPROCESS_ENTRY="${ROOT_DIR}/vq_lord3/data/preprocess/sciqa_preprocess.py"
 
 # Data
 TRAIN_NUM="${TRAIN_NUM:-0}"

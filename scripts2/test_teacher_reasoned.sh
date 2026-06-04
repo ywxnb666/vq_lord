@@ -12,7 +12,7 @@ align_vq_ensure_runtime_dirs
 align_vq_setup_logging "test_teacher_reasoned"
 
 # Paths
-EVAL_ENTRY="${ROOT_DIR}/vq_lord3/sciqa_process2_teacher_reasoned.py"
+EVAL_ENTRY="${ROOT_DIR}/vq_lord3/evaluation/sciqa_process2_teacher_reasoned.py"
 RESULT_PATH="${RESULT_PATH:-${TEST_RESULT_DIR}/teacher_test_reasoned.json}"
 
 # Teacher
