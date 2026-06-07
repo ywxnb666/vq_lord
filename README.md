@@ -1,6 +1,6 @@
 # MICAD
 
-MICAD is a multimodal training and evaluation workspace centered on the `VQ-LoRD` pipeline. The repository combines:
+MICAD is a multimodal training and evaluation workspace centered on the `stage1-stage2` pipeline. The repository combines:
 
 - a three-stage visual-token / distillation / alignment training flow for vision-language models,
 - teacher-data collection and preprocessing utilities,
