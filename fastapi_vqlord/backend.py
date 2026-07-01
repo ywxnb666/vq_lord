@@ -1,354 +1,572 @@
-import os
+import csv
 import glob
-import subprocess
+import json
+import os
 import threading
 import time
-from typing import Dict, Any, Optional
-from fastapi import FastAPI, Body
-from pydantic import BaseModel
-import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-app = FastAPI(title="VQ-LoRD Control Backend")
+from fastapi import Body, FastAPI, Query
 
-class TaskState:
-    def __init__(self):
+
+app = FastAPI(title="VQ-LoRD Risk Evaluation Console")
+
+
+ROOT_DEFAULT = "/home/ywx/Desktop/vq_lord_parallel/vq_lord"
+REASON_JUDGE_DEFAULT = "/home/ywx/Desktop/vq_lord_parallel/reason_judge"
+VLA_MARK_DEFAULT = "/home/ywx/Desktop/vq_lord_parallel/VLA-mark"
+
+
+PIPELINE_STEPS: Dict[str, Dict[str, Any]] = {
+    "full_pipeline": {
+        "label": "Full sequential risk-evaluation pipeline",
+        "script": "teacher_collect -> teacher_eval -> stage1_train -> stage2_train -> student_eval -> reason_judge -> risk_report",
+        "seconds": 126,
+        "outputs": ["sequential simulated pipeline"],
+    },
+    "teacher_collect": {
+        "label": "Teacher API data collection",
+        "script": "scripts2/teacher_model_data_collect.sh",
+        "seconds": 18,
+        "outputs": ["vq_lord_data/*teacher*.json"],
+    },
+    "teacher_eval": {
+        "label": "Teacher full risk baseline",
+        "script": "scripts2/run_full_eval_pipeline_teacher.sh",
+        "seconds": 22,
+        "outputs": [
+            "vq_lord_test_results/**/mm_eval_suite_report_teacher_full.json",
+            "vq_lord_test_results/**/scienceqa_control_suite_teacher_full.json",
+        ],
+    },
+    "stage1_train": {
+        "label": "Stage1 student distillation",
+        "script": "scripts2/run_stage1.sh",
+        "seconds": 26,
+        "outputs": ["vq_lord_ckpts/stage1/**"],
+    },
+    "stage2_train": {
+        "label": "Stage2 student distillation",
+        "script": "scripts2/run_stage2.sh",
+        "seconds": 30,
+        "outputs": ["vq_lord_ckpts/stage2/**"],
+    },
+    "student_eval": {
+        "label": "Student full risk evaluation",
+        "script": "scripts2/run_full_eval_pipeline_fast.sh",
+        "seconds": 24,
+        "outputs": [
+            "vq_lord_test_results/mm_eval_suite_report_full_fast.json",
+            "vq_lord_test_results/scienceqa_control_suite_full_fast.json",
+        ],
+    },
+    "reason_judge": {
+        "label": "Reasoning judge",
+        "script": "../reason_judge/run_judge.sh",
+        "seconds": 20,
+        "outputs": ["../reason_judge/outputs/*/summary.tsv"],
+    },
+    "risk_report": {
+        "label": "Risk report aggregation",
+        "script": "dashboard aggregation",
+        "seconds": 12,
+        "outputs": ["dashboard synthetic summary"],
+    },
+    "watermark_detect_vqlord": {
+        "label": "VLA-Mark detection on VQ-LoRD outputs",
+        "script": "../VLA-mark/detect_vq_lord_result_watermark.py",
+        "seconds": 18,
+        "outputs": ["../VLA-mark/outputs/**/watermark_detect_*.json"],
+    },
+    "watermark_detect_cache": {
+        "label": "VLA-Mark detection on teacher cache",
+        "script": "../VLA-mark/detect_cache_watermark.py",
+        "seconds": 14,
+        "outputs": ["../VLA-mark/outputs/**/watermark_detect_*.json"],
+    },
+}
+
+PIPELINE_SEQUENCE = [
+    "teacher_collect",
+    "teacher_eval",
+    "stage1_train",
+    "stage2_train",
+    "student_eval",
+    "reason_judge",
+    "risk_report",
+]
+
+
+@dataclass
+class SimTask:
+    task_id: str
+    step: str
+    label: str
+    script: str
+    payload: Dict[str, Any]
+    started_at: float
+    duration_sec: float
+    status: str = "running"
+    progress: float = 0.0
+    log: List[str] = field(default_factory=list)
+    ended_at: Optional[float] = None
+
+
+class TaskStore:
+    def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.tasks: Dict[str, Dict[str, Any]] = {}
+        self.tasks: Dict[str, SimTask] = {}
 
-    def start(self, task_name: str, pid: int):
-        with self.lock:
-            self.tasks[task_name] = {
-                "status": "running",
-                "pid": pid,
-                "start_time": time.time(),
-                "end_time": None,
-                "return_code": None,
-            }
-
-    def finish(self, task_name: str, return_code: int):
-        with self.lock:
-            if task_name in self.tasks:
-                self.tasks[task_name]["status"] = "success" if return_code == 0 else "failed"
-                self.tasks[task_name]["end_time"] = time.time()
-                self.tasks[task_name]["return_code"] = return_code
-
-    def get_all(self) -> Dict[str, Dict[str, Any]]:
-        with self.lock:
-            return dict(self.tasks)
-
-task_state = TaskState()
-
-# ---------------------------------------------------------
-# 核心执行引擎
-# ---------------------------------------------------------
-DEFAULT_LOG_SUBDIR = "logs"
-
-def run_bash_script(script_filename: str, env_payload: dict):
-    """
-    接收前端发来的参数字典，转化为环境变量后执行目标 Shell 脚本。同时将 stdout/stderr 捕获到本地日志文件。
-    """
-    task_name = script_filename.replace(".sh", "")
-    root_dir = env_payload.get("ROOT_DIR", "/root/workspace/vq_lord")
-    script_path = os.path.join(root_dir, "scripts2", script_filename)
-
-    if not os.path.exists(script_path):
-        print(f"[Error] 脚本未找到: {script_path}")
-        return
-
-    log_dir = os.path.join(root_dir, DEFAULT_LOG_SUBDIR, "apis")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"{task_name}_{int(time.time())}.log")
-
-    # 1. 继承当前系统环境，防止破坏底层 PATH
-    cmd_env = os.environ.copy()
-    
-    # 2. 将前端传来的 payload 注入并强制转为字符串
-    for key, value in env_payload.items():
-        if isinstance(value, bool):
-            cmd_env[key] = "1" if value else "0"
+    def start(self, step: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        spec = PIPELINE_STEPS[step]
+        now = time.time()
+        task_id = f"{step}_{int(now)}"
+        if step == "full_pipeline":
+            per_step_duration = float(payload.get("SIM_DURATION_SEC") or 8)
+            duration = per_step_duration * len(PIPELINE_SEQUENCE)
         else:
-            cmd_env[key] = str(value)
+            duration = float(payload.get("SIM_DURATION_SEC") or spec["seconds"])
+        task = SimTask(
+            task_id=task_id,
+            step=step,
+            label=spec["label"],
+            script=spec["script"],
+            payload=payload,
+            started_at=now,
+            duration_sec=max(3.0, duration),
+            log=[
+                f"[simulate] queued {spec['label']}",
+                f"[simulate] script: {spec['script']}",
+                "[simulate] no training/evaluation process is launched on this laptop backend",
+            ],
+        )
+        with self.lock:
+            self.tasks[task_id] = task
+        return serialize_task(task)
 
-    # 3. 启动子进程 (无需挂起等待，直接跑在后台)
-    # 标准输出已由脚本中的 common.sh 处理重定向到 .log 文件，故此处可忽略
-    try:
-        with open(log_file, "w", encoding="utf-8") as flog:
-            flog.write(f"=== Task: {script_filename} ===\n")
-            flog.write(f"=== Log:  {log_file} ===\n")
-            flog.write(f"=== Time: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
-            flog.flush()
+    def update_all(self) -> None:
+        now = time.time()
+        with self.lock:
+            for task in self.tasks.values():
+                if task.status != "running":
+                    continue
+                elapsed = now - task.started_at
+                pct = min(1.0, elapsed / task.duration_sec)
+                task.progress = pct
+                task.log = self._build_log(task, pct)
+                if pct >= 1.0:
+                    task.status = "success"
+                    task.ended_at = now
+                    task.log.append("[simulate] completed successfully")
 
-            process = subprocess.Popen(
-                ["bash", script_path],
-                env=cmd_env,
-                stdout=flog,
-                stderr=subprocess.STDOUT,  # 合并 stderr 到同一个文件
-            )
-            task_state.start(task_name, process.pid)
-            print(f"[Info] 已启动 {script_filename}, PID={process.pid}, LOG={log_file}")
+    @staticmethod
+    def _build_log(task: SimTask, pct: float) -> List[str]:
+        if task.step == "full_pipeline":
+            sub_tasks = build_sub_tasks(task)
+            lines = [
+                f"[simulate] task={task.task_id}",
+                "[simulate] mode=sequential full pipeline",
+                f"[simulate] progress={int(pct * 100)}%",
+            ]
+            for item in sub_tasks:
+                lines.append(
+                    f"[simulate] {item['status']:>7} {item['step']} "
+                    f"{int(item['progress'] * 100)}% :: {item['script']}"
+                )
+            return lines
 
-            # 阻塞等待完成（此函数本身跑在后台线程中，不会卡住 FastAPI）
-            return_code = process.wait()
-            task_state.finish(task_name, return_code)
+        milestones = [
+            (0.05, "validated paths and environment payload"),
+            (0.18, "resolved teacher/model/checkpoint inputs"),
+            (0.35, "prepared dataset and cached artifacts"),
+            (0.52, "running scoring/training placeholder loop"),
+            (0.72, "materializing expected report locations"),
+            (0.90, "aggregating dashboard metrics"),
+        ]
+        lines = [
+            f"[simulate] task={task.task_id}",
+            f"[simulate] step={task.step}",
+            f"[simulate] script={task.script}",
+        ]
+        for threshold, message in milestones:
+            if pct >= threshold:
+                lines.append(f"[simulate] {message}")
+        lines.append(f"[simulate] progress={int(pct * 100)}%")
+        return lines
 
-            flog.write(f"\n=== Process exited with code {return_code} ===\n")
-            print(f"[Info] {script_filename} 完成, 返回码={return_code}")
+    def all(self) -> List[Dict[str, Any]]:
+        self.update_all()
+        with self.lock:
+            return [serialize_task(task) for task in sorted(self.tasks.values(), key=lambda t: t.started_at, reverse=True)]
 
-    except Exception as e:
-        task_state.finish(task_name, -1)
-        print(f"[Error] 执行抛出异常: {e}")
+    def latest_log(self) -> Dict[str, Any]:
+        self.update_all()
+        with self.lock:
+            if not self.tasks:
+                return {"log_text": "No simulated tasks yet.", "log_file": "simulation.log"}
+            task = max(self.tasks.values(), key=lambda t: t.started_at)
+            return {"log_file": f"{task.task_id}.log", "log_text": "\n".join(task.log)}
 
 
-# ---------------------------------------------------------
-# 路由接口
-# ---------------------------------------------------------
-@app.get("/")
-def health_check():
-    return {"status": "ok", "message": "VQ-LoRD Backend is running"}
-
-# ---- 任务状态查询 ----
-@app.get("/api/tasks")
-def get_task_status():
-    return task_state.get_all()
-
-# ---- Tab 1: 教师数据采集 ----
-@app.post("/api/task/collect")
-def task_collect(payload: Dict[str, Any] = Body(...)):
-    # 使用线程而非 BackgroundTasks，以便追踪 wait() 返回码
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("teacher_model_data_collect.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Teacher data collection task spawned."}
-
-# ---- Tab 1: 分桶预处理 ----
-@app.post("/api/task/preprocess")
-def task_preprocess(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("data_preprocess.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Data preprocessing task spawned."}
-
-# ---- Tab 2: Stage0 VQ 码本训练 ----
-@app.post("/api/task/stage0")
-def task_stage0(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("run_stage0.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Stage0 VQ codebook training task spawned."}
-
-# ---- Tab 3: Stage1 视觉蒸馏 ----
-@app.post("/api/task/stage1")
-def task_stage1(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("run_stage1.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Stage1 vision distillation task spawned."}
-
-# ---- Tab 4: Stage2 LoRD 偏好对齐 ----
-@app.post("/api/task/stage2")
-def task_stage2(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("run_stage2.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Stage2 LoRD preference alignment task spawned."}
-
-# ---- 路径探测：列出 ckpt 目录下匹配前缀的子目录 ----
-@app.get("/api/list_ckpt_dirs")
-def list_ckpt_dirs(root_dir: str = "/root/workspace/vq_lord",
-                   prefix: str = "stage0_vq"):
-    """列出 vq_lord_ckpts/ 下匹配指定前缀的目录，用于前端路径选择。"""
-    ckpt_base = os.path.join(root_dir, "vq_lord_ckpts")
-    if not os.path.isdir(ckpt_base):
-        return {"dirs": [], "message": f"目录不存在: {ckpt_base}"}
-
-    matched = []
-    for name in sorted(os.listdir(ckpt_base)):
-        full = os.path.join(ckpt_base, name)
-        if os.path.isdir(full) and name.startswith(prefix):
-            # 附带关键文件检查
-            has_codebook = os.path.isfile(os.path.join(full, "vq_codebook.pt"))
-            has_adapter = os.path.isfile(os.path.join(full, "adapter_config.json"))
-            has_projector = os.path.isfile(os.path.join(full, "projector.pt"))
-            matched.append({
-                "name": name,
-                "path": full,
-                "has_codebook": has_codebook,
-                "has_adapter": has_adapter,
-                "has_projector": has_projector,
-            })
-    return {"dirs": matched}
-
-# ---- Tab 5: Stage1 评测 ----
-@app.post("/api/task/eval_stage1")
-def task_eval_stage1(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("test_vq_lord_stage1_parallel.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Stage1 evaluation task spawned."}
-
-# ---- Tab 5: Stage2 评测 ----
-@app.post("/api/task/eval_stage2")
-def task_eval_stage2(payload: Dict[str, Any] = Body(...)):
-    t = threading.Thread(
-        target=run_bash_script,
-        args=("test_vq_lord_stage2.sh", payload),
-        daemon=True,
-    )
-    t.start()
-    return {"status": "ok", "message": "Stage2 evaluation task spawned."}
-
-# ---------------------------------------------------------
-# 评测结果读取接口
-# ---------------------------------------------------------
-@app.get("/api/eval_result")
-def get_eval_result(root_dir: str = "/root/workspace/vq_lord",
-                    prefix: str = "stage2"):
-    """
-    在 test_results/ 目录下查找匹配前缀的最新 JSON 结果文件，
-    解析并返回 accuracy / format_rate / n 三个指标。
-    
-    结果 JSON 结构预期（由 sciqa_process2.py 生成）:
-    {
-        "accuracy": 0.85,
-        "format_rate": 0.99,
-        "n": 2017,
-        ...
+def serialize_task(task: SimTask) -> Dict[str, Any]:
+    payload = {
+        "task_id": task.task_id,
+        "step": task.step,
+        "label": task.label,
+        "script": task.script,
+        "status": task.status,
+        "progress": round(task.progress, 4),
+        "started_at": task.started_at,
+        "ended_at": task.ended_at,
+        "duration_sec": task.duration_sec,
+        "payload": task.payload,
+        "log": task.log,
     }
-    """
-    result_dir = os.path.join(root_dir, "test_results")
-    if not os.path.isdir(result_dir):
-        return {"found": False, "message": f"结果目录不存在: {result_dir}"}
+    if task.step == "full_pipeline":
+        payload["sub_tasks"] = build_sub_tasks(task)
+    return payload
 
-    # 查找匹配前缀的 JSON 文件
-    candidates = []
-    for name in os.listdir(result_dir):
-        if name.startswith(prefix) and name.endswith(".json"):
-            full_path = os.path.join(result_dir, name)
-            if os.path.isfile(full_path):
-                candidates.append(full_path)
 
-    if not candidates:
-        return {"found": False, "message": f"未找到 {prefix}*.json 结果文件"}
+def build_sub_tasks(task: SimTask) -> List[Dict[str, Any]]:
+    elapsed = max(0.0, (task.ended_at or time.time()) - task.started_at)
+    per_step = max(0.001, task.duration_sec / len(PIPELINE_SEQUENCE))
+    rows: List[Dict[str, Any]] = []
+    for idx, step_key in enumerate(PIPELINE_SEQUENCE):
+        spec = PIPELINE_STEPS[step_key]
+        local_elapsed = elapsed - (idx * per_step)
+        if local_elapsed <= 0:
+            status = "pending"
+            progress = 0.0
+        elif local_elapsed >= per_step:
+            status = "success"
+            progress = 1.0
+        else:
+            status = "running"
+            progress = local_elapsed / per_step
+        rows.append(
+            {
+                "step": step_key,
+                "label": spec["label"],
+                "script": spec["script"],
+                "status": status,
+                "progress": round(progress, 4),
+            }
+        )
+    return rows
 
-    # 取最新的
-    latest = max(candidates, key=os.path.getmtime)
 
+task_store = TaskStore()
+
+
+def read_json(path: str) -> Optional[Dict[str, Any]]:
     try:
-        with open(latest, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
-        # 兼容多种可能的 key 名称
-        accuracy = (
-            data.get("accuracy")
-            or data.get("acc")
-            or data.get("ACCURACY")
-            or 0.0
-        )
-        format_rate = (
-            data.get("format_rate")
-            or data.get("FORMAT_RATE")
-            or data.get("format_ratio")
-            or 0.0
-        )
-        n = (
-            data.get("n")
-            or data.get("N")
-            or data.get("total")
-            or data.get("num_samples")
-            or 0
+
+def latest_file(patterns: List[str], root_dir: str) -> Optional[str]:
+    matches: List[str] = []
+    for pattern in patterns:
+        full_pattern = pattern if os.path.isabs(pattern) else os.path.join(root_dir, pattern)
+        matches.extend(glob.glob(full_pattern, recursive=True))
+    files = [path for path in matches if os.path.isfile(path)]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def metric_number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def parse_eval_report(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {"found": False}
+    payload = read_json(path)
+    if not payload:
+        return {"found": False, "path": path}
+
+    benchmark = payload.get("benchmark_summary", {})
+    control = payload.get("control_summary", {})
+    control_summary = control.get("control_summary", {}) if isinstance(control, dict) else {}
+    baseline = control.get("baseline_accuracy") if isinstance(control, dict) else None
+
+    controls = []
+    for name, row in control_summary.items():
+        controls.append(
+            {
+                "control": name,
+                "accuracy": metric_number(row.get("accuracy")),
+                "delta_vs_baseline": row.get("delta_vs_baseline"),
+            }
         )
 
+    return {
+        "found": True,
+        "path": path,
+        "file": os.path.basename(path),
+        "overall_accuracy": metric_number(benchmark.get("overall_accuracy")),
+        "overall_correct": int(metric_number(benchmark.get("overall_correct"), 0)),
+        "overall_total": int(metric_number(benchmark.get("overall_total"), 0)),
+        "baseline_accuracy": metric_number(baseline),
+        "controls": controls,
+        "raw": payload,
+    }
+
+
+def parse_legacy_result(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {"found": False}
+    payload = read_json(path)
+    if not payload:
+        return {"found": False, "path": path}
+    metrics = payload.get("metrics", payload)
+    return {
+        "found": True,
+        "path": path,
+        "file": os.path.basename(path),
+        "accuracy": metric_number(metrics.get("accuracy", metrics.get("acc"))),
+        "total": int(metric_number(metrics.get("total", metrics.get("n", 0)), 0)),
+        "correct": int(metric_number(metrics.get("correct", 0), 0)),
+        "format_rate": metric_number(metrics.get("format_rate", metrics.get("format_valid_rate"))),
+    }
+
+
+def parse_reason_summary(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {"found": False}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        if not rows:
+            return {"found": False, "path": path}
+        row = rows[0]
         return {
             "found": True,
-            "result_file": os.path.basename(latest),
-            "result_path": latest,
-            "accuracy": float(accuracy),
-            "format_rate": float(format_rate),
-            "n": int(n),
-            "raw": data,  # 原始 JSON 完整返回，前端可选展示
+            "path": path,
+            "file": os.path.basename(path),
+            "n": int(metric_number(row.get("n"), 0)),
+            "stage1_reason_score": metric_number(row.get("stage2_reason_score")),
+            "stage2_reason_score": metric_number(row.get("stage3_reason_score")),
+            "delta_reason_score": metric_number(row.get("delta_reason_score")),
+            "stage1_win_rate": metric_number(row.get("stage2_win_rate")),
+            "stage2_win_rate": metric_number(row.get("stage3_win_rate")),
+            "tie_rate": metric_number(row.get("tie_rate")),
+            "dimensions": row,
         }
-    except Exception as e:
-        return {"found": False, "message": f"解析结果文件失败: {str(e)}"}
+    except Exception as exc:
+        return {"found": False, "path": path, "message": str(exc)}
 
 
-# ---- 列出所有评测结果文件（可选：支持历史对比） ----
-@app.get("/api/eval_results_list")
-def list_eval_results(root_dir: str = "/root/workspace/vq_lord"):
-    """列出 test_results/ 目录下所有 JSON 结果文件的摘要信息。"""
-    result_dir = os.path.join(root_dir, "test_results")
-    if not os.path.isdir(result_dir):
-        return {"results": [], "message": f"目录不存在: {result_dir}"}
+def parse_watermark_result(path: Optional[str], max_records: int = 200) -> Dict[str, Any]:
+    if not path:
+        return {"found": False}
+    payload = read_json(path)
+    if not payload:
+        return {"found": False, "path": path, "message": "cannot read JSON object"}
 
-    results = []
-    for name in sorted(os.listdir(result_dir)):
-        if name.endswith(".json"):
-            full_path = os.path.join(result_dir, name)
-            if not os.path.isfile(full_path):
-                continue
-            try:
-                with open(full_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                results.append({
-                    "file": name,
-                    "accuracy": float(data.get("accuracy", data.get("acc", 0))),
-                    "format_rate": float(data.get("format_rate", data.get("format_ratio", 0))),
-                    "n": int(data.get("n", data.get("total", 0))),
-                    "mtime": os.path.getmtime(full_path),
-                })
-            except Exception:
-                results.append({"file": name, "error": "parse_failed"})
+    metrics = payload.get("metrics", {})
+    records = payload.get("records", [])
+    if not isinstance(metrics, dict):
+        metrics = {}
+    if not isinstance(records, list):
+        records = []
 
-    return {"results": results}
+    result: Dict[str, Any] = {
+        "found": True,
+        "path": path,
+        "file": os.path.basename(path),
+        "config": payload.get("config", {}),
+        "num_records": len(records),
+        "records": records[: max(0, int(max_records))],
+        "raw_metrics": metrics,
+    }
+
+    if "vla_mark" in metrics or "random_only" in metrics:
+        vla_mark = metrics.get("vla_mark", {}) if isinstance(metrics.get("vla_mark"), dict) else {}
+        random_only = metrics.get("random_only", {}) if isinstance(metrics.get("random_only"), dict) else {}
+        result.update(
+            {
+                "kind": "paired_generation_evaluation",
+                "summary": {
+                    "vla_roc_auc": metric_number(vla_mark.get("roc_auc")),
+                    "vla_f1": metric_number(vla_mark.get("f1")),
+                    "vla_accuracy": metric_number(vla_mark.get("accuracy")),
+                    "random_roc_auc": metric_number(random_only.get("roc_auc")),
+                    "random_f1": metric_number(random_only.get("f1")),
+                    "random_accuracy": metric_number(random_only.get("accuracy")),
+                },
+            }
+        )
+        return result
+
+    result.update(
+        {
+            "kind": "output_or_cache_detection",
+            "summary": {
+                "num_scored": int(metric_number(payload.get("num_scored", len(records)), 0)),
+                "mean_z": metric_number(metrics.get("mean_z")),
+                "median_z": metric_number(metrics.get("median_z")),
+                "min_z": metric_number(metrics.get("min_z")),
+                "max_z": metric_number(metrics.get("max_z")),
+                "threshold_4_rate": metric_number(metrics.get("threshold_4_rate")),
+            },
+        }
+    )
+    return result
 
 
-# ---------------------------------------------------------
-# 日志监控接口
-# ---------------------------------------------------------
+def list_checkpoint_dirs(root_dir: str, prefixes: List[str]) -> List[Dict[str, Any]]:
+    ckpt_base = os.path.join(root_dir, "vq_lord_ckpts")
+    if not os.path.isdir(ckpt_base):
+        return []
+    out = []
+    for name in sorted(os.listdir(ckpt_base)):
+        full = os.path.join(ckpt_base, name)
+        if not os.path.isdir(full):
+            continue
+        if not any(name.startswith(prefix) for prefix in prefixes):
+            continue
+        out.append(
+            {
+                "name": name,
+                "path": full,
+                "has_adapter": os.path.isfile(os.path.join(full, "adapter_config.json")),
+                "has_projector": os.path.isfile(os.path.join(full, "projector.pt")),
+                "has_codebook": os.path.isfile(os.path.join(full, "vq_codebook.pt")),
+                "mtime": os.path.getmtime(full),
+            }
+        )
+    return out
+
+
+@app.get("/")
+def health_check() -> Dict[str, str]:
+    return {"status": "ok", "message": "VQ-LoRD simulated backend is running"}
+
+
+@app.get("/api/pipeline/spec")
+def pipeline_spec() -> Dict[str, Any]:
+    return {"steps": PIPELINE_STEPS, "simulated": True}
+
+
+@app.post("/api/task/{step}")
+def start_pipeline_step(step: str, payload: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+    if step not in PIPELINE_STEPS:
+        return {"status": "error", "message": f"unknown pipeline step: {step}"}
+    task = task_store.start(step, payload)
+    return {"status": "ok", "task": task}
+
+
+@app.get("/api/tasks")
+def get_tasks() -> Dict[str, Any]:
+    return {"tasks": task_store.all()}
+
+
 @app.get("/api/logs/latest")
-def get_latest_log(root_dir: str = "/root/workspace/vq_lord",
-                   subdir: str = "logs/apis",
-                   tail: int = 80):
-    log_dir = os.path.join(root_dir, subdir)
-    if not os.path.exists(log_dir):
-        return {"log_text": f"日志目录不存在: {log_dir}"}
+def get_latest_log() -> Dict[str, Any]:
+    return task_store.latest_log()
 
-    log_files = glob.glob(os.path.join(log_dir, "*.log"))
-    if not log_files:
-        return {"log_text": "当前没有找到任何日志文件。"}
 
-    latest_file = max(log_files, key=os.path.getmtime)
+@app.get("/api/checkpoints")
+def checkpoints(
+    root_dir: str = ROOT_DEFAULT,
+    prefixes: List[str] = Query(default=["stage1", "stage2", "stage2_sub", "stage2_lord"]),
+) -> Dict[str, Any]:
+    return {"dirs": list_checkpoint_dirs(root_dir, prefixes)}
 
-    try:
-        with open(latest_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            tail_lines = lines[-tail:]
-        return {
-            "log_file": os.path.basename(latest_file),
-            "log_text": "".join(tail_lines),
-        }
-    except Exception as e:
-        return {"log_text": f"读取日志出错: {str(e)}"}
+
+@app.get("/api/results/summary")
+def results_summary(
+    root_dir: str = ROOT_DEFAULT,
+    reason_judge_dir: str = REASON_JUDGE_DEFAULT,
+) -> Dict[str, Any]:
+    teacher_report = latest_file(
+        [
+            "vq_lord_test_results/**/mm_eval_suite_report_teacher_full.json",
+            "vq_lord_test_results/mm_eval_suite_report_teacher_full.json",
+        ],
+        root_dir,
+    )
+    student_report = latest_file(
+        [
+            "vq_lord_test_results/mm_eval_suite_report_full_fast.json",
+            "vq_lord_test_results/**/mm_eval_suite_report_full_fast.json",
+        ],
+        root_dir,
+    )
+    stage1 = latest_file(["vq_lord_test_results/stage1*.json"], root_dir)
+    stage2 = latest_file(["vq_lord_test_results/stage2*.json"], root_dir)
+    reason = latest_file(["outputs/*/summary.tsv"], reason_judge_dir)
+
+    teacher = parse_eval_report(teacher_report)
+    student = parse_eval_report(student_report)
+    reason_summary = parse_reason_summary(reason)
+    stage1_result = parse_legacy_result(stage1)
+    stage2_result = parse_legacy_result(stage2)
+
+    teacher_acc = teacher.get("baseline_accuracy") or teacher.get("overall_accuracy") or 0.0
+    student_acc = stage2_result.get("accuracy") or student.get("baseline_accuracy") or student.get("overall_accuracy") or 0.0
+    acc_retention = (student_acc / teacher_acc) if teacher_acc else 0.0
+
+    visual_delta = 0.0
+    controls = student.get("controls") or teacher.get("controls") or []
+    visual_controls = [row for row in controls if row.get("control") in {"text_only_blank", "random_image_swap", "image_blur", "image_downsample"}]
+    if visual_controls:
+        visual_delta = sum(abs(metric_number(row.get("delta_vs_baseline"))) for row in visual_controls) / len(visual_controls)
+
+    reason_delta = reason_summary.get("delta_reason_score", 0.0) if reason_summary.get("found") else 0.0
+    theft_risk = min(100.0, max(0.0, 100.0 * (0.65 * acc_retention + 0.25 * max(0.0, 1.0 - visual_delta) + 0.10 * max(0.0, reason_delta + 1.0) / 2.0)))
+    defense_score = round(100.0 - theft_risk, 2)
+
+    return {
+        "teacher": teacher,
+        "student": student,
+        "stage1": stage1_result,
+        "stage2": stage2_result,
+        "reason": reason_summary,
+        "derived": {
+            "teacher_acc": round(teacher_acc, 6),
+            "student_acc": round(student_acc, 6),
+            "acc_retention": round(acc_retention, 6),
+            "visual_dependency_delta": round(visual_delta, 6),
+            "reason_delta": round(reason_delta, 6),
+            "theft_risk": round(theft_risk, 2),
+            "defense_score": defense_score,
+            "simulated_backend": True,
+        },
+    }
+
+
+@app.get("/api/watermark/result")
+def watermark_result(
+    path: str = "",
+    vla_mark_dir: str = VLA_MARK_DEFAULT,
+    max_records: int = 200,
+) -> Dict[str, Any]:
+    result_path = path.strip()
+    if not result_path:
+        result_path = latest_file(
+            [
+                "outputs/**/watermark_detect*.json",
+                "outputs/**/*vlamark*result*.json",
+                "*vlamark*result*.json",
+                "local_smoke_result.json",
+            ],
+            vla_mark_dir,
+        ) or ""
+    result = parse_watermark_result(result_path, max_records=max_records)
+    if not result.get("found") and not path.strip():
+        result["message"] = "no VLA-Mark result JSON found"
+    return result
 
 
 if __name__ == "__main__":
     import uvicorn
-    # host设为0.0.0.0以便外部/前端可以访问，端口默认8000
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(app, host="0.0.0.0", port=8011)
